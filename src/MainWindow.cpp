@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "ScanWorker.h"
+#include "WeldSeamWidget.h"
 
 #include <QPushButton>
 #include <QPlainTextEdit>
@@ -12,13 +13,15 @@
 #include <QDir>
 #include <QCloseEvent>
 #include <QMessageBox>
+#include <QTabWidget>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle("Vizum 线扫建图");
-    resize(820, 560);
+    resize(1200, 760);
 
-    auto* central = new QWidget(this);
-    auto* root = new QVBoxLayout(central);
+    auto* tabs = new QTabWidget(this);
+    auto* scanTab = new QWidget(this);
+    auto* root = new QVBoxLayout(scanTab);
 
     // Status bar (top)
     m_statusLabel = new QLabel("未连接", this);
@@ -57,7 +60,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_logView->setMaximumBlockCount(2000);
     root->addWidget(m_logView, 1);
 
-    setCentralWidget(central);
+    tabs->addTab(scanTab, "线扫建图");
+    tabs->addTab(new WeldSeamWidget(this), "焊缝拟合");
+    setCentralWidget(tabs);
 
     // --- Worker thread ---
     m_worker = new ScanWorker;            // do NOT pass parent: it gets moved to thread
