@@ -8,6 +8,8 @@
 #include <queue>
 #include <vector>
 
+class QTextStream;
+
 #include "VZNL_Common.h"
 #include "VZNL_EyeConfig.h"
 #include "VZNL_DetectLaser.h"
@@ -71,7 +73,11 @@ private:
     void clearQueueLocked();   // assume m_queueMutex held
     void clearQueue();
     bool ensureClosedDetect(); // safe stop if currently detecting
-    bool drainQueueToFile(VZNLFILE hFile, int& totalLines, int& totalPts);
+    bool drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitScale,
+                          int& totalLines, int& totalPts);
+    void writeCsvHeader(QTextStream& csv);
+    void writeLaserLineCsv(QTextStream& csv, const SVzLaserLineData& line,
+                           double unitScale, int lineIndex);
 
 private:
     VZNLHANDLE m_hDevice = nullptr;

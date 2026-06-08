@@ -2,7 +2,10 @@
 #include <QThread>
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QElapsedTimer>
+#include <QTextStream>
+#include <QProcessEnvironment>
 #include <cstring>
 #include <unistd.h>
 
@@ -139,7 +142,45 @@ bool ScanWorker::ensureClosedDetect() {
     return true;
 }
 
-bool ScanWorker::drainQueueToFile(VZNLFILE hFile, int& totalLines, int& totalPts) {
+void ScanWorker::writeCsvHeader(QTextStream& csv) {
+    csv << "line_idx,point_idx,frame_idx,timestamp,swing_angle,"
+           "x_raw,y_raw,z_raw,x_m,y_m,z_m,rgb_uint,r,g,b\n";
+}
+
+void ScanWorker::writeLaserLineCsv(QTextStream& csv, const SVzLaserLineData& line,
+                                   double unitScale, int lineIndex) {
+    if (line.nPointCount <= 0 || !line.p3DPoint) {
+        return;
+    }
+
+    const auto* pts = static_cast<const SVzNLPointXYZRGBA*>(line.p3DPoint);
+    for (int i = 0; i < line.nPointCount; ++i) {
+        const SVzNLPointXYZRGBA& p = pts[i];
+        const unsigned int rgb = p.nRGB;
+        const unsigned int r = (rgb >> 16) & 0xff;
+        const unsigned int g = (rgb >> 8) & 0xff;
+        const unsigned int b = rgb & 0xff;
+
+        csv << lineIndex << ','
+            << i << ','
+            << line.llFrameIdx << ','
+            << line.llTimeStamp << ','
+            << line.fSwingAngle << ','
+            << p.x << ','
+            << p.y << ','
+            << p.z << ','
+            << (p.x * unitScale) << ','
+            << (p.y * unitScale) << ','
+            << (p.z * unitScale) << ','
+            << rgb << ','
+            << r << ','
+            << g << ','
+            << b << '\n';
+    }
+}
+
+bool ScanWorker::drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitScale,
+                                  int& totalLines, int& totalPts) {
     bool ok = true;
     for (;;) {
         OwnedLaserLine ol;
@@ -154,6 +195,10 @@ bool ScanWorker::drainQueueToFile(VZNLFILE hFile, int& totalLines, int& totalPts
 
         if (ol.data.nPointCount <= 0) {
             continue;
+        }
+
+        if (csv) {
+            writeLaserLineCsv(*csv, ol.data, unitScale, totalLines);
         }
 
         int rc = VzNL_WriteLaserFile(hFile, &ol.data);
@@ -456,6 +501,48 @@ void ScanWorker::startScanAndSave(QString filePath) {
         return;
     }
 
+    QFileInfo plyInfo(filePath);
+    const QString stemPath = plyInfo.dir().filePath(plyInfo.completeBaseName());
+    const QString pointsCsvPath = stemPath + QStringLiteral("_points.csv");
+    const QString poseCsvPath = stemPath + QStringLiteral(".csv");
+
+    QFile pointsCsvFile(pointsCsvPath);
+    if (!pointsCsvFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        emit log(QStringLiteral("打开点云 CSV 失败: %1").arg(pointsCsvPath));
+        VzNL_CloseLaserFile(hFile);
+        emit scanFinished(false, filePath);
+        emit busyChanged(false);
+        return;
+    }
+
+    QTextStream pointsCsv(&pointsCsvFile);
+    pointsCsv.setRealNumberNotation(QTextStream::FixedNotation);
+    pointsCsv.setRealNumberPrecision(9);
+    writeCsvHeader(pointsCsv);
+
+    double unitScale = 0.001; // SDK raw coordinates are commonly millimetres; weld pipeline consumes metres.
+    const QString scaleEnv = QProcessEnvironment::systemEnvironment().value(QStringLiteral("VIZUM_POINT_UNIT_SCALE"));
+    bool scaleOk = false;
+    const double envScale = scaleEnv.toDouble(&scaleOk);
+    if (scaleOk && envScale > 0.0) {
+        unitScale = envScale;
+    }
+    emit log(QStringLiteral("点云 CSV: %1").arg(pointsCsvPath));
+    emit log(QStringLiteral("米制换算比例 VIZUM_POINT_UNIT_SCALE=%1").arg(unitScale, 0, 'g', 12));
+
+    if (!QFileInfo::exists(poseCsvPath)) {
+        QFile poseCsvFile(poseCsvPath);
+        if (poseCsvFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+            QTextStream poseCsv(&poseCsvFile);
+            poseCsv << "x,y,z,rx,ry,rz\n";
+            poseCsv << "0,0,0,0,0,0\n";
+            poseCsvFile.close();
+            emit log(QStringLiteral("已生成机器人位姿占位 CSV，请采集后填入法奥 flange 位姿: %1").arg(poseCsvPath));
+        } else {
+            emit log(QStringLiteral("机器人位姿占位 CSV 创建失败，请手工创建: %1").arg(poseCsvPath));
+        }
+    }
+
     // Reset offset / motor pos (best-effort, no-op for dynamic cams)
     VzNL_ConfigLaserBeginOffsetValue(m_hDevice, 0.0);
     if (m_supportMotor) {
@@ -488,7 +575,7 @@ void ScanWorker::startScanAndSave(QString filePath) {
     QElapsedTimer t; t.start();
     const qint64 hardTimeoutMs = m_supportMotor ? 60000 : 5000;
     while (m_scanRunning.load() && !m_autoStopReceived.load() && t.elapsed() < hardTimeoutMs) {
-        writeOk = drainQueueToFile(hFile, totalLines, totalPts) && writeOk;
+        writeOk = drainQueueToFile(hFile, &pointsCsv, unitScale, totalLines, totalPts) && writeOk;
         QThread::msleep(10);
     }
     if (!m_autoStopReceived.load() && t.elapsed() >= hardTimeoutMs) {
@@ -502,8 +589,10 @@ void ScanWorker::startScanAndSave(QString filePath) {
 
     // Drain any callbacks that arrived just before stop
     QThread::msleep(150);
-    writeOk = drainQueueToFile(hFile, totalLines, totalPts) && writeOk;
+    writeOk = drainQueueToFile(hFile, &pointsCsv, unitScale, totalLines, totalPts) && writeOk;
 
+    pointsCsv.flush();
+    pointsCsvFile.close();
     VzNL_CloseLaserFile(hFile);
 
     QFileInfo fi(filePath);
@@ -517,6 +606,9 @@ void ScanWorker::startScanAndSave(QString filePath) {
     }
     emit log(QStringLiteral("扫描完成：%1 行 / %2 点 -> %3 (%4)")
              .arg(totalLines).arg(totalPts).arg(filePath).arg(ok ? "OK" : "EMPTY"));
+    if (ok) {
+        emit log(QStringLiteral("焊接输入点云 CSV 已保存: %1").arg(pointsCsvPath));
+    }
     emit scanFinished(ok, filePath);
     emit busyChanged(false);
 }

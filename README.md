@@ -8,6 +8,7 @@ Qt-based desktop GUI for Vizum VzNL SDK line-laser 3D reconstruction cameras. It
 - Read SDK, device, firmware, algorithm, hardware, and swing-motor version information.
 - Open and close the camera dust cover.
 - Run one swing-motor line scan and save the reconstructed point cloud as a `.ply` file.
+- Export a welding-pipeline input sidecar `<scan>_points.csv` with clean camera-frame points in metres.
 - Repeat scans in the same session without reconnecting the camera.
 - Keep SDK callbacks lightweight by deep-copying laser lines into a queue and writing PLY data from the worker thread.
 - Load a PLY point cloud, click near a weld seam, fit a 3D line segment, and drag the segment endpoints for manual correction.
@@ -75,6 +76,227 @@ Open the `焊缝拟合` tab:
 
 The viewer automatically downsamples the displayed points for interaction when a cloud is large, but fitting still uses the full-resolution point cloud.
 
+Each successful scan writes three files next to the selected `.ply`:
+
+```text
+<scan>.ply          # SDK PLY export
+<scan>_points.csv   # VIZUM point-cloud input for the welding pipeline
+<scan>.csv          # robot flange pose placeholder: x,y,z,rx,ry,rz
+```
+
+`<scan>_points.csv` contains SDK raw coordinates and metre-normalized coordinates:
+
+```text
+line_idx,point_idx,frame_idx,timestamp,swing_angle,
+x_raw,y_raw,z_raw,x_m,y_m,z_m,rgb_uint,r,g,b
+```
+
+The welding pipeline consumes `x_m/y_m/z_m` as camera-frame metres. The default raw-to-metre scale is `0.001`, which matches millimetre SDK output. If your VIZUM SDK/PLY already outputs metres, start the GUI with:
+
+```bash
+VIZUM_POINT_UNIT_SCALE=1 ./build/VizumScanGUI
+```
+
+## Welding Pipeline Integration
+
+For `~/lh/bianxierobot/project-weld-anything-20260529`, copy or save the scan files into its `data/` directory:
+
+```text
+project-weld-anything-20260529/data/<scan>_points.csv
+project-weld-anything-20260529/data/<scan>.csv
+```
+
+The welding project has been adapted to treat `*_points.csv + .csv` as a data group. RVC depth input still works as before; VIZUM groups bypass the old depth/intrinsics path and use direct camera-frame points.
+
+Calibration placeholders are provided in `config/`:
+
+```text
+config/camera_offset_template.csv  # flange -> camera, fill after hand-eye calibration
+config/tool_offset_template.csv    # flange -> TCP/tool, fill after TCP calibration
+```
+
+After calibration, place the filled files in the welding project root as `camera_offset.csv` and `tool_offset.csv`. Until then, identity placeholders are valid for software testing but not robot execution.
+
+## 中文操作流程：接入免示教焊接工程
+
+目标是把替换点放在“点云输入层”：VIZUM 负责输出干净的相机坐标系点云，焊接工程负责把点云变成钢筋线、焊缝点和机器人坐标。焊接路径生成层不用改。
+
+### 1. 编译 VIZUM 程序
+
+```bash
+cd ~/lh/vizum-line-scan-gui
+cmake -S . -B build
+cmake --build build -j$(nproc)
+```
+
+### 2. 启动 VIZUM 程序
+
+如果 VIZUM SDK 输出坐标是毫米，直接启动：
+
+```bash
+./build/VizumScanGUI
+```
+
+如果确认 VIZUM SDK 输出坐标已经是米，启动时改成：
+
+```bash
+VIZUM_POINT_UNIT_SCALE=1 ./build/VizumScanGUI
+```
+
+默认比例是 `0.001`，也就是把 SDK 原始坐标从毫米转换成米。焊接工程内部的几何算法统一按米计算，例如 `0.003` 表示 3 mm、`0.02` 表示 20 mm。最终保存给机器人执行的 `camera_points/base_points/flange_points` 仍然会转回毫米。
+
+### 3. 扫描并保存到焊接工程 data 目录
+
+在 GUI 中依次操作：
+
+1. 点击 `连接设备`
+2. 如果设备支持防尘盖，点击 `开盖`
+3. 点击 `线扫建图并保存 PLY`
+4. 保存路径建议直接选到焊接工程的 `data` 目录，例如：
+
+```text
+~/lh/bianxierobot/project-weld-anything-20260529/data/vizum_test_001.ply
+```
+
+扫描成功后会自动生成：
+
+```text
+data/vizum_test_001.ply
+data/vizum_test_001_points.csv
+data/vizum_test_001.csv
+```
+
+含义如下：
+
+```text
+vizum_test_001.ply          # VIZUM SDK 输出的 PLY 点云
+vizum_test_001_points.csv   # 焊接工程读取的 VIZUM 相机坐标系点云
+vizum_test_001.csv          # 当前帧机器人法兰位姿，默认先写 0 占位
+```
+
+`*_points.csv` 中的关键列是：
+
+```text
+x_m,y_m,z_m
+```
+
+这三列是相机坐标系下的点，单位是米。
+
+### 4. 填入采集时机器人法兰位姿
+
+打开刚生成的位姿文件：
+
+```text
+~/lh/bianxierobot/project-weld-anything-20260529/data/vizum_test_001.csv
+```
+
+默认内容是：
+
+```csv
+x,y,z,rx,ry,rz
+0,0,0,0,0,0
+```
+
+请替换成采集这帧点云时法奥机器人的法兰位姿。这里保持焊接工程原来的格式：
+
+```text
+x/y/z：毫米
+rx/ry/rz：角度
+```
+
+如果只是验证点云显示、平面拟合、直线提取，可以暂时用 0 占位；如果要转换到机器人坐标或执行焊接，必须填真实位姿。
+
+### 5. 准备手眼标定和 TCP 标定文件
+
+焊接工程根目录需要两个标定文件：
+
+```text
+~/lh/bianxierobot/project-weld-anything-20260529/camera_offset.csv
+~/lh/bianxierobot/project-weld-anything-20260529/tool_offset.csv
+```
+
+本工程提供了模板：
+
+```text
+config/camera_offset_template.csv
+config/tool_offset_template.csv
+```
+
+格式都是：
+
+```csv
+x,y,z,rx,ry,rz
+0,0,0,0,0,0
+```
+
+含义：
+
+```text
+camera_offset.csv：法兰坐标系 -> VIZUM 相机坐标系，也就是 flange -> camera
+tool_offset.csv：法兰坐标系 -> 焊枪 TCP/tool，也就是 flange -> TCP
+```
+
+未标定前可以先用全 0 占位验证软件流程，但不能用于真实机器人执行。
+
+### 6. 在焊接工程中加载 VIZUM 点云
+
+启动焊接工程：
+
+```bash
+cd ~/lh/bianxierobot/project-weld-anything-20260529
+python app.py
+```
+
+进入点云/路径生成界面后：
+
+1. 点击 `刷新`
+2. 选择刚才的数据组，例如 `vizum_test_001`
+3. 切到 `点云` 视图
+4. 点击 `点云：拟合平面`
+5. 如果平板区域显示为浅绿色，说明 VIZUM 点云输入层已经正常
+6. 点击 `法线区域提取`
+7. 点击 `直线端点提取`
+8. 检查钢筋线是否正确
+9. 再继续点击：
+
+```text
+计算钢筋焊接点
+焊枪回缩
+远离平面
+焊枪摆动
+保存
+```
+
+也可以直接点击：
+
+```text
+一键钢筋生成
+```
+
+对于 VIZUM 数据组，焊接工程会自动走纯点云流程：
+
+```text
+VIZUM 点云
+  -> 点云拟合平面
+  -> 法线变化提取钢筋线
+  -> 原有焊点计算
+  -> 原有回缩/远离平面/摆动
+  -> 保存机器人运行点
+```
+
+如本 RVC 的 `png + tif + csv` 数据仍按原流程运行，不受 VIZUM 点云输入分支影响。
+
+### 7. 现场首先检查两件事
+
+第一，检查点云单位是否正确。如果点云看起来大 1000 倍或小 1000 倍，就说明 `VIZUM_POINT_UNIT_SCALE` 需要调整：
+
+```bash
+VIZUM_POINT_UNIT_SCALE=1 ./build/VizumScanGUI      # SDK 原始点已经是米
+./build/VizumScanGUI                              # SDK 原始点是毫米，默认转米
+```
+
+第二，先只做 `点云：拟合平面`。如果平面拟合稳定，再继续做直线提取和焊点生成。不要在手眼标定和 TCP 标定未完成时直接执行机器人焊接。
+
 ## Implementation Notes
 
 The scan path follows the SDK sequence:
@@ -99,3 +321,5 @@ VzNL_Destroy
 ```
 
 The callback deliberately avoids blocking SDK calls, file I/O, and UI work. A bounded queue protects the process if disk writing cannot keep up with camera output.
+
+Point CSV writing happens in the worker thread while draining the same deep-copied queue that feeds `VzNL_WriteLaserFile`, so SDK callbacks remain lightweight.
