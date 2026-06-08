@@ -5,6 +5,7 @@ Qt-based desktop GUI for Vizum VzNL SDK line-laser 3D reconstruction cameras. It
 ## Features
 
 - Connect, disconnect, and reboot a Vizum Ethernet laser robot camera.
+- Read SDK, device, firmware, algorithm, hardware, and swing-motor version information.
 - Open and close the camera dust cover.
 - Run one swing-motor line scan and save the reconstructed point cloud as a `.ply` file.
 - Repeat scans in the same session without reconnecting the camera.

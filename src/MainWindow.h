@@ -22,6 +22,7 @@ private slots:
     void onConnectClicked();
     void onDisconnectClicked();
     void onRebootClicked();
+    void onGetVersionsClicked();
     void onOpenCoverClicked();
     void onCloseCoverClicked();
     void onScanClicked();
@@ -38,6 +39,7 @@ signals:
     void reqDisconnect();
     void reqReboot();
     void reqDestroy();
+    void reqGetVersions();
     void reqOpenCover();
     void reqCloseCover();
     void reqScan(QString path);
@@ -49,6 +51,7 @@ private:
     QPushButton* m_btnConnect{};
     QPushButton* m_btnDisconnect{};
     QPushButton* m_btnReboot{};
+    QPushButton* m_btnGetVersions{};
     QPushButton* m_btnOpenCover{};
     QPushButton* m_btnCloseCover{};
     QPushButton* m_btnScan{};

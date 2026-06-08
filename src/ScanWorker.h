@@ -45,6 +45,7 @@ public slots:
     void disconnectDevice();  // end laser + close
     void rebootDevice();      // reboot via SDK
     void destroySdk();        // VzNL_Destroy
+    void getVersions();       // VzNL_GetVersion + device/module versions
 
     // --- Cover
     void openCover();         // VzNL_CoverCamera(false)

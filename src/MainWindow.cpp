@@ -30,9 +30,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_btnConnect = new QPushButton("连接设备", this);
     m_btnDisconnect = new QPushButton("关闭设备", this);
     m_btnReboot = new QPushButton("重启设备", this);
+    m_btnGetVersions = new QPushButton("获取版本号", this);
     l1->addWidget(m_btnConnect);
     l1->addWidget(m_btnDisconnect);
     l1->addWidget(m_btnReboot);
+    l1->addWidget(m_btnGetVersions);
     root->addWidget(group1);
 
     auto* group2 = new QGroupBox("防尘盖", this);
@@ -74,6 +76,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(this, &MainWindow::reqDisconnect, m_worker, &ScanWorker::disconnectDevice, Qt::QueuedConnection);
     connect(this, &MainWindow::reqReboot, m_worker, &ScanWorker::rebootDevice, Qt::QueuedConnection);
     connect(this, &MainWindow::reqDestroy, m_worker, &ScanWorker::destroySdk, Qt::QueuedConnection);
+    connect(this, &MainWindow::reqGetVersions, m_worker, &ScanWorker::getVersions, Qt::QueuedConnection);
     connect(this, &MainWindow::reqOpenCover, m_worker, &ScanWorker::openCover, Qt::QueuedConnection);
     connect(this, &MainWindow::reqCloseCover, m_worker, &ScanWorker::closeCover, Qt::QueuedConnection);
     connect(this, &MainWindow::reqScan, m_worker, &ScanWorker::startScanAndSave, Qt::QueuedConnection);
@@ -82,6 +85,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_btnConnect, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
     connect(m_btnDisconnect, &QPushButton::clicked, this, &MainWindow::onDisconnectClicked);
     connect(m_btnReboot, &QPushButton::clicked, this, &MainWindow::onRebootClicked);
+    connect(m_btnGetVersions, &QPushButton::clicked, this, &MainWindow::onGetVersionsClicked);
     connect(m_btnOpenCover, &QPushButton::clicked, this, &MainWindow::onOpenCoverClicked);
     connect(m_btnCloseCover, &QPushButton::clicked, this, &MainWindow::onCloseCoverClicked);
     connect(m_btnScan, &QPushButton::clicked, this, &MainWindow::onScanClicked);
@@ -130,6 +134,7 @@ void MainWindow::onConnectionChanged(bool connected) {
     m_btnConnect->setEnabled(!connected);
     m_btnDisconnect->setEnabled(connected);
     m_btnReboot->setEnabled(connected);
+    m_btnGetVersions->setEnabled(connected);
     m_btnOpenCover->setEnabled(connected);
     m_btnCloseCover->setEnabled(connected);
     m_btnScan->setEnabled(connected);
@@ -148,6 +153,7 @@ void MainWindow::setBusy(bool busy) {
         m_btnConnect->setEnabled(false);
         m_btnDisconnect->setEnabled(false);
         m_btnReboot->setEnabled(false);
+        m_btnGetVersions->setEnabled(false);
         m_btnOpenCover->setEnabled(false);
         m_btnCloseCover->setEnabled(false);
         m_btnScan->setEnabled(false);
@@ -170,6 +176,7 @@ QString MainWindow::defaultPlyPath() {
 void MainWindow::onConnectClicked() { emit reqConnect(); }
 void MainWindow::onDisconnectClicked() { emit reqDisconnect(); }
 void MainWindow::onRebootClicked() { emit reqReboot(); }
+void MainWindow::onGetVersionsClicked() { emit reqGetVersions(); }
 void MainWindow::onOpenCoverClicked() { emit reqOpenCover(); }
 void MainWindow::onCloseCoverClicked() { emit reqCloseCover(); }
 

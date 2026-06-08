@@ -344,6 +344,67 @@ void ScanWorker::destroySdk() {
     }
 }
 
+void ScanWorker::getVersions() {
+    if (!m_hDevice) {
+        emit log("未连接设备，无法获取版本号");
+        return;
+    }
+
+    SVzNLVersionInfo version{};
+    int rc = VzNL_GetVersion(m_hDevice, &version);
+    if (rc != 0) {
+        emit log(QStringLiteral("获取版本号失败: %1").arg(errString(rc)));
+        return;
+    }
+
+    emit log("版本信息：");
+    auto logVersion = [this](const QString& name, long valid, const char* value) {
+        if (valid) {
+            emit log(QStringLiteral("  %1: %2").arg(name, QString::fromLocal8Bit(value)));
+        } else {
+            emit log(QStringLiteral("  %1: 不支持/不可用").arg(name));
+        }
+    };
+
+    logVersion("SDK", version.sCap.sVersionCap.bValidSDKVersion, version.szSDKVersion);
+    logVersion("EyeCB/App", version.sCap.sVersionCap.bValidAppVersion, version.szAppVersion);
+    logVersion("Camera/Eye", version.sCap.sVersionCap.bValidCameraVersion, version.szCameraVersion);
+    logVersion("Algo", version.sCap.sVersionCap.bValidAlgoVersion, version.szAlgoVersion);
+    logVersion("APK", version.sCap.sVersionCap.bValidApkVersion, version.szApkVersion);
+    logVersion("Device ID", version.sCap.sVersionCap.bValidDevIDVersion, version.szDevIDVersion);
+    logVersion("WiFi", version.sCap.sVersionCap.bValidWifiVersion, version.szWifiVersion);
+    logVersion("HDMI", version.sCap.sVersionCap.bValidHDMIVersion, version.szHDMIVersion);
+    logVersion("Vizum Eye Hardware", version.sCap.sVersionCap.bValidVizumEyeVersion, version.szVizumEyeVersion);
+    logVersion("Firmware", version.sCap.sVersionCap.bValidFwVersion, version.szFwVersion);
+
+    SVzNLEyeDeviceInfoEx devInfo{};
+    devInfo.sEyeCBInfo.nSize = sizeof(SVzNLEyeDeviceInfoEx);
+    rc = VzNL_GetDeviceInfo(m_hDevice, &devInfo.sEyeCBInfo);
+    if (rc == 0) {
+        emit log(QStringLiteral("  Device Name: %1").arg(QString::fromLocal8Bit(devInfo.sEyeCBInfo.szDeviceName)));
+        emit log(QStringLiteral("  Device IP: %1").arg(QString::fromLocal8Bit(devInfo.sEyeCBInfo.byServerIP)));
+        emit log(QStringLiteral("  Device ID: %1").arg(QString::fromLocal8Bit(devInfo.sEyeCBInfo.szDeviceID)));
+        emit log(QStringLiteral("  Device Hardware Version: %1").arg(devInfo.nHardwareVersion));
+        if (devInfo.szVersion[0] != '\0') {
+            emit log(QStringLiteral("  Device Version String: %1").arg(QString::fromLocal8Bit(devInfo.szVersion)));
+        }
+        if (devInfo.szHardwareVersion[0] != '\0') {
+            emit log(QStringLiteral("  Hardware Version String: %1").arg(QString::fromLocal8Bit(devInfo.szHardwareVersion)));
+        }
+    } else {
+        emit log(QStringLiteral("获取设备信息失败: %1").arg(errString(rc)));
+    }
+
+    if (m_supportMotor) {
+        unsigned int swingVersion = VzNL_GetSwingVersionCode(m_hDevice);
+        emit log(QStringLiteral("  Swing Motor Version Code: %1 (0x%2)")
+                 .arg(swingVersion)
+                 .arg(QString::number(swingVersion, 16).toUpper()));
+    } else {
+        emit log("  Swing Motor Version Code: 当前设备不支持摆动模块");
+    }
+}
+
 void ScanWorker::openCover() {
     if (!m_hDevice) { emit log("未连接设备"); return; }
     if (VzNL_IsSupportCoverCamera(m_hDevice, nullptr) != VzTrue) {
