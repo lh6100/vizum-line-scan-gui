@@ -47,7 +47,7 @@ private:
     using PointT = pcl::PointXYZRGBA;
     using CloudT = pcl::PointCloud<PointT>;
 
-    static void onLeftButtonPress(vtkObject* caller, unsigned long eventId, void* clientData, void* callData);
+    static void onMiddleButtonPress(vtkObject* caller, unsigned long eventId, void* clientData, void* callData);
     static void onStartHandleMoved(vtkObject* caller, unsigned long eventId, void* clientData, void* callData);
     static void onEndHandleMoved(vtkObject* caller, unsigned long eventId, void* clientData, void* callData);
 

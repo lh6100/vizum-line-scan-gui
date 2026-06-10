@@ -68,10 +68,10 @@ Run:
 Open the `焊缝拟合` tab:
 
 1. Click `加载 PLY` and select a scanned point cloud.
-2. Click a point near the weld seam.
+2. Middle-click a point near the weld seam.
 3. The tool uses a KDTree radius search around the picked point and fits a 3D line with RANSAC.
 4. The red line is the fitted seam segment. The green sphere is the start point and the red sphere is the end point.
-5. Drag either sphere to manually adjust the segment endpoint.
+5. Use the mouse wheel to zoom, right-drag to rotate, and left-drag either sphere to manually adjust the segment endpoint.
 6. Copy the result to get the start/end coordinates in camera coordinates.
 
 The viewer automatically downsamples the displayed points for interaction when a cloud is large, but fitting still uses the full-resolution point cloud.

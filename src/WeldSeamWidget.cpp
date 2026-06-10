@@ -33,6 +33,8 @@
 #include <vtkPolyDataMapper.h>
 #include <vtkProperty.h>
 #include <vtkPLYReader.h>
+#include <vtkInteractorStyleTrackballCamera.h>
+#include <vtkObjectFactory.h>
 #include <vtkRenderWindowInteractor.h>
 #include <vtkRenderWindow.h>
 #include <vtkRenderer.h>
@@ -47,6 +49,38 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+
+class WeldViewInteractorStyle : public vtkInteractorStyleTrackballCamera {
+public:
+    static WeldViewInteractorStyle* New();
+    vtkTypeMacro(WeldViewInteractorStyle, vtkInteractorStyleTrackballCamera);
+
+    void OnLeftButtonDown() override {}
+    void OnLeftButtonUp() override {}
+    void OnMiddleButtonDown() override {}
+    void OnMiddleButtonUp() override {}
+
+    void OnRightButtonDown() override {
+        this->FindPokedRenderer(this->Interactor->GetEventPosition()[0],
+                                this->Interactor->GetEventPosition()[1]);
+        if (!this->CurrentRenderer) {
+            return;
+        }
+        this->GrabFocus(this->EventCallbackCommand);
+        this->StartRotate();
+    }
+
+    void OnRightButtonUp() override {
+        if (this->State == VTKIS_ROTATE) {
+            this->EndRotate();
+        }
+        if (this->Interactor) {
+            this->ReleaseFocus();
+        }
+    }
+};
+
+vtkStandardNewMacro(WeldViewInteractorStyle);
 
 WeldSeamWidget::WeldSeamWidget(QWidget* parent)
     : QWidget(parent),
@@ -79,7 +113,7 @@ WeldSeamWidget::WeldSeamWidget(QWidget* parent)
     m_minPointsSpin->setValue(80);
 
     m_fileLabel = new QLabel("未加载点云", this);
-    m_pickLabel = new QLabel("点击点云中的焊缝附近点进行拟合；拟合后拖动两个球体微调端点。", this);
+    m_pickLabel = new QLabel("中键点击焊缝附近点进行拟合；滚轮缩放，右键旋转，左键拖动端点球体。", this);
 
     grid->addWidget(m_btnLoad, 0, 0);
     grid->addWidget(m_btnClear, 0, 1);
@@ -123,6 +157,9 @@ void WeldSeamWidget::setupVtk() {
     m_renderer->SetBackground(0.05, 0.08, 0.10);
     m_vtkWidget->renderWindow()->AddRenderer(m_renderer);
 
+    vtkNew<WeldViewInteractorStyle> style;
+    m_vtkWidget->interactor()->SetInteractorStyle(style);
+
     m_cloudPolyData = vtkSmartPointer<vtkPolyData>::New();
     vtkNew<vtkPolyDataMapper> cloudMapper;
     cloudMapper->SetInputData(m_cloudPolyData);
@@ -155,8 +192,8 @@ void WeldSeamWidget::setupVtk() {
 
     m_pickCallback = vtkSmartPointer<vtkCallbackCommand>::New();
     m_pickCallback->SetClientData(this);
-    m_pickCallback->SetCallback(&WeldSeamWidget::onLeftButtonPress);
-    m_vtkWidget->interactor()->AddObserver(vtkCommand::LeftButtonPressEvent, m_pickCallback);
+    m_pickCallback->SetCallback(&WeldSeamWidget::onMiddleButtonPress);
+    m_vtkWidget->interactor()->AddObserver(vtkCommand::MiddleButtonPressEvent, m_pickCallback);
 
     m_startHandleCallback = vtkSmartPointer<vtkCallbackCommand>::New();
     m_startHandleCallback->SetClientData(this);
@@ -266,7 +303,7 @@ void WeldSeamWidget::updateCloudActor() {
     m_cloudPolyData->Modified();
 }
 
-void WeldSeamWidget::onLeftButtonPress(vtkObject* caller, unsigned long, void* clientData, void*) {
+void WeldSeamWidget::onMiddleButtonPress(vtkObject* caller, unsigned long, void* clientData, void*) {
     auto* self = static_cast<WeldSeamWidget*>(clientData);
     auto* interactor = vtkRenderWindowInteractor::SafeDownCast(caller);
     if (!self || !interactor || self->m_cloud->empty()) return;
@@ -542,7 +579,7 @@ void WeldSeamWidget::updateResultText() {
                     .arg(dir.y(), 0, 'f', 6)
                     .arg(dir.z(), 0, 'f', 6);
     }
-    text += "\n拖动绿色球体调整起点，拖动红色球体调整终点。";
+    text += "\n左键拖动绿色球体调整起点，左键拖动红色球体调整终点。";
     m_resultText->setPlainText(text);
     emit cameraLineChanged(m_startPoint.x(), m_startPoint.y(), m_startPoint.z(),
                            m_endPoint.x(), m_endPoint.y(), m_endPoint.z());
