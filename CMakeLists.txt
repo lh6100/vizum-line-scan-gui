@@ -92,6 +92,8 @@ add_executable(VizumScanGUI
     src/MainWindow.h
     src/RobotControlWidget.cpp
     src/RobotControlWidget.h
+    src/RgbImageLabel.cpp
+    src/RgbImageLabel.h
     src/ScanWorker.cpp
     src/ScanWorker.h
     src/WeldSeamWidget.cpp

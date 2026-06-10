@@ -5,6 +5,9 @@
 #include <QString>
 #include <QMutex>
 #include <QImage>
+#include <QPoint>
+#include <QVector>
+#include <QVector3D>
 #include <atomic>
 #include <queue>
 #include <vector>
@@ -58,6 +61,7 @@ public slots:
 
     // --- RGB
     void grabRgbImage();      // one RGB frame -> QImage
+    void mapRgbLineTo3D(QPoint start, QPoint end, int sampleCount);
 
     // --- Scan
     void startScanAndSave(QString filePath);  // one full scan -> .ply
@@ -68,6 +72,7 @@ signals:
     void scanFinished(bool ok, QString filePath);
     void busyChanged(bool busy);
     void rgbImageReady(QImage image, QString desc);
+    void rgbLineMapped(QVector<QVector3D> points, QString desc);
 
 private:
     // SDK callback: must be free of SDK calls; only enqueues a deep copy.
@@ -85,12 +90,20 @@ private:
     void writeCsvHeader(QTextStream& csv);
     void writeLaserLineCsv(QTextStream& csv, const SVzLaserLineData& line,
                            double unitScale, int lineIndex);
+    bool beginRgbCloudMapping();
+    void finishRgbCloudMapping();
+    void destroyRgbCloudMapping();
+    bool findMapped3DNearPixel(const QPoint& pixel, int searchRadius, QVector3D& point) const;
 
 private:
     VZNLHANDLE m_hDevice = nullptr;
     bool m_sdkInitialized = false;
     bool m_laserToolBegun = false;
     bool m_supportMotor = false;
+    VZNLRGBCLOUDPOINTTOOL m_rgbCloudTool = nullptr;
+    bool m_rgbCloudToolBuilding = false;
+    bool m_rgbCloudToolReady = false;
+    bool m_rgbCloudPushFailed = false;
 
     // Scan state
     std::atomic<bool> m_scanRunning{false};

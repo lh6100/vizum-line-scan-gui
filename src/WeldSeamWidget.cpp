@@ -476,6 +476,131 @@ bool WeldSeamWidget::fitLinePca(const std::vector<int>& indices, Eigen::Vector3f
     return true;
 }
 
+bool WeldSeamWidget::fitLinePcaFromPoints(const QVector<QVector3D>& points,
+                                          Eigen::Vector3f& start,
+                                          Eigen::Vector3f& end) const {
+    if (points.size() < 2) return false;
+
+    Eigen::Vector3f mean(0.f, 0.f, 0.f);
+    for (const QVector3D& p : points) {
+        mean += Eigen::Vector3f(p.x(), p.y(), p.z());
+    }
+    mean /= static_cast<float>(points.size());
+
+    Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+    for (const QVector3D& p : points) {
+        Eigen::Vector3f d(p.x(), p.y(), p.z());
+        d -= mean;
+        cov += d * d.transpose();
+    }
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
+    if (solver.info() != Eigen::Success) return false;
+
+    Eigen::Vector3f direction = solver.eigenvectors().col(2);
+    if (direction.norm() < std::numeric_limits<float>::epsilon()) return false;
+    direction.normalize();
+
+    float tMin = std::numeric_limits<float>::max();
+    float tMax = -std::numeric_limits<float>::max();
+    for (const QVector3D& p : points) {
+        const Eigen::Vector3f point(p.x(), p.y(), p.z());
+        const float t = (point - mean).dot(direction);
+        tMin = std::min(tMin, t);
+        tMax = std::max(tMax, t);
+    }
+    if (tMax <= tMin) return false;
+
+    start = mean + tMin * direction;
+    end = mean + tMax * direction;
+    return true;
+}
+
+bool WeldSeamWidget::fitLineRobustFromPoints(const QVector<QVector3D>& points,
+                                             Eigen::Vector3f& start,
+                                             Eigen::Vector3f& end,
+                                             QVector<QVector3D>& inlierPoints,
+                                             QString& method) const {
+    if (points.size() < 2) {
+        return false;
+    }
+
+    QVector<QVector3D> validPoints;
+    validPoints.reserve(points.size());
+    for (const QVector3D& p : points) {
+        if (std::isfinite(p.x()) && std::isfinite(p.y()) && std::isfinite(p.z()) &&
+            std::abs(p.z()) > 1e-3f) {
+            validPoints.push_back(p);
+        }
+    }
+    if (validPoints.size() < 2) {
+        return false;
+    }
+
+    CloudT::Ptr subset(new CloudT);
+    subset->reserve(validPoints.size());
+    for (const QVector3D& p : validPoints) {
+        PointT pt;
+        pt.x = p.x();
+        pt.y = p.y();
+        pt.z = p.z();
+        pt.r = 255;
+        pt.g = 230;
+        pt.b = 0;
+        pt.a = 255;
+        subset->push_back(pt);
+    }
+
+    pcl::SampleConsensusModelLine<PointT>::Ptr model(new pcl::SampleConsensusModelLine<PointT>(subset));
+    pcl::RandomSampleConsensus<PointT> ransac(model);
+    ransac.setDistanceThreshold(std::max(1.0, m_ransacThresholdSpin->value()));
+    ransac.setMaxIterations(1000);
+
+    std::vector<int> inliers;
+    Eigen::VectorXf coeffs;
+    if (ransac.computeModel()) {
+        ransac.getInliers(inliers);
+        ransac.getModelCoefficients(coeffs);
+    }
+
+    const int minInliers = std::max(6, std::min(20, validPoints.size() / 4));
+    if (coeffs.size() >= 6 && static_cast<int>(inliers.size()) >= minInliers) {
+        Eigen::Vector3f origin(coeffs[0], coeffs[1], coeffs[2]);
+        Eigen::Vector3f direction(coeffs[3], coeffs[4], coeffs[5]);
+        if (direction.norm() > std::numeric_limits<float>::epsilon()) {
+            direction.normalize();
+            float tMin = std::numeric_limits<float>::max();
+            float tMax = -std::numeric_limits<float>::max();
+            inlierPoints.clear();
+            inlierPoints.reserve(static_cast<int>(inliers.size()));
+            for (int index : inliers) {
+                const QVector3D& p = validPoints[index];
+                inlierPoints.push_back(p);
+                const Eigen::Vector3f point(p.x(), p.y(), p.z());
+                const float t = (point - origin).dot(direction);
+                tMin = std::min(tMin, t);
+                tMax = std::max(tMax, t);
+            }
+            if (tMax > tMin) {
+                start = origin + tMin * direction;
+                end = origin + tMax * direction;
+                method = QStringLiteral("RANSAC内点 %1/%2，阈值 %3 mm")
+                             .arg(inliers.size())
+                             .arg(validPoints.size())
+                             .arg(m_ransacThresholdSpin->value(), 0, 'f', 2);
+                return true;
+            }
+        }
+    }
+
+    if (!fitLinePcaFromPoints(validPoints, start, end)) {
+        return false;
+    }
+    inlierPoints = validPoints;
+    method = QStringLiteral("PCA全部有效点 %1，RANSAC内点不足").arg(validPoints.size());
+    return true;
+}
+
 void WeldSeamWidget::showFitResult(const Eigen::Vector3f& start, const Eigen::Vector3f& end,
                                    const std::vector<int>& inliers) {
     m_startPoint = start;
@@ -502,6 +627,55 @@ void WeldSeamWidget::showFitResult(const Eigen::Vector3f& start, const Eigen::Ve
     updateHandleWidgets();
     updateResultText();
     m_vtkWidget->renderWindow()->Render();
+}
+
+void WeldSeamWidget::showPointListResult(const Eigen::Vector3f& start, const Eigen::Vector3f& end,
+                                         const QVector<QVector3D>& pointsIn) {
+    m_startPoint = start;
+    m_endPoint = end;
+    m_hasFit = true;
+
+    vtkNew<vtkPoints> points;
+    vtkNew<vtkCellArray> vertices;
+    points->SetDataTypeToFloat();
+    points->Allocate(static_cast<vtkIdType>(pointsIn.size()));
+    vertices->AllocateEstimate(static_cast<vtkIdType>(pointsIn.size()), 1);
+    for (const QVector3D& p : pointsIn) {
+        vtkIdType id = points->InsertNextPoint(p.x(), p.y(), p.z());
+        vertices->InsertNextCell(1);
+        vertices->InsertCellPoint(id);
+    }
+    m_inlierPolyData->SetPoints(points);
+    m_inlierPolyData->SetVerts(vertices);
+    m_inlierPolyData->Modified();
+    m_inlierActor->SetVisibility(true);
+
+    updateLineActor();
+    updateHandleWidgets();
+    updateResultText();
+    m_vtkWidget->renderWindow()->Render();
+}
+
+void WeldSeamWidget::showMappedRgbLine(QVector<QVector3D> points, QString info) {
+    if (points.size() < 2) {
+        appendLog(QStringLiteral("RGB线段映射失败或命中点不足: %1").arg(info));
+        return;
+    }
+
+    Eigen::Vector3f start;
+    Eigen::Vector3f end;
+    QVector<QVector3D> inlierPoints;
+    QString method;
+    if (!fitLineRobustFromPoints(points, start, end, inlierPoints, method)) {
+        appendLog(QStringLiteral("RGB线段映射点无法拟合直线: %1").arg(info));
+        return;
+    }
+
+    showPointListResult(start, end, inlierPoints);
+    appendLog(QStringLiteral("RGB线段已映射到3D并拟合: %1，黄色点=拟合内点，红线=3D拟合线，%2，长度 %3 mm")
+              .arg(info)
+              .arg(method)
+              .arg((end - start).norm(), 0, 'f', 2));
 }
 
 void WeldSeamWidget::updateLineActor() {

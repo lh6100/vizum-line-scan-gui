@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "RobotControlWidget.h"
+#include "RgbImageLabel.h"
 #include "ScanWorker.h"
 #include "WeldSeamWidget.h"
 
@@ -13,12 +14,16 @@
 #include <QDir>
 #include <QCoreApplication>
 #include <QCloseEvent>
+#include <QFileInfo>
 #include <QMessageBox>
+#include <QMetaType>
 #include <QTabWidget>
-#include <QPixmap>
 #include <QSizePolicy>
+#include <QSplitter>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    qRegisterMetaType<QVector<QVector3D>>("QVector<QVector3D>");
+
     setWindowTitle("Vizum 线扫建图");
     resize(1200, 760);
 
@@ -58,26 +63,34 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     l3->addWidget(m_btnScan);
     root->addWidget(group3);
 
+    auto* lowerSplitter = new QSplitter(Qt::Horizontal, this);
+
     auto* group4 = new QGroupBox("RGB图片", this);
     auto* l4 = new QVBoxLayout(group4);
     auto* rgbTop = new QHBoxLayout;
     m_btnGrabRgb = new QPushButton("获取 RGB 图片", this);
     m_rgbInfoLabel = new QLabel("未获取 RGB 图片", this);
+    m_rgbInfoLabel->setWordWrap(true);
     rgbTop->addWidget(m_btnGrabRgb);
     rgbTop->addWidget(m_rgbInfoLabel, 1);
     l4->addLayout(rgbTop);
-    m_rgbImageLabel = new QLabel("RGB 图片显示区域", this);
-    m_rgbImageLabel->setAlignment(Qt::AlignCenter);
-    m_rgbImageLabel->setFixedSize(360, 270);
-    m_rgbImageLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-    m_rgbImageLabel->setStyleSheet("background:#111; color:#bbb; border:1px solid #444;");
-    l4->addWidget(m_rgbImageLabel, 0, Qt::AlignHCenter);
-    root->addWidget(group4);
+    m_rgbImageLabel = new RgbImageLabel(this);
+    m_rgbImageLabel->setText("RGB 图片显示区域");
+    m_rgbImageLabel->setMinimumSize(520, 520);
+    m_rgbImageLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    l4->addWidget(m_rgbImageLabel, 1);
+    lowerSplitter->addWidget(group4);
 
+    auto* logGroup = new QGroupBox("日志", this);
+    auto* logLayout = new QVBoxLayout(logGroup);
     m_logView = new QPlainTextEdit(this);
     m_logView->setReadOnly(true);
     m_logView->setMaximumBlockCount(2000);
-    root->addWidget(m_logView, 1);
+    logLayout->addWidget(m_logView);
+    lowerSplitter->addWidget(logGroup);
+    lowerSplitter->setStretchFactor(0, 3);
+    lowerSplitter->setStretchFactor(1, 2);
+    root->addWidget(lowerSplitter, 1);
 
     m_weldWidget = new WeldSeamWidget(this);
     auto* robotWidget = new RobotControlWidget(this);
@@ -101,6 +114,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_worker, &ScanWorker::scanFinished, this, &MainWindow::onScanFinished, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::busyChanged, this, &MainWindow::onBusyChanged, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::rgbImageReady, this, &MainWindow::onRgbImageReady, Qt::QueuedConnection);
+    connect(m_worker, &ScanWorker::rgbLineMapped, this, &MainWindow::onRgbLineMapped, Qt::QueuedConnection);
 
     connect(this, &MainWindow::reqInit, m_worker, &ScanWorker::initSdk, Qt::QueuedConnection);
     connect(this, &MainWindow::reqConnect, m_worker, &ScanWorker::connectDevice, Qt::QueuedConnection);
@@ -112,6 +126,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(this, &MainWindow::reqCloseCover, m_worker, &ScanWorker::closeCover, Qt::QueuedConnection);
     connect(this, &MainWindow::reqScan, m_worker, &ScanWorker::startScanAndSave, Qt::QueuedConnection);
     connect(this, &MainWindow::reqGrabRgb, m_worker, &ScanWorker::grabRgbImage, Qt::QueuedConnection);
+    connect(this, &MainWindow::reqMapRgbLine, m_worker, &ScanWorker::mapRgbLineTo3D, Qt::QueuedConnection);
 
     // --- Button signals ---
     connect(m_btnConnect, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
@@ -122,6 +137,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_btnCloseCover, &QPushButton::clicked, this, &MainWindow::onCloseCoverClicked);
     connect(m_btnScan, &QPushButton::clicked, this, &MainWindow::onScanClicked);
     connect(m_btnGrabRgb, &QPushButton::clicked, this, &MainWindow::onGrabRgbClicked);
+    connect(m_rgbImageLabel, &RgbImageLabel::lineSelected, this, &MainWindow::onRgbLineSelected);
 
     onConnectionChanged(false);
 
@@ -193,20 +209,31 @@ void MainWindow::onRgbImageReady(QImage image, QString desc) {
     }
     const QString path = defaultRgbPath();
     if (image.save(path)) {
-        m_rgbInfoLabel->setText(QStringLiteral("%1 -> %2").arg(desc, path));
+        m_rgbInfoLabel->setText(QStringLiteral("%1 -> %2").arg(desc, QFileInfo(path).fileName()));
+        m_rgbInfoLabel->setToolTip(path);
         onLog(QStringLiteral("RGB 图片已保存: %1").arg(path));
     } else {
         m_rgbInfoLabel->setText(desc);
+        m_rgbInfoLabel->setToolTip(QString());
         onLog(QStringLiteral("RGB 图片保存失败: %1").arg(path));
     }
 
-    const QSize displaySize = image.size().scaled(QSize(640, 360), Qt::KeepAspectRatio);
-    m_rgbImageLabel->setFixedSize(displaySize);
-    const QPixmap pixmap = QPixmap::fromImage(image);
-    m_rgbImageLabel->setPixmap(pixmap.scaled(displaySize,
-                                             Qt::KeepAspectRatio,
-                                             Qt::SmoothTransformation));
+    m_rgbImageLabel->setImage(image);
     onLog(QStringLiteral("RGB 图片已显示: %1").arg(desc));
+}
+
+void MainWindow::onRgbLineSelected(QPoint start, QPoint end) {
+    onLog(QStringLiteral("RGB 图上线段: (%1,%2) -> (%3,%4)，开始映射到 3D")
+          .arg(start.x()).arg(start.y()).arg(end.x()).arg(end.y()));
+    emit reqMapRgbLine(start, end, 300);
+}
+
+void MainWindow::onRgbLineMapped(QVector<QVector3D> points, QString desc) {
+    onLog(desc);
+    if (!m_weldWidget) {
+        return;
+    }
+    m_weldWidget->showMappedRgbLine(points, desc);
 }
 
 void MainWindow::setBusy(bool busy) {

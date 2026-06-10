@@ -3,6 +3,8 @@
 
 #include <QWidget>
 #include <QString>
+#include <QVector>
+#include <QVector3D>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -37,6 +39,7 @@ public:
 
 public slots:
     void loadCloudFile(QString filePath);
+    void showMappedRgbLine(QVector<QVector3D> points, QString info);
 
 signals:
     void cameraLineChanged(double sx, double sy, double sz, double ex, double ey, double ez);
@@ -61,7 +64,11 @@ private:
     bool fitLineFromIndices(const std::vector<int>& indices, Eigen::Vector3f& start, Eigen::Vector3f& end,
                             std::vector<int>& inlierIndices, QString& errorText) const;
     bool fitLinePca(const std::vector<int>& indices, Eigen::Vector3f& start, Eigen::Vector3f& end) const;
+    bool fitLinePcaFromPoints(const QVector<QVector3D>& points, Eigen::Vector3f& start, Eigen::Vector3f& end) const;
+    bool fitLineRobustFromPoints(const QVector<QVector3D>& points, Eigen::Vector3f& start, Eigen::Vector3f& end,
+                                 QVector<QVector3D>& inlierPoints, QString& method) const;
     void showFitResult(const Eigen::Vector3f& start, const Eigen::Vector3f& end, const std::vector<int>& inliers);
+    void showPointListResult(const Eigen::Vector3f& start, const Eigen::Vector3f& end, const QVector<QVector3D>& points);
     void updateLineActor();
     void updateHandleWidgets();
     void updateResultText();

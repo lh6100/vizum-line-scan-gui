@@ -10,6 +10,7 @@ Qt-based desktop GUI for Vizum VzNL SDK line-laser 3D reconstruction cameras. It
 - Open and close the camera dust cover.
 - Run one swing-motor line scan and automatically save the reconstructed point cloud as a `.ply` file.
 - Automatically display the latest saved PLY in the weld seam fitting page after each successful scan.
+- Build an SDK RGB 2D-to-3D mapping cache during each scan, then draw a line on the RGB image and map it onto the 3D point cloud.
 - Export a welding-pipeline input sidecar `<scan>_points.csv` with clean camera-frame points in metres.
 - Repeat scans in the same session without reconnecting the camera.
 - Keep SDK callbacks lightweight by deep-copying laser lines into a queue and writing PLY data from the worker thread.
@@ -64,8 +65,9 @@ Run:
 5. Click `获取 RGB 图片` to capture, preview, and save one RGB frame if the camera supports RGB.
 6. Click `线扫建图并保存 PLY` and wait for the scan to finish.
 7. The saved PLY is loaded automatically in the `焊缝拟合` tab.
-8. Click the scan button again to perform another scan and save another PLY file.
-9. Click `关盖` and `关闭设备` when finished.
+8. Drag a line on the RGB image with the left mouse button to map that RGB line to 3D. The fitted 3D segment appears in the `焊缝拟合` tab.
+9. Click the scan button again to perform another scan and save another PLY file.
+10. Click `关盖` and `关闭设备` when finished.
 
 ## Weld Seam Fitting
 
@@ -79,6 +81,17 @@ Open the `焊缝拟合` tab:
 6. Copy the result to get the start/end coordinates in camera coordinates.
 
 The viewer automatically downsamples the displayed points for interaction when a cloud is large, but fitting still uses the full-resolution point cloud.
+
+## RGB Line to 3D
+
+After a successful scan, the worker keeps the Vizum SDK RGB point-cloud mapping tool alive. You can draw a line directly on the latest RGB preview:
+
+1. Capture an RGB image with `获取 RGB 图片`.
+2. Complete one `线扫建图并保存 PLY` while the scene remains physically still.
+3. Left-drag on the RGB preview to mark the seam line. Use the mouse wheel to zoom and right-drag to pan the RGB image while annotating.
+4. The GUI samples pixels along that RGB line, calls `VzNL_Find3DPointFrom2DPosForRGBCloudPointTool`, fits the returned 3D points with PCA, and shows the red 3D segment plus draggable endpoints in the `焊缝拟合` tab.
+
+The mapping cache is replaced on every new scan and cleared if the scan fails, the device is disconnected, or the device is rebooted.
 
 ## Output Files
 

@@ -8,7 +8,9 @@
 #include <QProcessEnvironment>
 #include <QImage>
 #include <QDateTime>
+#include <QSet>
 #include <cstring>
+#include <cmath>
 #include <unistd.h>
 
 static QString errString(int code) {
@@ -87,6 +89,7 @@ ScanWorker::ScanWorker(QObject* parent) : QObject(parent) {}
 ScanWorker::~ScanWorker() {
     // Ensure clean shutdown if user closed window while connected.
     disconnectDevice();
+    destroyRgbCloudMapping();
     destroySdk();
     clearQueue();
 }
@@ -236,6 +239,14 @@ bool ScanWorker::drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitS
             writeLaserLineCsv(*csv, ol.data, unitScale, totalLines);
         }
 
+        if (m_rgbCloudToolBuilding && m_rgbCloudTool) {
+            int mapRc = VzNL_PushPointToRGBCloudPointTool(m_rgbCloudTool, &ol.data);
+            if (mapRc != 0 && !m_rgbCloudPushFailed) {
+                emit log(QStringLiteral("RGB 2D->3D 映射推点失败: %1").arg(errString(mapRc)));
+                m_rgbCloudPushFailed = true;
+            }
+        }
+
         int rc = VzNL_WriteLaserFile(hFile, &ol.data);
         if (rc != 0) {
             emit log(QStringLiteral("WriteLaserFile: %1").arg(errString(rc)));
@@ -246,6 +257,98 @@ bool ScanWorker::drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitS
         }
     }
     return ok;
+}
+
+bool ScanWorker::beginRgbCloudMapping() {
+    destroyRgbCloudMapping();
+    if (!m_hDevice) {
+        return false;
+    }
+
+    m_rgbCloudTool = VzNL_CreateRGBCloudPointTool(m_hDevice);
+    if (!m_rgbCloudTool) {
+        emit log("RGB 2D->3D 映射工具创建失败，本次扫描仍会保存 PLY");
+        return false;
+    }
+
+    int rc = VzNL_BeginPushPointToRGBCloudPointTool(m_rgbCloudTool, keResultDataType_PointXYZRGBA);
+    if (rc != 0) {
+        emit log(QStringLiteral("RGB 2D->3D 映射工具初始化失败: %1").arg(errString(rc)));
+        VzNL_DestroyRGBCloudPointTool(m_rgbCloudTool);
+        m_rgbCloudTool = nullptr;
+        return false;
+    }
+
+    m_rgbCloudToolBuilding = true;
+    m_rgbCloudToolReady = false;
+    m_rgbCloudPushFailed = false;
+    emit log("RGB 2D->3D 映射缓存开始建立");
+    return true;
+}
+
+void ScanWorker::finishRgbCloudMapping() {
+    if (!m_rgbCloudTool || !m_rgbCloudToolBuilding) {
+        return;
+    }
+
+    int rc = VzNL_EndPushPointToRGBCloudPointTool(m_rgbCloudTool);
+    m_rgbCloudToolBuilding = false;
+    m_rgbCloudToolReady = (rc == 0 && !m_rgbCloudPushFailed);
+    if (rc != 0) {
+        emit log(QStringLiteral("RGB 2D->3D 映射缓存结束失败: %1").arg(errString(rc)));
+    } else if (m_rgbCloudToolReady) {
+        emit log("RGB 2D->3D 映射缓存已就绪，可在 RGB 图上画线映射到点云");
+    } else {
+        emit log("RGB 2D->3D 映射缓存存在推点错误，本次 RGB 画线映射不可用");
+    }
+}
+
+void ScanWorker::destroyRgbCloudMapping() {
+    if (!m_rgbCloudTool) {
+        m_rgbCloudToolBuilding = false;
+        m_rgbCloudToolReady = false;
+        return;
+    }
+    if (m_rgbCloudToolBuilding) {
+        VzNL_EndPushPointToRGBCloudPointTool(m_rgbCloudTool);
+    }
+    VzNL_DestroyRGBCloudPointTool(m_rgbCloudTool);
+    m_rgbCloudTool = nullptr;
+    m_rgbCloudToolBuilding = false;
+    m_rgbCloudToolReady = false;
+    m_rgbCloudPushFailed = false;
+}
+
+bool ScanWorker::findMapped3DNearPixel(const QPoint& pixel, int searchRadius, QVector3D& point) const {
+    if (!m_rgbCloudTool || !m_rgbCloudToolReady) {
+        return false;
+    }
+
+    for (int radius = 0; radius <= searchRadius; ++radius) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                if (radius > 0 && std::abs(dx) != radius && std::abs(dy) != radius) {
+                    continue;
+                }
+                SVzNL2DPoint p2d{};
+                p2d.x = pixel.x() + dx;
+                p2d.y = pixel.y() + dy;
+                SVzNL3DPoint p3d{};
+                int rc = VzNL_Find3DPointFrom2DPosForRGBCloudPointTool(m_rgbCloudTool, p2d, &p3d);
+                const bool validPoint = std::isfinite(p3d.x) &&
+                                        std::isfinite(p3d.y) &&
+                                        std::isfinite(p3d.z) &&
+                                        std::abs(p3d.z) > 1e-3;
+                if (rc == 0 && validPoint) {
+                    point = QVector3D(static_cast<float>(p3d.x),
+                                      static_cast<float>(p3d.y),
+                                      static_cast<float>(p3d.z));
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 // ---------------- Slots ----------------
@@ -394,6 +497,7 @@ void ScanWorker::disconnectDevice() {
     emit busyChanged(true);
 
     ensureClosedDetect();
+    destroyRgbCloudMapping();
 
     if (m_laserToolBegun) {
         VzNL_EndDetectLaser(m_hDevice);
@@ -419,6 +523,7 @@ void ScanWorker::rebootDevice() {
     else emit log("已发送重启命令");
 
     // After reboot we must close and let the user re-connect once camera comes back
+    destroyRgbCloudMapping();
     if (m_laserToolBegun) { VzNL_EndDetectLaser(m_hDevice); m_laserToolBegun = false; }
     VzNL_CloseDevice(m_hDevice);
     m_hDevice = nullptr;
@@ -584,6 +689,54 @@ void ScanWorker::grabRgbImage() {
     emit rgbImageReady(image, desc);
 }
 
+void ScanWorker::mapRgbLineTo3D(QPoint start, QPoint end, int sampleCount) {
+    if (!m_hDevice) {
+        emit log("未连接设备，无法执行 RGB 线段到 3D 映射");
+        emit rgbLineMapped({}, "未连接设备");
+        return;
+    }
+    if (m_scanRunning.load() || VzNL_IsAutoDetecting(m_hDevice, nullptr)) {
+        emit log("扫描中，暂不执行 RGB 线段映射");
+        emit rgbLineMapped({}, "扫描中");
+        return;
+    }
+    if (!m_rgbCloudToolReady || !m_rgbCloudTool) {
+        emit log("RGB 2D->3D 映射缓存未就绪，请先完成一次线扫建图");
+        emit rgbLineMapped({}, "请先线扫建图");
+        return;
+    }
+
+    sampleCount = std::max(2, std::min(sampleCount, 1000));
+    QVector<QVector3D> mappedPoints;
+    mappedPoints.reserve(sampleCount);
+
+    QSet<qint64> visited;
+    const int searchRadius = 8;
+    for (int i = 0; i < sampleCount; ++i) {
+        const double t = sampleCount == 1 ? 0.0 : static_cast<double>(i) / static_cast<double>(sampleCount - 1);
+        const int x = static_cast<int>(start.x() + (end.x() - start.x()) * t + 0.5);
+        const int y = static_cast<int>(start.y() + (end.y() - start.y()) * t + 0.5);
+        const qint64 key = (static_cast<qint64>(x) << 32) ^ static_cast<unsigned int>(y);
+        if (visited.contains(key)) {
+            continue;
+        }
+        visited.insert(key);
+
+        QVector3D p3d;
+        if (findMapped3DNearPixel(QPoint(x, y), searchRadius, p3d)) {
+            mappedPoints.push_back(p3d);
+        }
+    }
+
+    const QString desc = QStringLiteral("RGB线段 [%1,%2] -> [%3,%4], 采样%5，命中3D点%6")
+                             .arg(start.x()).arg(start.y())
+                             .arg(end.x()).arg(end.y())
+                             .arg(sampleCount)
+                             .arg(mappedPoints.size());
+    emit log(desc);
+    emit rgbLineMapped(mappedPoints, desc);
+}
+
 void ScanWorker::startScanAndSave(QString filePath) {
     if (!m_hDevice) { emit log("未连接设备"); emit scanFinished(false, filePath); return; }
     if (m_scanRunning.load()) { emit log("扫描中，请稍候"); return; }
@@ -594,10 +747,12 @@ void ScanWorker::startScanAndSave(QString filePath) {
 
     m_autoStopReceived.store(false);
     m_queueOverflow.store(false);
+    beginRgbCloudMapping();
 
     VZNLFILE hFile = VzNL_CreateLaserFile(keLaserFileType_Ply);
     if (!hFile) {
         emit log("创建 PLY 文件句柄失败");
+        destroyRgbCloudMapping();
         emit scanFinished(false, filePath);
         emit busyChanged(false);
         return;
@@ -608,6 +763,7 @@ void ScanWorker::startScanAndSave(QString filePath) {
     if (rc != 0) {
         emit log(QStringLiteral("打开输出文件失败: %1").arg(errString(rc)));
         VzNL_CloseLaserFile(hFile);
+        destroyRgbCloudMapping();
         emit scanFinished(false, filePath);
         emit busyChanged(false);
         return;
@@ -622,6 +778,7 @@ void ScanWorker::startScanAndSave(QString filePath) {
     if (!pointsCsvFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
         emit log(QStringLiteral("打开点云 CSV 失败: %1").arg(pointsCsvPath));
         VzNL_CloseLaserFile(hFile);
+        destroyRgbCloudMapping();
         emit scanFinished(false, filePath);
         emit busyChanged(false);
         return;
@@ -670,6 +827,7 @@ void ScanWorker::startScanAndSave(QString filePath) {
         m_scanRunning.store(false);
         emit log(QStringLiteral("开流失败: %1").arg(errString(rc)));
         VzNL_CloseLaserFile(hFile);
+        destroyRgbCloudMapping();
         clearQueue();
         emit scanFinished(false, filePath);
         emit busyChanged(false);
@@ -702,6 +860,7 @@ void ScanWorker::startScanAndSave(QString filePath) {
     // Drain any callbacks that arrived just before stop
     QThread::msleep(150);
     writeOk = drainQueueToFile(hFile, &pointsCsv, unitScale, totalLines, totalPts) && writeOk;
+    finishRgbCloudMapping();
 
     pointsCsv.flush();
     pointsCsvFile.close();
@@ -715,6 +874,10 @@ void ScanWorker::startScanAndSave(QString filePath) {
     }
     if (m_queueOverflow.load()) {
         emit log("回调队列积压过多，本次扫描已主动停止，点云可能不完整");
+    }
+    if (!ok) {
+        destroyRgbCloudMapping();
+        emit log("本次扫描未生成有效 RGB 2D->3D 映射缓存");
     }
     emit log(QStringLiteral("扫描完成：%1 行 / %2 点 -> %3 (%4)")
              .arg(totalLines).arg(totalPts).arg(filePath).arg(ok ? "OK" : "EMPTY"));
