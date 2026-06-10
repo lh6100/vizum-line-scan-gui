@@ -52,6 +52,8 @@ signals:
 private:
     void setBusy(bool busy);
     QString defaultPlyPath();
+    QString defaultRgbPath();
+    QString dataDirPath();
 
     QPushButton* m_btnConnect{};
     QPushButton* m_btnDisconnect{};
@@ -72,6 +74,7 @@ private:
 
     bool m_connected{false};
     int m_scanCounter{0};
+    int m_rgbCounter{0};
 };
 
 #endif // MAINWINDOW_H

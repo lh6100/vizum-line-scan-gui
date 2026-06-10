@@ -9,13 +9,14 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include <QGroupBox>
-#include <QFileDialog>
 #include <QDateTime>
 #include <QDir>
+#include <QCoreApplication>
 #include <QCloseEvent>
 #include <QMessageBox>
 #include <QTabWidget>
 #include <QPixmap>
+#include <QSizePolicy>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle("Vizum 线扫建图");
@@ -67,9 +68,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     l4->addLayout(rgbTop);
     m_rgbImageLabel = new QLabel("RGB 图片显示区域", this);
     m_rgbImageLabel->setAlignment(Qt::AlignCenter);
-    m_rgbImageLabel->setMinimumHeight(260);
+    m_rgbImageLabel->setFixedSize(360, 270);
+    m_rgbImageLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     m_rgbImageLabel->setStyleSheet("background:#111; color:#bbb; border:1px solid #444;");
-    l4->addWidget(m_rgbImageLabel);
+    l4->addWidget(m_rgbImageLabel, 0, Qt::AlignHCenter);
     root->addWidget(group4);
 
     m_logView = new QPlainTextEdit(this);
@@ -189,9 +191,19 @@ void MainWindow::onRgbImageReady(QImage image, QString desc) {
         onLog("RGB 图片为空");
         return;
     }
-    m_rgbInfoLabel->setText(desc);
+    const QString path = defaultRgbPath();
+    if (image.save(path)) {
+        m_rgbInfoLabel->setText(QStringLiteral("%1 -> %2").arg(desc, path));
+        onLog(QStringLiteral("RGB 图片已保存: %1").arg(path));
+    } else {
+        m_rgbInfoLabel->setText(desc);
+        onLog(QStringLiteral("RGB 图片保存失败: %1").arg(path));
+    }
+
+    const QSize displaySize = image.size().scaled(QSize(640, 360), Qt::KeepAspectRatio);
+    m_rgbImageLabel->setFixedSize(displaySize);
     const QPixmap pixmap = QPixmap::fromImage(image);
-    m_rgbImageLabel->setPixmap(pixmap.scaled(m_rgbImageLabel->size(),
+    m_rgbImageLabel->setPixmap(pixmap.scaled(displaySize,
                                              Qt::KeepAspectRatio,
                                              Qt::SmoothTransformation));
     onLog(QStringLiteral("RGB 图片已显示: %1").arg(desc));
@@ -219,8 +231,24 @@ void MainWindow::onBusyChanged(bool busy) {
 
 QString MainWindow::defaultPlyPath() {
     QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    QString dir = QDir::currentPath();
-    return QStringLiteral("%1/scan_%2_%3.ply").arg(dir).arg(stamp).arg(++m_scanCounter);
+    return QStringLiteral("%1/scan_%2_%3.ply").arg(dataDirPath()).arg(stamp).arg(++m_scanCounter);
+}
+
+QString MainWindow::defaultRgbPath() {
+    QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    return QStringLiteral("%1/rgb_%2_%3.png").arg(dataDirPath()).arg(stamp).arg(++m_rgbCounter);
+}
+
+QString MainWindow::dataDirPath() {
+    QDir dir(QCoreApplication::applicationDirPath());
+    if (dir.dirName() == "build") {
+        dir.cdUp();
+    }
+    if (!dir.exists("data")) {
+        dir.mkdir("data");
+    }
+    dir.cd("data");
+    return dir.absolutePath();
 }
 
 void MainWindow::onConnectClicked() { emit reqConnect(); }
@@ -232,9 +260,7 @@ void MainWindow::onCloseCoverClicked() { emit reqCloseCover(); }
 void MainWindow::onGrabRgbClicked() { emit reqGrabRgb(); }
 
 void MainWindow::onScanClicked() {
-    QString suggested = defaultPlyPath();
-    QString path = QFileDialog::getSaveFileName(this, "保存点云为 PLY", suggested, "PLY (*.ply)");
-    if (path.isEmpty()) return;
-    if (!path.endsWith(".ply", Qt::CaseInsensitive)) path += ".ply";
+    const QString path = defaultPlyPath();
+    onLog(QStringLiteral("开始扫描，PLY 将保存到: %1").arg(path));
     emit reqScan(path);
 }

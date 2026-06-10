@@ -6,9 +6,9 @@ Qt-based desktop GUI for Vizum VzNL SDK line-laser 3D reconstruction cameras. It
 
 - Connect, disconnect, and reboot a Vizum Ethernet laser robot camera.
 - Read SDK, device, firmware, algorithm, hardware, and swing-motor version information.
-- Capture and preview an RGB frame from supported Vizum RGB cameras.
+- Capture, preview, and automatically save an RGB frame from supported Vizum RGB cameras.
 - Open and close the camera dust cover.
-- Run one swing-motor line scan and save the reconstructed point cloud as a `.ply` file.
+- Run one swing-motor line scan and automatically save the reconstructed point cloud as a `.ply` file.
 - Automatically display the latest saved PLY in the weld seam fitting page after each successful scan.
 - Export a welding-pipeline input sidecar `<scan>_points.csv` with clean camera-frame points in metres.
 - Repeat scans in the same session without reconnecting the camera.
@@ -61,8 +61,8 @@ Run:
 2. Start the GUI.
 3. Click `连接设备`.
 4. Click `开盖` if the device supports dust-cover control.
-5. Click `获取 RGB 图片` to capture and preview one RGB frame if the camera supports RGB.
-6. Click `线扫建图并保存 PLY`, choose an output path, and wait for the scan to finish.
+5. Click `获取 RGB 图片` to capture, preview, and save one RGB frame if the camera supports RGB.
+6. Click `线扫建图并保存 PLY` and wait for the scan to finish.
 7. The saved PLY is loaded automatically in the `焊缝拟合` tab.
 8. Click the scan button again to perform another scan and save another PLY file.
 9. Click `关盖` and `关闭设备` when finished.
@@ -80,7 +80,24 @@ Open the `焊缝拟合` tab:
 
 The viewer automatically downsamples the displayed points for interaction when a cloud is large, but fitting still uses the full-resolution point cloud.
 
-Each successful scan writes three files next to the selected `.ply`:
+## Output Files
+
+RGB images and scanned point clouds are saved automatically under:
+
+```text
+VizumScanGUI/data/
+```
+
+File names use timestamps:
+
+```text
+rgb_yyyyMMdd_HHmmss_N.png
+scan_yyyyMMdd_HHmmss_N.ply
+scan_yyyyMMdd_HHmmss_N_points.csv
+scan_yyyyMMdd_HHmmss_N.csv
+```
+
+Each successful scan writes three files using the same timestamp stem:
 
 ```text
 <scan>.ply          # SDK PLY export
