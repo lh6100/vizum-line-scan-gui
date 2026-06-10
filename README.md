@@ -297,6 +297,252 @@ VIZUM_POINT_UNIT_SCALE=1 ./build/VizumScanGUI      # SDK 原始点已经是米
 
 第二，先只做 `点云：拟合平面`。如果平面拟合稳定，再继续做直线提取和焊点生成。不要在手眼标定和 TCP 标定未完成时直接执行机器人焊接。
 
+## 中文操作流程：VIZUM 点到法奥 TCP 目标
+
+本工程现在增加了一个独立的机器人坐标转换/运动验证层，不改变 VIZUM 扫描 GUI，也不改变焊接路径生成层。它的输入是相机坐标系点，单位毫米；输出是法奥基坐标系焊缝点和 TCP 运动目标，单位毫米/角度。
+
+核心坐标链为：
+
+```text
+P_base = T_base_flange * T_flange_camera * P_camera
+```
+
+默认不反转手眼矩阵。只有当你的标定结果是 `T_camera_flange` 时，才把 `config/handeye_config.yaml` 中的 `mode` 改成：
+
+```yaml
+mode: flange_to_camera
+```
+
+### 1. 检查配置文件
+
+机器人 IP：
+
+```text
+config/robot_config.yaml
+```
+
+默认内容：
+
+```yaml
+robot_ip: 192.168.1.200
+enable_robot_motion: false
+```
+
+手眼矩阵：
+
+```text
+config/handeye_config.yaml
+```
+
+默认矩阵是当前待标定值，表示 `T_flange_camera`，单位毫米：
+
+```text
+[-0.98,  0.00, -0.21, -114.12]
+[-0.03, -0.99,  0.10,  -44.02]
+[-0.21,  0.10,  0.97,  125.38]
+[ 0.00,  0.00,  0.00,    1.00]
+```
+
+焊枪 TCP/tool3：
+
+```text
+config/tool_config.yaml
+```
+
+默认值：
+
+```yaml
+tool_id: 3
+x: 0.326
+y: -194.553
+z: 368.943
+rx: -169.517
+ry: 8.355
+rz: 1.904
+```
+
+如果程序已经连接机器人，会优先调用法奥 SDK 的 `GetToolCoordWithID(tool_id)` 读取工具坐标；没有连接时使用上面的手动配置。
+
+运动安全开关：
+
+```text
+config/weld_motion_config.yaml
+```
+
+默认是安全干运行：
+
+```yaml
+dry_run: true
+enable_robot_motion: false
+enable_arc: false
+```
+
+### 2. 编译并运行离线验证
+
+```bash
+cd ~/lh/vizum-line-scan-gui
+cmake -S . -B build
+cmake --build build --target CameraToBaseTest -j$(nproc)
+./build/CameraToBaseTest
+```
+
+期望看到接近下面的输出：
+
+```text
+Start_base(mm): [278.08, -509.08, -48.82]
+End_base(mm):   [296.96, -515.72, -47.85]
+Line length(mm): 20.04
+Dry-run: no robot motion sent.
+Camera-to-base test passed.
+```
+
+这说明相机点 `Start_camera=[35.615,61.376,376.638]` 和 `End_camera=[49.096,76.015,374.845]` 已经按法奥浮动坐标 ZYX 顺序转换到了基坐标系。当前程序使用的欧拉角公式是：
+
+```text
+R = Rz(RZ) * Ry(RY) * Rx(RX)
+```
+
+### 3. 真机运动前必须确认
+
+先只连接机器人读取当前法兰/TCP，不运动。修改：
+
+```yaml
+# config/robot_config.yaml
+robot_ip: 192.168.1.200
+connect_robot: true
+enable_robot_motion: false
+
+# config/weld_motion_config.yaml
+dry_run: true
+enable_robot_motion: false
+enable_arc: false
+```
+
+编译并运行现场连接验证程序：
+
+```bash
+cd ~/lh/vizum-line-scan-gui
+cmake -S . -B build
+cmake --build build --target FairinoWeldMoveDemo -j$(nproc)
+./build/FairinoWeldMoveDemo
+```
+
+也可以直接传入 VIZUM 焊缝起点/终点，相机坐标系，单位毫米：
+
+```bash
+./build/FairinoWeldMoveDemo sx sy sz ex ey ez
+```
+
+例如：
+
+```bash
+./build/FairinoWeldMoveDemo 35.615 61.376 376.638 49.096 76.015 374.845
+```
+
+程序会读取并打印：
+
+```text
+Current flange pose
+Current TCP pose
+Tool3 coord
+```
+
+然后保持干运行，观察打印出的三个 TCP 目标：
+
+```text
+Approach TCP   # 起点上方 safe_height_mm
+Start TCP      # 焊缝起点
+End TCP        # 焊缝终点
+```
+
+确认无误后，才允许同时打开两个开关：
+
+```yaml
+# config/robot_config.yaml
+connect_robot: true
+enable_robot_motion: true
+
+# config/weld_motion_config.yaml
+dry_run: false
+enable_robot_motion: true
+```
+
+如果需要程序自动上使能和切自动模式，再打开：
+
+```yaml
+# config/robot_config.yaml
+auto_enable: true
+auto_mode: true
+```
+
+程序会通过法奥 SDK 调用：
+
+```text
+RPC("192.168.1.200")
+RobotEnable(1)     # 仅 auto_enable: true 时调用
+Mode(0)            # 仅 auto_mode: true 时调用
+GetActualToolFlangePose
+GetActualTCPPose
+GetToolCoordWithID(3)
+MoveL
+```
+
+默认速度很低，且 `enable_arc` 仍为 `false`，当前版本只做 TCP 直线运动验证，不启动焊机。
+
+### 4. 在 VizumScanGUI 里操作机械臂
+
+启动 GUI：
+
+```bash
+./build/VizumScanGUI
+```
+
+界面现在有三个页签：
+
+```text
+线扫建图
+焊缝拟合
+机械臂控制
+```
+
+推荐现场顺序：
+
+1. 在 `线扫建图` 页扫描并保存 PLY。
+2. 在 `焊缝拟合` 页加载 PLY，点击焊缝附近点，得到 Start/End Camera 端点。
+3. 切到 `机械臂控制` 页，端点会自动同步到 `焊缝 Camera 线段端点(mm)`。
+4. 点击 `连接机械臂`。
+5. 点击 `读取当前法兰/TCP`。
+6. 点击 `计算焊枪 TCP 点位`，先看日志里的：
+
+```text
+Start_base
+End_base
+Approach TCP
+Start TCP
+End TCP
+```
+
+7. 保持 `干运行：只打印，不发运动` 勾选时，点击 `执行 MoveL 三点` 只会打印，不会动机器人。
+8. 真运动前，必须确认点位安全，再取消干运行并勾选 `允许真运动 MoveL`。
+
+机械臂控制页按钮含义：
+
+```text
+连接机械臂              RPC 连接 192.168.1.200
+读取当前法兰/TCP        读取 GetActualToolFlangePose 和 GetActualTCPPose
+上伺服                  RobotEnable(1)
+下伺服                  RobotEnable(0)
+切自动模式              Mode(0)
+复位错误                ResetAllError
+停止运动/急停移动       StopMotion，软件停止当前运动
+暂停运动                PauseMotion
+继续运动                ResumeMotion
+计算焊枪 TCP 点位       只计算并打印目标点
+执行 MoveL 三点          Approach -> Start -> End
+```
+
+`停止运动/急停移动` 是 SDK 的 `StopMotion` 软件停止命令，不替代控制柜硬件急停。
+
 ## Implementation Notes
 
 The scan path follows the SDK sequence:

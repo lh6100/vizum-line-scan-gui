@@ -544,6 +544,8 @@ void WeldSeamWidget::updateResultText() {
     }
     text += "\n拖动绿色球体调整起点，拖动红色球体调整终点。";
     m_resultText->setPlainText(text);
+    emit cameraLineChanged(m_startPoint.x(), m_startPoint.y(), m_startPoint.z(),
+                           m_endPoint.x(), m_endPoint.y(), m_endPoint.z());
 }
 
 void WeldSeamWidget::clearFit() {

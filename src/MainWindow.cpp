@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "RobotControlWidget.h"
 #include "ScanWorker.h"
 #include "WeldSeamWidget.h"
 
@@ -60,9 +61,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     m_logView->setMaximumBlockCount(2000);
     root->addWidget(m_logView, 1);
 
+    auto* weldWidget = new WeldSeamWidget(this);
+    auto* robotWidget = new RobotControlWidget(this);
     tabs->addTab(scanTab, "线扫建图");
-    tabs->addTab(new WeldSeamWidget(this), "焊缝拟合");
+    tabs->addTab(weldWidget, "焊缝拟合");
+    tabs->addTab(robotWidget, "机械臂控制");
     setCentralWidget(tabs);
+
+    connect(weldWidget, &WeldSeamWidget::cameraLineChanged,
+            robotWidget, &RobotControlWidget::setCameraLineFromFit);
 
     // --- Worker thread ---
     m_worker = new ScanWorker;            // do NOT pass parent: it gets moved to thread

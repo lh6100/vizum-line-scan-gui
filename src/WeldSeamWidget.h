@@ -35,6 +35,9 @@ public:
     explicit WeldSeamWidget(QWidget* parent = nullptr);
     ~WeldSeamWidget() override;
 
+signals:
+    void cameraLineChanged(double sx, double sy, double sz, double ex, double ey, double ez);
+
 private slots:
     void loadPointCloud();
     void clearFit();

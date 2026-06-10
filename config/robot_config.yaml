@@ -1,0 +1,12 @@
+# Fairino controller connection.
+robot_ip: 192.168.1.200
+
+# Set true to connect and read current flange/TCP/tool data.
+connect_robot: false
+
+# Must be true before code is allowed to send robot motion.
+enable_robot_motion: false
+
+# Optional helpers for real motion. Keep false unless the cell is ready.
+auto_enable: false
+auto_mode: false

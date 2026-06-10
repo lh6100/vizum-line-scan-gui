@@ -1,0 +1,12 @@
+# Fairino tool/user coordinates.
+tool_id: 3
+user_id: 0
+
+# Fallback flange -> TCP/tool pose, units mm/deg.
+# The code will prefer GetToolCoordWithID(tool_id) when robot SDK is connected.
+x: 0.326
+y: -194.553
+z: 368.943
+rx: -169.517
+ry: 8.355
+rz: 1.904

@@ -1,0 +1,15 @@
+# Software safety defaults. Keep dry_run true while calibrating.
+dry_run: true
+enable_robot_motion: false
+enable_arc: false
+
+safe_height_mm: 50.0
+vel: 5.0
+acc: 20.0
+ovl: 10.0
+blend_r: -1.0
+
+# Process offset from weld point to TCP target in base coordinates.
+process_offset_x: 0.0
+process_offset_y: 0.0
+process_offset_z: 0.0

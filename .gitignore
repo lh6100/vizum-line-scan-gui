@@ -15,6 +15,8 @@ qrc_*.cpp
 ui_*.h
 
 # Runtime output
+data/
+SDK/fairino-cpp-sdk-3.9.4/
 *.ply
 *.pcd
 *.las
