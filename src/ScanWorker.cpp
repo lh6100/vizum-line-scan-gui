@@ -6,6 +6,8 @@
 #include <QElapsedTimer>
 #include <QTextStream>
 #include <QProcessEnvironment>
+#include <QImage>
+#include <QDateTime>
 #include <cstring>
 #include <unistd.h>
 
@@ -13,6 +15,39 @@ static QString errString(int code) {
     char buf[256] = {0};
     VzNL_GetErrorInfo(code, buf);
     return QStringLiteral("[%1] %2").arg(code).arg(QString::fromLocal8Bit(buf));
+}
+
+static QImage imageFromVzImage(const SVzNLImageData* image) {
+    if (!image || !image->pBuffer || image->nWidth == 0 || image->nHeight == 0) {
+        return {};
+    }
+
+    const int width = static_cast<int>(image->nWidth);
+    const int height = static_cast<int>(image->nHeight);
+    const int channels = static_cast<int>(image->nChannels);
+    const int stride = width * channels;
+    if (stride <= 0 || image->nBufferSize < static_cast<unsigned int>(stride * height)) {
+        return {};
+    }
+
+    switch (image->eImageType) {
+    case keVzNLImageType_RGB888:
+        return QImage(image->pBuffer, width, height, stride, QImage::Format_RGB888).copy();
+    case keVzNLImageType_BGR888:
+        return QImage(image->pBuffer, width, height, stride, QImage::Format_BGR888).copy();
+    case keVzNLImageType_GRAY:
+        return QImage(image->pBuffer, width, height, width, QImage::Format_Grayscale8).copy();
+    case keVzNLImageType_BGRA8888:
+        return QImage(image->pBuffer, width, height, width * 4, QImage::Format_ARGB32).copy();
+    default:
+        if (channels == 3) {
+            return QImage(image->pBuffer, width, height, stride, QImage::Format_RGB888).copy();
+        }
+        if (channels == 1) {
+            return QImage(image->pBuffer, width, height, width, QImage::Format_Grayscale8).copy();
+        }
+        return {};
+    }
 }
 
 OwnedLaserLine::OwnedLaserLine() {
@@ -290,15 +325,27 @@ void ScanWorker::connectDevice() {
         return;
     }
     m_hDevice = h;
+    int rc = 0;
 
     // Output image format
     VzNL_SetOutputImageFormat(keVzNLImageType_BGR888);
+
+    if (VzNL_IsSupportRGBCamera(m_hDevice, nullptr) == VzTrue) {
+        rc = VzNL_EnableRGB(m_hDevice, VzTrue);
+        if (rc != 0) {
+            emit log(QStringLiteral("EnableRGB: %1").arg(errString(rc)));
+        } else {
+            emit log("RGB 相机已启用");
+        }
+    } else {
+        emit log("当前设备不支持 RGB 相机");
+    }
 
     // Status callback for auto-stop signal
     VzNL_SetDeviceStatusNotify(m_hDevice, &ScanWorker::s_onDeviceStatusCB, this);
 
     // Begin laser detect tool
-    int rc = VzNL_BeginDetectLaser(m_hDevice);
+    rc = VzNL_BeginDetectLaser(m_hDevice);
     if (rc != 0) {
         emit log(QStringLiteral("BeginDetectLaser 失败: %1").arg(errString(rc)));
         VzNL_CloseDevice(m_hDevice); m_hDevice = nullptr;
@@ -470,6 +517,71 @@ void ScanWorker::closeCover() {
     int rc = VzNL_CoverCamera(m_hDevice, VzTrue);  // true = close
     if (rc != 0) emit log(QStringLiteral("关盖失败: %1").arg(errString(rc)));
     else emit log("防尘盖已关");
+}
+
+void ScanWorker::grabRgbImage() {
+    if (!m_hDevice) {
+        emit log("未连接设备，无法获取 RGB 图片");
+        return;
+    }
+    if (m_scanRunning.load() || VzNL_IsAutoDetecting(m_hDevice, nullptr)) {
+        emit log("扫描中，暂不获取 RGB 图片");
+        return;
+    }
+    if (VzNL_IsSupportRGBCamera(m_hDevice, nullptr) != VzTrue) {
+        emit log("当前设备不支持 RGB 相机");
+        return;
+    }
+
+    int rc = 0;
+    if (VzNL_IsEnableRGB(m_hDevice, &rc) != VzTrue) {
+        rc = VzNL_EnableRGB(m_hDevice, VzTrue);
+        if (rc != 0) {
+            emit log(QStringLiteral("启用 RGB 失败: %1").arg(errString(rc)));
+            return;
+        }
+    }
+
+    SVzNLImageData* rgbImage = nullptr;
+    rc = VzNL_GetRGBImage(m_hDevice, &rgbImage);
+    if (rc != 0 || !rgbImage) {
+        VzNL_GenRGBSoftSignal(m_hDevice);
+        QThread::msleep(150);
+        rc = VzNL_GetRGBImage(m_hDevice, &rgbImage);
+    }
+
+    if (rc != 0 || !rgbImage) {
+        emit log(QStringLiteral("获取 RGB 图片失败: %1").arg(errString(rc)));
+        return;
+    }
+
+    QImage image = imageFromVzImage(rgbImage);
+    if (image.isNull()) {
+        const QString tmpPath = QDir::temp().filePath(
+            QStringLiteral("vizum_rgb_%1.png").arg(QDateTime::currentMSecsSinceEpoch()));
+        const QByteArray tmpLocal = tmpPath.toLocal8Bit();
+        int saveRc = VzNL_SaveImage(tmpLocal.constData(), rgbImage);
+        if (saveRc == 0) {
+            image.load(tmpPath);
+            QFile::remove(tmpPath);
+        } else {
+            emit log(QStringLiteral("RGB 图片格式转换失败，SaveImage: %1").arg(errString(saveRc)));
+        }
+    }
+    const QString desc = QStringLiteral("RGB %1x%2 type=%3 channels=%4")
+                             .arg(rgbImage->nWidth)
+                             .arg(rgbImage->nHeight)
+                             .arg(static_cast<int>(rgbImage->eImageType))
+                             .arg(rgbImage->nChannels);
+    VzNL_ReleaseImage(&rgbImage);
+
+    if (image.isNull()) {
+        emit log("RGB 图片格式暂不支持或数据为空");
+        return;
+    }
+
+    emit log(QStringLiteral("已获取 %1").arg(desc));
+    emit rgbImageReady(image, desc);
 }
 
 void ScanWorker::startScanAndSave(QString filePath) {

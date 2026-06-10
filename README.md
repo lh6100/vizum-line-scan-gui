@@ -6,8 +6,10 @@ Qt-based desktop GUI for Vizum VzNL SDK line-laser 3D reconstruction cameras. It
 
 - Connect, disconnect, and reboot a Vizum Ethernet laser robot camera.
 - Read SDK, device, firmware, algorithm, hardware, and swing-motor version information.
+- Capture and preview an RGB frame from supported Vizum RGB cameras.
 - Open and close the camera dust cover.
 - Run one swing-motor line scan and save the reconstructed point cloud as a `.ply` file.
+- Automatically display the latest saved PLY in the weld seam fitting page after each successful scan.
 - Export a welding-pipeline input sidecar `<scan>_points.csv` with clean camera-frame points in metres.
 - Repeat scans in the same session without reconnecting the camera.
 - Keep SDK callbacks lightweight by deep-copying laser lines into a queue and writing PLY data from the worker thread.
@@ -59,9 +61,11 @@ Run:
 2. Start the GUI.
 3. Click `连接设备`.
 4. Click `开盖` if the device supports dust-cover control.
-5. Click `线扫建图并保存 PLY`, choose an output path, and wait for the scan to finish.
-6. Click the scan button again to perform another scan and save another PLY file.
-7. Click `关盖` and `关闭设备` when finished.
+5. Click `获取 RGB 图片` to capture and preview one RGB frame if the camera supports RGB.
+6. Click `线扫建图并保存 PLY`, choose an output path, and wait for the scan to finish.
+7. The saved PLY is loaded automatically in the `焊缝拟合` tab.
+8. Click the scan button again to perform another scan and save another PLY file.
+9. Click `关盖` and `关闭设备` when finished.
 
 ## Weld Seam Fitting
 

@@ -15,6 +15,7 @@
 #include <QCloseEvent>
 #include <QMessageBox>
 #include <QTabWidget>
+#include <QPixmap>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle("Vizum 线扫建图");
@@ -56,19 +57,34 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     l3->addWidget(m_btnScan);
     root->addWidget(group3);
 
+    auto* group4 = new QGroupBox("RGB图片", this);
+    auto* l4 = new QVBoxLayout(group4);
+    auto* rgbTop = new QHBoxLayout;
+    m_btnGrabRgb = new QPushButton("获取 RGB 图片", this);
+    m_rgbInfoLabel = new QLabel("未获取 RGB 图片", this);
+    rgbTop->addWidget(m_btnGrabRgb);
+    rgbTop->addWidget(m_rgbInfoLabel, 1);
+    l4->addLayout(rgbTop);
+    m_rgbImageLabel = new QLabel("RGB 图片显示区域", this);
+    m_rgbImageLabel->setAlignment(Qt::AlignCenter);
+    m_rgbImageLabel->setMinimumHeight(260);
+    m_rgbImageLabel->setStyleSheet("background:#111; color:#bbb; border:1px solid #444;");
+    l4->addWidget(m_rgbImageLabel);
+    root->addWidget(group4);
+
     m_logView = new QPlainTextEdit(this);
     m_logView->setReadOnly(true);
     m_logView->setMaximumBlockCount(2000);
     root->addWidget(m_logView, 1);
 
-    auto* weldWidget = new WeldSeamWidget(this);
+    m_weldWidget = new WeldSeamWidget(this);
     auto* robotWidget = new RobotControlWidget(this);
     tabs->addTab(scanTab, "线扫建图");
-    tabs->addTab(weldWidget, "焊缝拟合");
+    tabs->addTab(m_weldWidget, "焊缝拟合");
     tabs->addTab(robotWidget, "机械臂控制");
     setCentralWidget(tabs);
 
-    connect(weldWidget, &WeldSeamWidget::cameraLineChanged,
+    connect(m_weldWidget, &WeldSeamWidget::cameraLineChanged,
             robotWidget, &RobotControlWidget::setCameraLineFromFit);
 
     // --- Worker thread ---
@@ -82,6 +98,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_worker, &ScanWorker::connectionChanged, this, &MainWindow::onConnectionChanged, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::scanFinished, this, &MainWindow::onScanFinished, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::busyChanged, this, &MainWindow::onBusyChanged, Qt::QueuedConnection);
+    connect(m_worker, &ScanWorker::rgbImageReady, this, &MainWindow::onRgbImageReady, Qt::QueuedConnection);
 
     connect(this, &MainWindow::reqInit, m_worker, &ScanWorker::initSdk, Qt::QueuedConnection);
     connect(this, &MainWindow::reqConnect, m_worker, &ScanWorker::connectDevice, Qt::QueuedConnection);
@@ -92,6 +109,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(this, &MainWindow::reqOpenCover, m_worker, &ScanWorker::openCover, Qt::QueuedConnection);
     connect(this, &MainWindow::reqCloseCover, m_worker, &ScanWorker::closeCover, Qt::QueuedConnection);
     connect(this, &MainWindow::reqScan, m_worker, &ScanWorker::startScanAndSave, Qt::QueuedConnection);
+    connect(this, &MainWindow::reqGrabRgb, m_worker, &ScanWorker::grabRgbImage, Qt::QueuedConnection);
 
     // --- Button signals ---
     connect(m_btnConnect, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
@@ -101,6 +119,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_btnOpenCover, &QPushButton::clicked, this, &MainWindow::onOpenCoverClicked);
     connect(m_btnCloseCover, &QPushButton::clicked, this, &MainWindow::onCloseCoverClicked);
     connect(m_btnScan, &QPushButton::clicked, this, &MainWindow::onScanClicked);
+    connect(m_btnGrabRgb, &QPushButton::clicked, this, &MainWindow::onGrabRgbClicked);
 
     onConnectionChanged(false);
 
@@ -150,14 +169,32 @@ void MainWindow::onConnectionChanged(bool connected) {
     m_btnOpenCover->setEnabled(connected);
     m_btnCloseCover->setEnabled(connected);
     m_btnScan->setEnabled(connected);
+    m_btnGrabRgb->setEnabled(connected);
 }
 
 void MainWindow::onScanFinished(bool ok, QString path) {
     if (ok) {
         onLog(QStringLiteral("点云已保存: %1").arg(path));
+        if (m_weldWidget) {
+            m_weldWidget->loadCloudFile(path);
+            onLog(QStringLiteral("已在焊缝拟合页展示点云: %1").arg(path));
+        }
     } else {
         onLog(QStringLiteral("扫描未保存有效点云"));
     }
+}
+
+void MainWindow::onRgbImageReady(QImage image, QString desc) {
+    if (image.isNull()) {
+        onLog("RGB 图片为空");
+        return;
+    }
+    m_rgbInfoLabel->setText(desc);
+    const QPixmap pixmap = QPixmap::fromImage(image);
+    m_rgbImageLabel->setPixmap(pixmap.scaled(m_rgbImageLabel->size(),
+                                             Qt::KeepAspectRatio,
+                                             Qt::SmoothTransformation));
+    onLog(QStringLiteral("RGB 图片已显示: %1").arg(desc));
 }
 
 void MainWindow::setBusy(bool busy) {
@@ -169,6 +206,7 @@ void MainWindow::setBusy(bool busy) {
         m_btnOpenCover->setEnabled(false);
         m_btnCloseCover->setEnabled(false);
         m_btnScan->setEnabled(false);
+        m_btnGrabRgb->setEnabled(false);
     } else {
         // Re-evaluate based on connection state
         onConnectionChanged(m_connected);
@@ -191,6 +229,7 @@ void MainWindow::onRebootClicked() { emit reqReboot(); }
 void MainWindow::onGetVersionsClicked() { emit reqGetVersions(); }
 void MainWindow::onOpenCoverClicked() { emit reqOpenCover(); }
 void MainWindow::onCloseCoverClicked() { emit reqCloseCover(); }
+void MainWindow::onGrabRgbClicked() { emit reqGrabRgb(); }
 
 void MainWindow::onScanClicked() {
     QString suggested = defaultPlyPath();

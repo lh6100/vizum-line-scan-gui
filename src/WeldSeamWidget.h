@@ -35,6 +35,9 @@ public:
     explicit WeldSeamWidget(QWidget* parent = nullptr);
     ~WeldSeamWidget() override;
 
+public slots:
+    void loadCloudFile(QString filePath);
+
 signals:
     void cameraLineChanged(double sx, double sy, double sz, double ex, double ey, double ez);
 

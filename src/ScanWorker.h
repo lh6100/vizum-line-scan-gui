@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QMutex>
+#include <QImage>
 #include <atomic>
 #include <queue>
 #include <vector>
@@ -15,8 +16,10 @@ class QTextStream;
 #include "VZNL_DetectLaser.h"
 #include "VZNL_DetectConfig.h"
 #include "VZNL_DustCover.h"
+#include "VZNL_RGBConfig.h"
 #include "VZNL_SwingMotor.h"
 #include "VZNL_FileUtils.h"
+#include "VZNL_Graphics.h"
 #include "VZNL_Utils.h"
 #include "VZNL_Types.h"
 
@@ -53,6 +56,9 @@ public slots:
     void openCover();         // VzNL_CoverCamera(false)
     void closeCover();        // VzNL_CoverCamera(true)
 
+    // --- RGB
+    void grabRgbImage();      // one RGB frame -> QImage
+
     // --- Scan
     void startScanAndSave(QString filePath);  // one full scan -> .ply
 
@@ -61,6 +67,7 @@ signals:
     void connectionChanged(bool connected);
     void scanFinished(bool ok, QString filePath);
     void busyChanged(bool busy);
+    void rgbImageReady(QImage image, QString desc);
 
 private:
     // SDK callback: must be free of SDK calls; only enqueues a deep copy.

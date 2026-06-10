@@ -208,6 +208,11 @@ void WeldSeamWidget::loadPointCloud() {
                                               : QFileInfo(m_loadedPath).absolutePath();
     QString filePath = QFileDialog::getOpenFileName(this, "加载 PLY 点云", startDir, "PLY (*.ply)");
     if (filePath.isEmpty()) return;
+    loadCloudFile(filePath);
+}
+
+void WeldSeamWidget::loadCloudFile(QString filePath) {
+    if (filePath.isEmpty()) return;
     loadCloudFromPath(filePath);
 }
 
