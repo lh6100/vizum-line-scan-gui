@@ -67,12 +67,18 @@ public:
             return;
         }
         this->GrabFocus(this->EventCallbackCommand);
-        this->StartRotate();
+        if (this->Interactor->GetControlKey()) {
+            this->StartPan();
+        } else {
+            this->StartRotate();
+        }
     }
 
     void OnRightButtonUp() override {
         if (this->State == VTKIS_ROTATE) {
             this->EndRotate();
+        } else if (this->State == VTKIS_PAN) {
+            this->EndPan();
         }
         if (this->Interactor) {
             this->ReleaseFocus();
@@ -113,7 +119,7 @@ WeldSeamWidget::WeldSeamWidget(QWidget* parent)
     m_minPointsSpin->setValue(80);
 
     m_fileLabel = new QLabel("未加载点云", this);
-    m_pickLabel = new QLabel("中键点击焊缝附近点进行拟合；滚轮缩放，右键旋转，左键拖动端点球体。", this);
+    m_pickLabel = new QLabel("中键点击焊缝附近点进行拟合；滚轮缩放，右键旋转，Ctrl+右键平移，左键拖动端点球体。", this);
 
     grid->addWidget(m_btnLoad, 0, 0);
     grid->addWidget(m_btnClear, 0, 1);
