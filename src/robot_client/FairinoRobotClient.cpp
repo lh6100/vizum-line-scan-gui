@@ -7,6 +7,8 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <chrono>
+#include <thread>
 
 namespace fairino_client {
 
@@ -109,7 +111,11 @@ bool FairinoRobotClient::connectRobot(const RobotConfig& config) {
         return false;
     }
 #if defined(HAVE_FAIRINO_SDK)
-    const errno_t err = robot_->RPC(config.ip.c_str());
+    errno_t err = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        err = robot_->RPC(config.ip.c_str());
+    }
     connected_ = (err == 0);
     if (!connected_) {
         std::cerr << "FRRobot::RPC failed, err=" << err << std::endl;
@@ -126,6 +132,7 @@ bool FairinoRobotClient::connectRobot(const RobotConfig& config) {
 void FairinoRobotClient::disconnectRobot() {
 #if defined(HAVE_FAIRINO_SDK)
     if (connected_ && robot_) {
+        std::lock_guard<std::mutex> lock(mutex_);
         robot_->CloseRPC();
     }
 #endif
@@ -142,6 +149,7 @@ bool FairinoRobotClient::prepareForMotion(const RobotConfig& config) {
         return false;
     }
     if (config.autoEnable) {
+        std::lock_guard<std::mutex> lock(mutex_);
         const errno_t err = robot_->RobotEnable(1);
         if (err != 0) {
             std::cerr << "RobotEnable(1) failed, err=" << err << std::endl;
@@ -150,6 +158,7 @@ bool FairinoRobotClient::prepareForMotion(const RobotConfig& config) {
         std::cout << "RobotEnable(1) sent." << std::endl;
     }
     if (config.autoMode) {
+        std::lock_guard<std::mutex> lock(mutex_);
         const errno_t err = robot_->Mode(0);
         if (err != 0) {
             std::cerr << "Mode(0) failed, err=" << err << std::endl;
@@ -170,6 +179,7 @@ bool FairinoRobotClient::enableRobot(bool enabled) {
         std::cerr << "Robot is not connected." << std::endl;
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     const errno_t err = robot_->RobotEnable(enabled ? 1 : 0);
     if (err != 0) {
         std::cerr << "RobotEnable(" << (enabled ? 1 : 0) << ") failed, err=" << err << std::endl;
@@ -188,6 +198,7 @@ bool FairinoRobotClient::setAutoMode() {
         std::cerr << "Robot is not connected." << std::endl;
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     const errno_t err = robot_->Mode(0);
     if (err != 0) {
         std::cerr << "Mode(0) failed, err=" << err << std::endl;
@@ -205,6 +216,7 @@ bool FairinoRobotClient::stopMotion() {
         std::cerr << "Robot is not connected." << std::endl;
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     const errno_t err = robot_->StopMotion();
     if (err != 0) {
         std::cerr << "StopMotion failed, err=" << err << std::endl;
@@ -222,6 +234,7 @@ bool FairinoRobotClient::pauseMotion() {
         std::cerr << "Robot is not connected." << std::endl;
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     const errno_t err = robot_->PauseMotion();
     if (err != 0) {
         std::cerr << "PauseMotion failed, err=" << err << std::endl;
@@ -239,6 +252,7 @@ bool FairinoRobotClient::resumeMotion() {
         std::cerr << "Robot is not connected." << std::endl;
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     const errno_t err = robot_->ResumeMotion();
     if (err != 0) {
         std::cerr << "ResumeMotion failed, err=" << err << std::endl;
@@ -256,6 +270,7 @@ bool FairinoRobotClient::resetAllError() {
         std::cerr << "Robot is not connected." << std::endl;
         return false;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     const errno_t err = robot_->ResetAllError();
     if (err != 0) {
         std::cerr << "ResetAllError failed, err=" << err << std::endl;
@@ -267,13 +282,64 @@ bool FairinoRobotClient::resetAllError() {
 #endif
 }
 
+bool FairinoRobotClient::getRobotMotionDone(bool* done) {
+#if defined(HAVE_FAIRINO_SDK)
+    if (!connected_ || !done) {
+        return false;
+    }
+    uint8_t state = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const errno_t err = robot_->GetRobotMotionDone(&state);
+        if (err != 0) {
+            std::cerr << "GetRobotMotionDone failed, err=" << err << std::endl;
+            return false;
+        }
+    }
+    *done = (state != 0);
+    return true;
+#else
+    (void)done;
+    return false;
+#endif
+}
+
+int FairinoRobotClient::waitRobotMotionDone(int timeoutMs, int pollIntervalMs) {
+#if defined(HAVE_FAIRINO_SDK)
+    if (!connected_) {
+        return -2;
+    }
+    const int loops = timeoutMs <= 0 ? 1 : (timeoutMs + pollIntervalMs - 1) / pollIntervalMs;
+    for (int i = 0; i < loops; ++i) {
+        bool done = false;
+        if (!getRobotMotionDone(&done)) {
+            return -4;
+        }
+        if (done) {
+            return 0;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+    }
+    std::cerr << "waitRobotMotionDone timeout." << std::endl;
+    return -5;
+#else
+    (void)timeoutMs;
+    (void)pollIntervalMs;
+    return -3;
+#endif
+}
+
 bool FairinoRobotClient::getCurrentFlangePose(weld_geometry::Pose6D* pose) {
 #if defined(HAVE_FAIRINO_SDK)
     if (!connected_ || !pose) {
         return false;
     }
     DescPose desc;
-    const errno_t err = robot_->GetActualToolFlangePose(0, &desc);
+    errno_t err = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        err = robot_->GetActualToolFlangePose(0, &desc);
+    }
     if (err != 0) {
         std::cerr << "GetActualToolFlangePose failed, err=" << err << std::endl;
         return false;
@@ -292,7 +358,11 @@ bool FairinoRobotClient::getCurrentToolPose(weld_geometry::Pose6D* pose) {
         return false;
     }
     DescPose desc;
-    const errno_t err = robot_->GetActualTCPPose(0, &desc);
+    errno_t err = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        err = robot_->GetActualTCPPose(0, &desc);
+    }
     if (err != 0) {
         std::cerr << "GetActualTCPPose failed, err=" << err << std::endl;
         return false;
@@ -311,7 +381,11 @@ bool FairinoRobotClient::getToolCoord(int toolId, weld_geometry::Pose6D* pose) {
         return false;
     }
     DescPose desc;
-    const errno_t err = robot_->GetToolCoordWithID(toolId, desc);
+    errno_t err = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        err = robot_->GetToolCoordWithID(toolId, desc);
+    }
     if (err != 0) {
         std::cerr << "GetToolCoordWithID(" << toolId << ") failed, err=" << err << std::endl;
         return false;
@@ -342,10 +416,12 @@ weld_geometry::Matrix4 FairinoRobotClient::getTBaseTool(const weld_geometry::Pos
 }
 
 int FairinoRobotClient::moveL(const weld_geometry::Pose6D& target, int toolId, int userId, const weld_motion::WeldMotionConfig& motionConfig) {
+    const double effectiveBlendR = motionConfig.blendR < 0.0 ? 0.0 : motionConfig.blendR;
     std::cout << "MoveL target TCP: " << weld_geometry::formatPose(target)
               << ", tool=" << toolId << ", user=" << userId
               << ", vel=" << motionConfig.vel << ", acc=" << motionConfig.acc
-              << ", ovl=" << motionConfig.ovl << std::endl;
+              << ", ovl=" << motionConfig.ovl
+              << ", blendR=" << effectiveBlendR << std::endl;
 
     if (motionConfig.dryRun || !motionConfig.enableRobotMotion) {
         std::cout << "Dry-run: no robot motion sent." << std::endl;
@@ -364,12 +440,15 @@ int FairinoRobotClient::moveL(const weld_geometry::Pose6D& target, int toolId, i
     DescPose desc = toDescPose(target);
     ExaxisPos epos;
     DescPose offset;
-    return robot_->MoveL(&desc, toolId, userId,
-                         static_cast<float>(motionConfig.vel),
-                         static_cast<float>(motionConfig.acc),
-                         static_cast<float>(motionConfig.ovl),
-                         static_cast<float>(motionConfig.blendR),
-                         0, &epos, 0, 0, &offset);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return robot_->MoveL(&desc, toolId, userId,
+                             static_cast<float>(motionConfig.vel),
+                             static_cast<float>(motionConfig.acc),
+                             static_cast<float>(motionConfig.ovl),
+                             static_cast<float>(effectiveBlendR),
+                             0, &epos, 0, 0, &offset);
+    }
 #else
     std::cerr << "Fairino SDK is not linked in this build." << std::endl;
     return -3;
@@ -405,7 +484,15 @@ int executeLinearWeldMove(
     if (err != 0) {
         return err;
     }
-    return robot.moveL(plan.endTcpTarget, toolConfig.toolId, toolConfig.userId, motionConfig);
+    err = robot.moveL(plan.endTcpTarget, toolConfig.toolId, toolConfig.userId, motionConfig);
+    if (err != 0) {
+        return err;
+    }
+    if (!motionConfig.dryRun && motionConfig.enableRobotMotion) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        return robot.waitRobotMotionDone();
+    }
+    return 0;
 }
 
 } // namespace fairino_client

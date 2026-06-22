@@ -1,7 +1,7 @@
 # Software safety defaults. Keep dry_run true while calibrating.
 dry_run: true
-enable_robot_motion: false
-enable_arc: false
+enable_robot_motion: true
+enable_arc: true
 
 safe_height_mm: 50.0
 vel: 5.0

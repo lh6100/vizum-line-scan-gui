@@ -7,6 +7,9 @@
 
 #include <QWidget>
 
+#include <atomic>
+#include <thread>
+
 class QCheckBox;
 class QDoubleSpinBox;
 class QLabel;
@@ -24,6 +27,10 @@ public:
 public slots:
     void setCameraLineFromFit(double sx, double sy, double sz, double ex, double ey, double ez);
 
+signals:
+    void asyncLog(QString msg);
+    void asyncMotionFinished(int err);
+
 private slots:
     void connectRobot();
     void disconnectRobot();
@@ -37,10 +44,12 @@ private slots:
     void resumeMotion();
     void calculateTargets();
     void executeMove();
+    void onMotionFinished(int err);
 
 private:
     void appendLog(const QString& msg);
     void setConnectedUi(bool connected);
+    void setMotionUi(bool running);
     void loadConfigs();
     void syncMotionConfigFromUi();
     weld_geometry::Vec3 startCameraPoint() const;
@@ -102,6 +111,8 @@ private:
     weld_motion::ToolConfig m_toolConfig;
     weld_motion::WeldMotionConfig m_motionConfig;
     bool m_hasCurrentPose{false};
+    std::atomic<bool> m_motionRunning{false};
+    std::thread m_motionThread;
 };
 
 #endif // ROBOTCONTROLWIDGET_H

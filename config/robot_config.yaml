@@ -2,10 +2,10 @@
 robot_ip: 192.168.1.200
 
 # Set true to connect and read current flange/TCP/tool data.
-connect_robot: false
+connect_robot: true
 
 # Must be true before code is allowed to send robot motion.
-enable_robot_motion: false
+enable_robot_motion: true
 
 # Optional helpers for real motion. Keep false unless the cell is ready.
 auto_enable: false

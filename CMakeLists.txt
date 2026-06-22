@@ -12,6 +12,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Find Qt5
 find_package(Qt5 COMPONENTS Widgets REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d aruco)
 find_package(PCL REQUIRED COMPONENTS common kdtree sample_consensus io)
 find_package(VTK REQUIRED COMPONENTS
     CommonCore
@@ -47,6 +48,7 @@ endif()
 
 include_directories(${VZNL_INC_DIR})
 include_directories(${PCL_INCLUDE_DIRS})
+include_directories(${OpenCV_INCLUDE_DIRS})
 link_directories(${VZNL_LIB_DIR})
 if(HAVE_FAIRINO_SDK)
     include_directories(${FAIRINO_INC_DIR})
@@ -88,6 +90,8 @@ endif()
 
 add_executable(VizumScanGUI
     src/main.cpp
+    src/ExtrinsicCalibrationWidget.cpp
+    src/ExtrinsicCalibrationWidget.h
     src/MainWindow.cpp
     src/MainWindow.h
     src/RobotControlWidget.cpp
@@ -110,6 +114,7 @@ target_link_libraries(VizumScanGUI
     -Wl,--as-needed
     WeldMotionCore
     Eigen3::Eigen
+    ${OpenCV_LIBS}
     ${PCL_LIBRARIES}
     ${VTK_LIBRARIES}
     pthread
@@ -135,3 +140,84 @@ add_executable(FairinoWeldMoveDemo
 target_link_libraries(FairinoWeldMoveDemo
     WeldMotionCore
 )
+
+add_executable(VizumEyeCaptureDemo
+    tests/vizum_eye_capture_demo.cpp
+)
+
+target_link_libraries(VizumEyeCaptureDemo
+    -Wl,--no-as-needed
+    VzNLDetect
+    VzNLGraphics
+    VzKernel
+    VzEyeSecurityLoader-shared
+    -Wl,--as-needed
+    ${OpenCV_LIBS}
+    pthread
+)
+
+target_compile_definitions(VizumEyeCaptureDemo PRIVATE VIZUM_HAS_TRANSPICMODE)
+
+set(VZNL_MUL_SDK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDK/MulDetectLaser_3.6.20.110_All/SDK/VzNLSDK)
+if(EXISTS "${VZNL_MUL_SDK_DIR}/Linux/x64/libVzNLDetect.so")
+    set(VZNL_MUL_INC_DIR ${VZNL_MUL_SDK_DIR}/Inc)
+    set(VZNL_MUL_LIB_DIR ${VZNL_MUL_SDK_DIR}/Linux/x64)
+
+    add_executable(VizumEyeCaptureDemoMulSDK
+        tests/vizum_eye_capture_demo.cpp
+    )
+
+    target_include_directories(VizumEyeCaptureDemoMulSDK BEFORE PRIVATE
+        ${VZNL_MUL_INC_DIR}
+        ${OpenCV_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(VizumEyeCaptureDemoMulSDK
+        -Wl,--no-as-needed
+        ${VZNL_MUL_LIB_DIR}/libVzNLDetect.so
+        ${VZNL_MUL_LIB_DIR}/libVzNLGraphics.so
+        ${VZNL_MUL_LIB_DIR}/libVzKernel.so
+        ${VZNL_MUL_LIB_DIR}/libVzEyeSecurityLoader-shared.so
+        -Wl,--as-needed
+        ${OpenCV_LIBS}
+        pthread
+    )
+
+    set_target_properties(VizumEyeCaptureDemoMulSDK PROPERTIES
+        BUILD_RPATH "${VZNL_MUL_LIB_DIR}"
+        INSTALL_RPATH "${VZNL_MUL_LIB_DIR}"
+    )
+endif()
+
+set(VZNL_DETECT_SDK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDK/DetectLaser_3.6.20.116_Windows&Linux&ARM/SDK/VzNLSDK)
+if(EXISTS "${VZNL_DETECT_SDK_DIR}/Linux/x64/libVzNLDetect.so")
+    set(VZNL_DETECT_INC_DIR ${VZNL_DETECT_SDK_DIR}/Inc)
+    set(VZNL_DETECT_LIB_DIR ${VZNL_DETECT_SDK_DIR}/Linux/x64)
+
+    add_executable(VizumEyeCaptureDemoDetectSDK
+        tests/vizum_eye_capture_demo.cpp
+    )
+
+    target_compile_definitions(VizumEyeCaptureDemoDetectSDK PRIVATE VIZUM_HAS_TRANSPICMODE)
+
+    target_include_directories(VizumEyeCaptureDemoDetectSDK BEFORE PRIVATE
+        ${VZNL_DETECT_INC_DIR}
+        ${OpenCV_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(VizumEyeCaptureDemoDetectSDK
+        -Wl,--no-as-needed
+        ${VZNL_DETECT_LIB_DIR}/libVzNLDetect.so
+        ${VZNL_DETECT_LIB_DIR}/libVzNLGraphics.so
+        ${VZNL_DETECT_LIB_DIR}/libVzKernel.so
+        ${VZNL_DETECT_LIB_DIR}/libVzEyeSecurityLoader-shared.so
+        -Wl,--as-needed
+        ${OpenCV_LIBS}
+        pthread
+    )
+
+    set_target_properties(VizumEyeCaptureDemoDetectSDK PROPERTIES
+        BUILD_RPATH "${VZNL_DETECT_LIB_DIR}"
+        INSTALL_RPATH "${VZNL_DETECT_LIB_DIR}"
+    )
+endif()

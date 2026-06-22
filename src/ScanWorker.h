@@ -19,6 +19,7 @@ class QTextStream;
 #include "VZNL_DetectLaser.h"
 #include "VZNL_DetectConfig.h"
 #include "VZNL_DustCover.h"
+#include "VZNL_ExtStrobeLaser.h"
 #include "VZNL_RGBConfig.h"
 #include "VZNL_SwingMotor.h"
 #include "VZNL_FileUtils.h"
@@ -51,6 +52,7 @@ public slots:
     void initSdk();           // VzNL_Init + log level
     void connectDevice();     // research + bind + open + begin laser tool + setup motor
     void disconnectDevice();  // end laser + close
+    void softResetDevice();   // stop stream + reset swing/reconnect + rebuild laser tool
     void rebootDevice();      // reboot via SDK
     void destroySdk();        // VzNL_Destroy
     void getVersions();       // VzNL_GetVersion + device/module versions
@@ -61,6 +63,13 @@ public slots:
 
     // --- RGB
     void grabRgbImage();      // one RGB frame -> QImage
+    void grabLeftEyeImage();  // one left-eye grayscale frame -> QImage
+    void grabLeftEyeImageWithParams(int frameRate, int exposure, int gain, bool keepLaserOn);
+    void calibrateLeftEyeCharuco(); // left-eye image + SDK intrinsics -> board pose
+    void calibrateLeftEyeCharucoWithParams(int frameRate, int exposure, int gain, int squaresX, int squaresY,
+                                           double squareMm, double markerMm, QString dictionaryName,
+                                           bool keepLaserOn);
+    void loadVizumConfig(QString filePath);
     void mapRgbLineTo3D(QPoint start, QPoint end, int sampleCount);
 
     // --- Scan
@@ -72,6 +81,9 @@ signals:
     void scanFinished(bool ok, QString filePath);
     void busyChanged(bool busy);
     void rgbImageReady(QImage image, QString desc);
+    void leftEyeImageReady(QImage image, QString desc);
+    void leftEyeCharucoResult(bool ok, QImage image, QString desc,
+                              QVector<double> tLeftBoard, QString report);
     void rgbLineMapped(QVector<QVector3D> points, QString desc);
 
 private:
@@ -85,6 +97,15 @@ private:
     void clearQueueLocked();   // assume m_queueMutex held
     void clearQueue();
     bool ensureClosedDetect(); // safe stop if currently detecting
+    bool configureDeviceRuntime(); // RGB/notify/laser tool/trigger/motor setup
+    bool waitForDeviceReady(int timeoutMs);
+    bool moveSwingToStartForScan();
+    bool ensureCoverOpenForScan();
+    void ensureLaserLightEnabled();
+    bool configurePointCloudProcMode();
+    void logScanRuntimeState(QString context);
+    bool configureFullEyeRoiForCalibration(bool useCalibImage);
+    void configureEyeCalibrationRuntime();
     bool drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitScale,
                           int& totalLines, int& totalPts);
     void writeCsvHeader(QTextStream& csv);
@@ -94,6 +115,13 @@ private:
     void finishRgbCloudMapping();
     void destroyRgbCloudMapping();
     bool findMapped3DNearPixel(const QPoint& pixel, int searchRadius, QVector3D& point) const;
+    bool configureLeftEyeImaging(int frameRate, int exposure, int gain);
+    bool captureLeftEyeImage(QImage& image, QString& desc, int frameRate = -1,
+                             int exposure = -1, int gain = -1, bool keepLaserOn = false,
+                             bool useCalibImage = false);
+    void calibrateLeftEyeCharucoImpl(int frameRate, int exposure, int gain, int squaresX, int squaresY,
+                                     double squareMm, double markerMm, QString dictionaryName,
+                                     bool emitStructuredResult, bool keepLaserOn);
 
 private:
     VZNLHANDLE m_hDevice = nullptr;
@@ -104,11 +132,20 @@ private:
     bool m_rgbCloudToolBuilding = false;
     bool m_rgbCloudToolReady = false;
     bool m_rgbCloudPushFailed = false;
+    bool m_hasLoadedPointCloudProcMode = false;
+    EVzPointCloudProcMode m_loadedPointCloudProcMode = kePointCloudProcMode_Invalid;
+    double m_loadedFixedStep = 0.0;
 
     // Scan state
     std::atomic<bool> m_scanRunning{false};
     std::atomic<bool> m_autoStopReceived{false};
     std::atomic<bool> m_queueOverflow{false};
+    std::atomic<int> m_cbTotalLines{0};
+    std::atomic<int> m_cbAcceptedLines{0};
+    std::atomic<int> m_cbNonEmptyLines{0};
+    std::atomic<int> m_cbEndSignals{0};
+    std::atomic<int> m_cbLastType{-1};
+    std::atomic<int> m_cbLastPointCount{0};
 
     // Captured laser lines (deep copies)
     QMutex m_queueMutex;

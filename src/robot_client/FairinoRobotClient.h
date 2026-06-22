@@ -4,6 +4,7 @@
 #include "../geometry/TransformUtils.h"
 #include "../welding/WeldPathPlanner.h"
 
+#include <mutex>
 #include <string>
 
 class FRRobot;
@@ -37,6 +38,8 @@ public:
     bool pauseMotion();
     bool resumeMotion();
     bool resetAllError();
+    bool getRobotMotionDone(bool* done);
+    int waitRobotMotionDone(int timeoutMs = 120000, int pollIntervalMs = 100);
     bool getCurrentFlangePose(weld_geometry::Pose6D* pose);
     bool getCurrentToolPose(weld_geometry::Pose6D* pose);
     bool getToolCoord(int toolId, weld_geometry::Pose6D* pose);
@@ -50,6 +53,7 @@ public:
 private:
     FRRobot* robot_;
     bool connected_;
+    std::mutex mutex_;
 };
 
 int executeLinearWeldMove(

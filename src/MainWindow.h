@@ -11,6 +11,9 @@
 class QPushButton;
 class QPlainTextEdit;
 class QLabel;
+class QCheckBox;
+class QComboBox;
+class ExtrinsicCalibrationWidget;
 class ScanWorker;
 class WeldSeamWidget;
 class RgbImageLabel;
@@ -27,18 +30,24 @@ protected:
 private slots:
     void onConnectClicked();
     void onDisconnectClicked();
+    void onSoftResetClicked();
     void onRebootClicked();
     void onGetVersionsClicked();
     void onOpenCoverClicked();
     void onCloseCoverClicked();
     void onScanClicked();
     void onGrabRgbClicked();
+    void onGrabLeftEyeClicked();
+    void onCalibrateLeftEyeClicked();
+    void onLoadVizumConfigClicked();
+    void refreshVizumConfigList();
 
     void onLog(QString msg);
     void onConnectionChanged(bool connected);
     void onScanFinished(bool ok, QString path);
     void onBusyChanged(bool busy);
     void onRgbImageReady(QImage image, QString desc);
+    void onLeftEyeImageReady(QImage image, QString desc);
     void onRgbLineSelected(QPoint start, QPoint end);
     void onRgbLineMapped(QVector<QVector3D> points, QString desc);
 
@@ -47,6 +56,7 @@ signals:
     void reqInit();
     void reqConnect();
     void reqDisconnect();
+    void reqSoftReset();
     void reqReboot();
     void reqDestroy();
     void reqGetVersions();
@@ -54,27 +64,41 @@ signals:
     void reqCloseCover();
     void reqScan(QString path);
     void reqGrabRgb();
+    void reqGrabLeftEye();
+    void reqCalibrateLeftEye();
+    void reqLoadVizumConfig(QString path);
     void reqMapRgbLine(QPoint start, QPoint end, int sampleCount);
 
 private:
     void setBusy(bool busy);
     QString defaultPlyPath();
     QString defaultRgbPath();
+    QString defaultLeftEyePath();
     QString dataDirPath();
+    QString vizumConfigDirPath();
+    QString currentVizumConfigPath() const;
 
     QPushButton* m_btnConnect{};
     QPushButton* m_btnDisconnect{};
+    QPushButton* m_btnSoftReset{};
     QPushButton* m_btnReboot{};
     QPushButton* m_btnGetVersions{};
     QPushButton* m_btnOpenCover{};
     QPushButton* m_btnCloseCover{};
     QPushButton* m_btnScan{};
     QPushButton* m_btnGrabRgb{};
+    QPushButton* m_btnGrabLeftEye{};
+    QPushButton* m_btnCalibrateLeftEye{};
+    QComboBox* m_vizumConfigCombo{};
+    QPushButton* m_btnRefreshVizumConfig{};
+    QPushButton* m_btnLoadVizumConfig{};
+    QCheckBox* m_autoLoadVizumConfigCheck{};
     RgbImageLabel* m_rgbImageLabel{};
     QLabel* m_rgbInfoLabel{};
     QPlainTextEdit* m_logView{};
     QLabel* m_statusLabel{};
     WeldSeamWidget* m_weldWidget{};
+    ExtrinsicCalibrationWidget* m_calibWidget{};
 
     QThread m_workerThread;
     ScanWorker* m_worker{};
@@ -82,6 +106,7 @@ private:
     bool m_connected{false};
     int m_scanCounter{0};
     int m_rgbCounter{0};
+    int m_leftEyeCounter{0};
 };
 
 #endif // MAINWINDOW_H

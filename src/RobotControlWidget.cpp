@@ -147,12 +147,21 @@ RobotControlWidget::RobotControlWidget(QWidget* parent)
     connect(m_btnResume, &QPushButton::clicked, this, &RobotControlWidget::resumeMotion);
     connect(m_btnCalculate, &QPushButton::clicked, this, &RobotControlWidget::calculateTargets);
     connect(m_btnExecute, &QPushButton::clicked, this, &RobotControlWidget::executeMove);
+    connect(this, &RobotControlWidget::asyncLog, this, &RobotControlWidget::appendLog);
+    connect(this, &RobotControlWidget::asyncMotionFinished, this, &RobotControlWidget::onMotionFinished);
 
     setConnectedUi(false);
     appendLog("默认干运行。真运动需要取消干运行并勾选允许真运动 MoveL。");
 }
 
 RobotControlWidget::~RobotControlWidget() {
+    if (m_motionRunning.load()) {
+        appendLog("窗口关闭，正在发送 StopMotion。");
+        m_robot.stopMotion();
+    }
+    if (m_motionThread.joinable()) {
+        m_motionThread.join();
+    }
     m_robot.disconnectRobot();
 }
 
@@ -197,6 +206,26 @@ void RobotControlWidget::setConnectedUi(bool connected) {
     m_btnStop->setEnabled(connected);
     m_btnPause->setEnabled(connected);
     m_btnResume->setEnabled(connected);
+    if (m_motionRunning.load()) {
+        setMotionUi(true);
+    }
+}
+
+void RobotControlWidget::setMotionUi(bool running) {
+    m_btnConnect->setEnabled(!running && !m_robot.isConnected());
+    m_btnDisconnect->setEnabled(!running && m_robot.isConnected());
+    m_btnReadPose->setEnabled(!running && m_robot.isConnected());
+    m_btnServoOn->setEnabled(!running && m_robot.isConnected());
+    m_btnServoOff->setEnabled(!running && m_robot.isConnected());
+    m_btnAutoMode->setEnabled(!running && m_robot.isConnected());
+    m_btnResetError->setEnabled(!running && m_robot.isConnected());
+    m_btnPause->setEnabled(!running && m_robot.isConnected());
+    m_btnResume->setEnabled(!running && m_robot.isConnected());
+    m_btnCalculate->setEnabled(!running);
+    m_btnExecute->setEnabled(!running);
+    m_btnStop->setEnabled(m_robot.isConnected() || running);
+    m_dryRunCheck->setEnabled(!running);
+    m_enableMotionCheck->setEnabled(!running);
 }
 
 void RobotControlWidget::syncMotionConfigFromUi() {
@@ -253,6 +282,10 @@ void RobotControlWidget::connectRobot() {
 }
 
 void RobotControlWidget::disconnectRobot() {
+    if (m_motionRunning.load()) {
+        QMessageBox::warning(this, "正在运动", "请先点击停止运动/急停移动，等待运动线程结束后再断开。");
+        return;
+    }
     m_robot.disconnectRobot();
     m_hasCurrentPose = false;
     setConnectedUi(false);
@@ -304,7 +337,8 @@ void RobotControlWidget::resetError() {
 }
 
 void RobotControlWidget::stopMotion() {
-    appendLog(m_robot.stopMotion() ? "StopMotion 已发送。" : "StopMotion 发送失败。");
+    appendLog("正在发送 StopMotion...");
+    appendLog(m_robot.stopMotion() ? "StopMotion 已发送。" : "StopMotion 发送失败。请立即使用控制柜物理急停。");
 }
 
 void RobotControlWidget::pauseMotion() {
@@ -329,6 +363,10 @@ void RobotControlWidget::calculateTargets() {
 
 void RobotControlWidget::executeMove() {
     syncMotionConfigFromUi();
+    if (m_motionRunning.load()) {
+        QMessageBox::warning(this, "正在运动", "当前 MoveL 流程尚未结束。");
+        return;
+    }
     if (m_motionConfig.enableRobotMotion && m_motionConfig.dryRun) {
         QMessageBox::warning(this, "仍是干运行", "当前勾选了干运行，不会发送真实 MoveL。");
     }
@@ -340,8 +378,34 @@ void RobotControlWidget::executeMove() {
         QMessageBox::warning(this, "未读取当前位姿", "真运动前请先读取当前法兰/TCP。");
         return;
     }
-    const int err = fairino_client::executeLinearWeldMove(
-        m_robot, startCameraPoint(), endCameraPoint(), fallbackFlangePose(), fallbackTcpPose(),
-        m_handEyeConfig, m_toolConfig, m_motionConfig);
-    appendLog(err == 0 ? "MoveL 流程完成。" : QStringLiteral("MoveL 流程失败，错误码 %1").arg(err));
+    if (m_motionThread.joinable()) {
+        m_motionThread.join();
+    }
+
+    const weld_geometry::Vec3 start = startCameraPoint();
+    const weld_geometry::Vec3 end = endCameraPoint();
+    const weld_geometry::Pose6D flange = fallbackFlangePose();
+    const weld_geometry::Pose6D tcp = fallbackTcpPose();
+    const weld_motion::HandEyeConfig handEye = m_handEyeConfig;
+    const weld_motion::ToolConfig tool = m_toolConfig;
+    const weld_motion::WeldMotionConfig motion = m_motionConfig;
+
+    m_motionRunning.store(true);
+    setMotionUi(true);
+    appendLog("MoveL 流程已进入后台线程，UI 可继续响应。红色停止按钮保持可用。");
+
+    m_motionThread = std::thread([this, start, end, flange, tcp, handEye, tool, motion]() {
+        const int err = fairino_client::executeLinearWeldMove(
+            m_robot, start, end, flange, tcp, handEye, tool, motion);
+        emit asyncMotionFinished(err);
+    });
+}
+
+void RobotControlWidget::onMotionFinished(int err) {
+    if (m_motionThread.joinable()) {
+        m_motionThread.join();
+    }
+    m_motionRunning.store(false);
+    setMotionUi(false);
+    appendLog(err == 0 ? "MoveL 流程完成。" : QStringLiteral("MoveL 流程失败或被停止，错误码 %1").arg(err));
 }

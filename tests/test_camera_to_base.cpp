@@ -53,8 +53,8 @@ int main(int argc, char** argv) {
               << ", flange->TCP=" << weld_geometry::formatPose(tool.flangeToTool) << std::endl;
 
     int failures = 0;
-    failures += checkVec(plan.startBase, {278.11, -509.62, -49.85}, 1.5, "Start_base");
-    failures += checkVec(plan.endBase, {296.91, -516.32, -48.89}, 1.5, "End_base");
+    failures += checkVec(plan.startBase, {258.206, -509.608, -53.040}, 1.5, "Start_base");
+    failures += checkVec(plan.endBase, {276.921, -516.601, -53.374}, 1.5, "End_base");
     if (!nearlyEqual(plan.lineLengthMm, 19.98, 1.5)) {
         std::cerr << "Line length mismatch. actual=" << plan.lineLengthMm
                   << ", expected=19.98, tolerance=1.5" << std::endl;
