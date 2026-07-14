@@ -21,6 +21,7 @@ SDK/*.zip
 SDK/DetectLaser_3.6.20.116_Windows&Linux&ARM/
 SDK/MulDetectLaser_3.6.20.110_All/
 VizumLog/
+ros2/
 *.ply
 *.pcd
 *.las

@@ -68,6 +68,8 @@ endif()
 add_library(WeldMotionCore
     src/geometry/TransformUtils.cpp
     src/geometry/TransformUtils.h
+    src/robot_capture/RobotOffsetCapturePlanner.cpp
+    src/robot_capture/RobotOffsetCapturePlanner.h
     src/welding/WeldPathPlanner.cpp
     src/welding/WeldPathPlanner.h
     src/robot_client/FairinoRobotClient.cpp
@@ -94,6 +96,8 @@ add_executable(VizumScanGUI
     src/ExtrinsicCalibrationWidget.h
     src/MainWindow.cpp
     src/MainWindow.h
+    src/MotionTracePlotWidget.cpp
+    src/MotionTracePlotWidget.h
     src/RobotControlWidget.cpp
     src/RobotControlWidget.h
     src/RgbImageLabel.cpp
@@ -141,6 +145,14 @@ target_link_libraries(FairinoWeldMoveDemo
     WeldMotionCore
 )
 
+add_executable(RobotOffsetCapturePlannerTest
+    tests/test_robot_offset_capture_planner.cpp
+)
+
+target_link_libraries(RobotOffsetCapturePlannerTest
+    WeldMotionCore
+)
+
 add_executable(VizumEyeCaptureDemo
     tests/vizum_eye_capture_demo.cpp
 )
@@ -157,6 +169,21 @@ target_link_libraries(VizumEyeCaptureDemo
 )
 
 target_compile_definitions(VizumEyeCaptureDemo PRIVATE VIZUM_HAS_TRANSPICMODE)
+
+add_executable(VizumDynamicProfileOnceDemo
+    tests/vizum_dynamic_profile_once_demo.cpp
+)
+
+target_link_libraries(VizumDynamicProfileOnceDemo
+    -Wl,--no-as-needed
+    VzNLDetect
+    VzNLGraphics
+    VzKernel
+    VzEyeSecurityLoader-shared
+    -Wl,--as-needed
+    ${OpenCV_LIBS}
+    pthread
+)
 
 set(VZNL_MUL_SDK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/SDK/MulDetectLaser_3.6.20.110_All/SDK/VzNLSDK)
 if(EXISTS "${VZNL_MUL_SDK_DIR}/Linux/x64/libVzNLDetect.so")

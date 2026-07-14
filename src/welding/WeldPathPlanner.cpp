@@ -103,8 +103,11 @@ WeldMotionConfig defaultWeldMotionConfig() {
     config.dryRun = true;
     config.enableRobotMotion = false;
     config.enableArc = false;
+    config.physicalSpeedMode = false;
     config.safeHeightMm = 50.0;
-    config.vel = 5.0;
+    config.retractHeightMm = 50.0;
+    config.travelVel = 100.0;
+    config.weldVel = 5.0;
     config.acc = 20.0;
     config.ovl = 10.0;
     config.blendR = -1.0;
@@ -147,8 +150,12 @@ WeldMotionConfig loadWeldMotionConfig(const std::string& path) {
     config.dryRun = parseBoolValue(path, "dry_run", config.dryRun);
     config.enableRobotMotion = parseBoolValue(path, "enable_robot_motion", config.enableRobotMotion);
     config.enableArc = parseBoolValue(path, "enable_arc", config.enableArc);
+    config.physicalSpeedMode = parseBoolValue(path, "physical_speed_mode", config.physicalSpeedMode);
     config.safeHeightMm = parseDoubleValue(path, "safe_height_mm", config.safeHeightMm);
-    config.vel = parseDoubleValue(path, "vel", config.vel);
+    config.retractHeightMm = parseDoubleValue(path, "retract_height_mm", config.retractHeightMm);
+    const double legacyVel = parseDoubleValue(path, "vel", config.travelVel);
+    config.travelVel = parseDoubleValue(path, "travel_vel", legacyVel);
+    config.weldVel = parseDoubleValue(path, "weld_vel", legacyVel);
     config.acc = parseDoubleValue(path, "acc", config.acc);
     config.ovl = parseDoubleValue(path, "ovl", config.ovl);
     config.blendR = parseDoubleValue(path, "blend_r", config.blendR);
@@ -212,6 +219,8 @@ WeldLinePlan planLinearWeldMove(
     plan.endTcpTarget = weldPointToTcpTarget(plan.endBase, motionConfig.processOffset, currentTcpPose);
     plan.approachTcpTarget = plan.startTcpTarget;
     plan.approachTcpTarget.z += motionConfig.safeHeightMm;
+    plan.retractTcpTarget = plan.endTcpTarget;
+    plan.retractTcpTarget.z += motionConfig.retractHeightMm;
     plan.lineLengthMm = weld_geometry::distance(plan.startBase, plan.endBase);
     return plan;
 }
@@ -240,6 +249,7 @@ void printWeldLinePlan(const WeldLinePlan& plan) {
     std::cout << "Approach TCP: " << weld_geometry::formatPose(plan.approachTcpTarget) << std::endl;
     std::cout << "Start TCP:    " << weld_geometry::formatPose(plan.startTcpTarget) << std::endl;
     std::cout << "End TCP:      " << weld_geometry::formatPose(plan.endTcpTarget) << std::endl;
+    std::cout << "Retract TCP:  " << weld_geometry::formatPose(plan.retractTcpTarget) << std::endl;
 }
 
 } // namespace weld_motion

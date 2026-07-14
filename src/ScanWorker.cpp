@@ -1,10 +1,10 @@
 #include "ScanWorker.h"
+#include "vision/VizumEyeCaptureOptions.h"
 #include <QThread>
 #include <QFile>
 #include <QFileInfo>
 #include <QDir>
 #include <QElapsedTimer>
-#include <QTextStream>
 #include <QProcessEnvironment>
 #include <QSettings>
 #include <QImage>
@@ -698,6 +698,22 @@ void ScanWorker::ensureLaserLightEnabled() {
     }
 }
 
+bool ScanWorker::configureFixedLineForEyeCapture() {
+    if (!m_hDevice || !m_supportMotor) {
+        return true;
+    }
+
+    const int rc = VzNL_EnableSwingMotor(m_hDevice, VzFalse);
+    if (rc != 0) {
+        emit log(QStringLiteral("固定线拍照关闭摆动电机失败: %1").arg(errString(rc)));
+        return false;
+    }
+
+    emit log("固定线拍照：摆动电机已关闭");
+    QThread::msleep(150);
+    return true;
+}
+
 bool ScanWorker::configurePointCloudProcMode() {
     if (!m_hDevice) {
         return false;
@@ -838,45 +854,7 @@ void ScanWorker::logScanRuntimeState(QString context) {
     }
 }
 
-void ScanWorker::writeCsvHeader(QTextStream& csv) {
-    csv << "line_idx,point_idx,frame_idx,timestamp,swing_angle,"
-           "x_raw,y_raw,z_raw,x_m,y_m,z_m,rgb_uint,r,g,b\n";
-}
-
-void ScanWorker::writeLaserLineCsv(QTextStream& csv, const SVzLaserLineData& line,
-                                   double unitScale, int lineIndex) {
-    if (line.nPointCount <= 0 || !line.p3DPoint) {
-        return;
-    }
-
-    const auto* pts = static_cast<const SVzNLPointXYZRGBA*>(line.p3DPoint);
-    for (int i = 0; i < line.nPointCount; ++i) {
-        const SVzNLPointXYZRGBA& p = pts[i];
-        const unsigned int rgb = p.nRGB;
-        const unsigned int r = (rgb >> 16) & 0xff;
-        const unsigned int g = (rgb >> 8) & 0xff;
-        const unsigned int b = rgb & 0xff;
-
-        csv << lineIndex << ','
-            << i << ','
-            << line.llFrameIdx << ','
-            << line.llTimeStamp << ','
-            << line.fSwingAngle << ','
-            << p.x << ','
-            << p.y << ','
-            << p.z << ','
-            << (p.x * unitScale) << ','
-            << (p.y * unitScale) << ','
-            << (p.z * unitScale) << ','
-            << rgb << ','
-            << r << ','
-            << g << ','
-            << b << '\n';
-    }
-}
-
-bool ScanWorker::drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitScale,
-                                  int& totalLines, int& totalPts) {
+bool ScanWorker::drainQueueToFile(VZNLFILE hFile, int& totalLines, int& totalPts) {
     bool ok = true;
     for (;;) {
         OwnedLaserLine ol;
@@ -891,10 +869,6 @@ bool ScanWorker::drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitS
 
         if (ol.data.nPointCount <= 0) {
             continue;
-        }
-
-        if (csv) {
-            writeLaserLineCsv(*csv, ol.data, unitScale, totalLines);
         }
 
         if (m_rgbCloudToolBuilding && m_rgbCloudTool) {
@@ -1985,6 +1959,126 @@ bool ScanWorker::captureLeftEyeImage(QImage& image, QString& desc, int frameRate
     return true;
 }
 
+bool ScanWorker::captureLeftRightEyeImages(QImage& leftImage, QImage& rightImage, QString& desc,
+                                           int frameRate, int exposure, int gain, bool keepLaserOn,
+                                           bool useCalibImage) {
+    leftImage = {};
+    rightImage = {};
+    desc.clear();
+
+    if (!m_hDevice) {
+        emit log("未连接设备，无法获取左右目图像");
+        return false;
+    }
+    if (m_scanRunning.load() || VzNL_IsAutoDetecting(m_hDevice, nullptr)) {
+        emit log("扫描中，暂不获取左右目图像");
+        return false;
+    }
+    if (!configureFixedLineForEyeCapture()) {
+        return false;
+    }
+
+    bool turnedLaserOnForThisCapture = false;
+    if (m_supportMotor) {
+        if (VzNL_IsEnableLaserLight(m_hDevice) != VzTrue) {
+            int rc = VzNL_EnableLaserLight(m_hDevice, VzTrue);
+            if (rc != 0) {
+                emit log(QStringLiteral("左右目拍照前打开线激光失败: %1").arg(errString(rc)));
+            } else {
+                turnedLaserOnForThisCapture = true;
+                emit log("左右目拍照已打开线激光");
+                QThread::msleep(200);
+            }
+        } else if (keepLaserOn) {
+            emit log("左右目拍照保持线激光开启");
+        }
+    }
+
+    auto restoreLaserIfNeeded = [&]() {
+        if (m_supportMotor && !keepLaserOn && VzNL_IsEnableLaserLight(m_hDevice) == VzTrue) {
+            int rc = VzNL_EnableLaserLight(m_hDevice, VzFalse);
+            if (rc != 0) {
+                emit log(QStringLiteral("左右目拍照后关闭线激光失败: %1").arg(errString(rc)));
+            } else if (turnedLaserOnForThisCapture) {
+                emit log("左右目拍照后已关闭线激光");
+            }
+        }
+    };
+
+    if (!ensureCoverOpenForScan()) {
+        restoreLaserIfNeeded();
+        return false;
+    }
+
+    configureFullEyeRoiForCalibration(useCalibImage);
+    configureEyeCalibrationRuntime();
+    configureLeftEyeImaging(frameRate, exposure, gain);
+
+    VzNL_SetOutputImageFormat(keVzNLImageType_GRAY);
+    SVzNLImageData* leftFrame = nullptr;
+    SVzNLImageData* rightFrame = nullptr;
+    const unsigned int timeoutMs = static_cast<unsigned int>(
+        frameRate > 0 ? std::max(2500, static_cast<int>(std::ceil(3000.0 / frameRate))) : 2000);
+
+    int rc = 0;
+    for (int i = 0; i < 2; ++i) {
+        SVzNLImageData* l = nullptr;
+        SVzNLImageData* r = nullptr;
+        rc = VzNL_GetEyeImage(m_hDevice, &l, &r, timeoutMs);
+        if (rc != 0 || !l || !r) {
+            VzNL_ReleaseImage(&l);
+            VzNL_ReleaseImage(&r);
+            leftFrame = nullptr;
+            rightFrame = nullptr;
+            break;
+        }
+        if (i == 0) {
+            emit log("已丢弃左右目缓存帧，等待当前曝光帧");
+            VzNL_ReleaseImage(&l);
+            VzNL_ReleaseImage(&r);
+            continue;
+        }
+        leftFrame = l;
+        rightFrame = r;
+    }
+    VzNL_SetOutputImageFormat(keVzNLImageType_BGR888);
+    restoreLaserIfNeeded();
+
+    if (rc != 0 || !leftFrame || !rightFrame) {
+        emit log(QStringLiteral("获取左右目图像失败: %1").arg(errString(rc)));
+        VzNL_ReleaseImage(&leftFrame);
+        VzNL_ReleaseImage(&rightFrame);
+        return false;
+    }
+
+    leftImage = imageFromVzImage(leftFrame).convertToFormat(QImage::Format_Grayscale8);
+    rightImage = imageFromVzImage(rightFrame).convertToFormat(QImage::Format_Grayscale8);
+    desc = QStringLiteral("Left %1x%2 / Right %3x%4 type=%5/%6 channels=%7/%8")
+               .arg(leftFrame->nWidth)
+               .arg(leftFrame->nHeight)
+               .arg(rightFrame->nWidth)
+               .arg(rightFrame->nHeight)
+               .arg(static_cast<int>(leftFrame->eImageType))
+               .arg(static_cast<int>(rightFrame->eImageType))
+               .arg(leftFrame->nChannels)
+               .arg(rightFrame->nChannels);
+    VzNL_ReleaseImage(&leftFrame);
+    VzNL_ReleaseImage(&rightFrame);
+
+    if (leftImage.isNull() || rightImage.isNull()) {
+        emit log("左右目图像格式暂不支持或数据为空");
+        return false;
+    }
+
+    const QString leftStats = grayImageStats(leftImage);
+    const QString rightStats = grayImageStats(rightImage);
+    if (!leftStats.isEmpty() || !rightStats.isEmpty()) {
+        desc += QStringLiteral(" / L:%1 / R:%2").arg(leftStats, rightStats);
+    }
+    emit log(QStringLiteral("已获取左右目图像: %1").arg(desc));
+    return true;
+}
+
 void ScanWorker::grabLeftEyeImage() {
     emit busyChanged(true);
     QImage image;
@@ -2002,6 +2096,35 @@ void ScanWorker::grabLeftEyeImageWithParams(int frameRate, int exposure, int gai
     if (captureLeftEyeImage(image, desc, frameRate, exposure, gain, keepLaserOn, true)) {
         emit leftEyeImageReady(image, desc);
     }
+    emit busyChanged(false);
+}
+
+void ScanWorker::saveLeftRightEyeImages(int requestId, QString leftPath, QString rightPath,
+                                        int frameRate, int exposure, int gain, bool keepLaserOn) {
+    emit busyChanged(true);
+
+    QImage leftImage;
+    QImage rightImage;
+    QString desc;
+    const bool useCalibImage = vizum_capture::defaultRobotOffsetUseCalibImage();
+    bool ok = captureLeftRightEyeImages(leftImage, rightImage, desc, frameRate, exposure, gain, keepLaserOn, useCalibImage);
+    if (ok) {
+        QFileInfo leftInfo(leftPath);
+        QFileInfo rightInfo(rightPath);
+        QDir().mkpath(leftInfo.absolutePath());
+        QDir().mkpath(rightInfo.absolutePath());
+        const bool leftOk = leftImage.save(leftPath);
+        const bool rightOk = rightImage.save(rightPath);
+        ok = leftOk && rightOk;
+        if (ok) {
+            emit log(QStringLiteral("左右目图像已保存: %1 / %2").arg(leftPath, rightPath));
+        } else {
+            desc += QStringLiteral(" / 保存失败 left=%1 right=%2").arg(leftOk ? 1 : 0).arg(rightOk ? 1 : 0);
+            emit log(QStringLiteral("左右目图像保存失败: %1").arg(desc));
+        }
+    }
+
+    emit leftRightEyeImagesSaved(requestId, ok, leftPath, rightPath, desc);
     emit busyChanged(false);
 }
 
@@ -2356,49 +2479,6 @@ void ScanWorker::startScanAndSave(QString filePath) {
         return;
     }
 
-    QFileInfo plyInfo(filePath);
-    const QString stemPath = plyInfo.dir().filePath(plyInfo.completeBaseName());
-    const QString pointsCsvPath = stemPath + QStringLiteral("_points.csv");
-    const QString poseCsvPath = stemPath + QStringLiteral(".csv");
-
-    QFile pointsCsvFile(pointsCsvPath);
-    if (!pointsCsvFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-        emit log(QStringLiteral("打开点云 CSV 失败: %1").arg(pointsCsvPath));
-        VzNL_CloseLaserFile(hFile);
-        destroyRgbCloudMapping();
-        emit scanFinished(false, filePath);
-        emit busyChanged(false);
-        return;
-    }
-
-    QTextStream pointsCsv(&pointsCsvFile);
-    pointsCsv.setRealNumberNotation(QTextStream::FixedNotation);
-    pointsCsv.setRealNumberPrecision(9);
-    writeCsvHeader(pointsCsv);
-
-    double unitScale = 0.001; // SDK raw coordinates are commonly millimetres; weld pipeline consumes metres.
-    const QString scaleEnv = QProcessEnvironment::systemEnvironment().value(QStringLiteral("VIZUM_POINT_UNIT_SCALE"));
-    bool scaleOk = false;
-    const double envScale = scaleEnv.toDouble(&scaleOk);
-    if (scaleOk && envScale > 0.0) {
-        unitScale = envScale;
-    }
-    emit log(QStringLiteral("点云 CSV: %1").arg(pointsCsvPath));
-    emit log(QStringLiteral("米制换算比例 VIZUM_POINT_UNIT_SCALE=%1").arg(unitScale, 0, 'g', 12));
-
-    if (!QFileInfo::exists(poseCsvPath)) {
-        QFile poseCsvFile(poseCsvPath);
-        if (poseCsvFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            QTextStream poseCsv(&poseCsvFile);
-            poseCsv << "x,y,z,rx,ry,rz\n";
-            poseCsv << "0,0,0,0,0,0\n";
-            poseCsvFile.close();
-            emit log(QStringLiteral("已生成机器人位姿占位 CSV，请采集后填入法奥 flange 位姿: %1").arg(poseCsvPath));
-        } else {
-            emit log(QStringLiteral("机器人位姿占位 CSV 创建失败，请手工创建: %1").arg(poseCsvPath));
-        }
-    }
-
     // Reset offset; swing start position has already been verified above.
     VzNL_ConfigLaserBeginOffsetValue(m_hDevice, 0.0);
 
@@ -2429,7 +2509,7 @@ void ScanWorker::startScanAndSave(QString filePath) {
     QElapsedTimer t; t.start();
     const qint64 hardTimeoutMs = m_supportMotor ? 60000 : 5000;
     while (m_scanRunning.load() && !m_autoStopReceived.load() && t.elapsed() < hardTimeoutMs) {
-        writeOk = drainQueueToFile(hFile, &pointsCsv, unitScale, totalLines, totalPts) && writeOk;
+        writeOk = drainQueueToFile(hFile, totalLines, totalPts) && writeOk;
         QThread::msleep(10);
     }
     if (!m_autoStopReceived.load() && t.elapsed() >= hardTimeoutMs) {
@@ -2443,11 +2523,9 @@ void ScanWorker::startScanAndSave(QString filePath) {
 
     // Drain any callbacks that arrived just before stop
     QThread::msleep(150);
-    writeOk = drainQueueToFile(hFile, &pointsCsv, unitScale, totalLines, totalPts) && writeOk;
+    writeOk = drainQueueToFile(hFile, totalLines, totalPts) && writeOk;
     finishRgbCloudMapping();
 
-    pointsCsv.flush();
-    pointsCsvFile.close();
     VzNL_CloseLaserFile(hFile);
 
     QFileInfo fi(filePath);
@@ -2473,9 +2551,6 @@ void ScanWorker::startScanAndSave(QString filePath) {
     }
     emit log(QStringLiteral("扫描完成：%1 行 / %2 点 -> %3 (%4)")
              .arg(totalLines).arg(totalPts).arg(filePath).arg(ok ? "OK" : "EMPTY"));
-    if (ok) {
-        emit log(QStringLiteral("焊接输入点云 CSV 已保存: %1").arg(pointsCsvPath));
-    }
     emit scanFinished(ok, filePath);
     emit busyChanged(false);
 }

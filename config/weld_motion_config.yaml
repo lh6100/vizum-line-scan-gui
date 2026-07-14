@@ -2,9 +2,12 @@
 dry_run: true
 enable_robot_motion: true
 enable_arc: true
+physical_speed_mode: false
 
 safe_height_mm: 50.0
-vel: 5.0
+retract_height_mm: 50.0
+travel_vel: 100.0
+weld_vel: 5.0
 acc: 20.0
 ovl: 10.0
 blend_r: -1.0

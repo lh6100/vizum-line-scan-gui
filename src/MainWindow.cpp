@@ -141,6 +141,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_worker, &ScanWorker::busyChanged, this, &MainWindow::onBusyChanged, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::rgbImageReady, this, &MainWindow::onRgbImageReady, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::leftEyeImageReady, this, &MainWindow::onLeftEyeImageReady, Qt::QueuedConnection);
+    connect(m_worker, &ScanWorker::leftRightEyeImagesSaved,
+            robotWidget, &RobotControlWidget::onLeftRightEyeCaptureSaved, Qt::QueuedConnection);
     connect(m_worker, &ScanWorker::rgbLineMapped, this, &MainWindow::onRgbLineMapped, Qt::QueuedConnection);
     m_calibWidget->setWorker(m_worker);
 
@@ -159,6 +161,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(this, &MainWindow::reqCalibrateLeftEye, m_worker, &ScanWorker::calibrateLeftEyeCharuco, Qt::QueuedConnection);
     connect(this, &MainWindow::reqLoadVizumConfig, m_worker, &ScanWorker::loadVizumConfig, Qt::QueuedConnection);
     connect(this, &MainWindow::reqMapRgbLine, m_worker, &ScanWorker::mapRgbLineTo3D, Qt::QueuedConnection);
+    connect(robotWidget, &RobotControlWidget::requestLeftRightEyeCapture,
+            m_worker, &ScanWorker::saveLeftRightEyeImages, Qt::QueuedConnection);
 
     // --- Button signals ---
     connect(m_btnConnect, &QPushButton::clicked, this, &MainWindow::onConnectClicked);

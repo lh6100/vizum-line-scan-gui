@@ -28,8 +28,11 @@ struct WeldMotionConfig {
     bool dryRun;
     bool enableRobotMotion;
     bool enableArc;
+    bool physicalSpeedMode;
     double safeHeightMm;
-    double vel;
+    double retractHeightMm;
+    double travelVel;
+    double weldVel;
     double acc;
     double ovl;
     double blendR;
@@ -42,6 +45,7 @@ struct WeldLinePlan {
     weld_geometry::Pose6D startTcpTarget;
     weld_geometry::Pose6D approachTcpTarget;
     weld_geometry::Pose6D endTcpTarget;
+    weld_geometry::Pose6D retractTcpTarget;
     double lineLengthMm;
 };
 

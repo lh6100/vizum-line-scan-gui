@@ -12,8 +12,6 @@
 #include <queue>
 #include <vector>
 
-class QTextStream;
-
 #include "VZNL_Common.h"
 #include "VZNL_EyeConfig.h"
 #include "VZNL_DetectLaser.h"
@@ -65,6 +63,8 @@ public slots:
     void grabRgbImage();      // one RGB frame -> QImage
     void grabLeftEyeImage();  // one left-eye grayscale frame -> QImage
     void grabLeftEyeImageWithParams(int frameRate, int exposure, int gain, bool keepLaserOn);
+    void saveLeftRightEyeImages(int requestId, QString leftPath, QString rightPath,
+                                int frameRate, int exposure, int gain, bool keepLaserOn);
     void calibrateLeftEyeCharuco(); // left-eye image + SDK intrinsics -> board pose
     void calibrateLeftEyeCharucoWithParams(int frameRate, int exposure, int gain, int squaresX, int squaresY,
                                            double squareMm, double markerMm, QString dictionaryName,
@@ -82,6 +82,7 @@ signals:
     void busyChanged(bool busy);
     void rgbImageReady(QImage image, QString desc);
     void leftEyeImageReady(QImage image, QString desc);
+    void leftRightEyeImagesSaved(int requestId, bool ok, QString leftPath, QString rightPath, QString desc);
     void leftEyeCharucoResult(bool ok, QImage image, QString desc,
                               QVector<double> tLeftBoard, QString report);
     void rgbLineMapped(QVector<QVector3D> points, QString desc);
@@ -102,15 +103,12 @@ private:
     bool moveSwingToStartForScan();
     bool ensureCoverOpenForScan();
     void ensureLaserLightEnabled();
+    bool configureFixedLineForEyeCapture();
     bool configurePointCloudProcMode();
     void logScanRuntimeState(QString context);
     bool configureFullEyeRoiForCalibration(bool useCalibImage);
     void configureEyeCalibrationRuntime();
-    bool drainQueueToFile(VZNLFILE hFile, QTextStream* csv, double unitScale,
-                          int& totalLines, int& totalPts);
-    void writeCsvHeader(QTextStream& csv);
-    void writeLaserLineCsv(QTextStream& csv, const SVzLaserLineData& line,
-                           double unitScale, int lineIndex);
+    bool drainQueueToFile(VZNLFILE hFile, int& totalLines, int& totalPts);
     bool beginRgbCloudMapping();
     void finishRgbCloudMapping();
     void destroyRgbCloudMapping();
@@ -119,6 +117,9 @@ private:
     bool captureLeftEyeImage(QImage& image, QString& desc, int frameRate = -1,
                              int exposure = -1, int gain = -1, bool keepLaserOn = false,
                              bool useCalibImage = false);
+    bool captureLeftRightEyeImages(QImage& leftImage, QImage& rightImage, QString& desc,
+                                   int frameRate, int exposure, int gain, bool keepLaserOn,
+                                   bool useCalibImage = true);
     void calibrateLeftEyeCharucoImpl(int frameRate, int exposure, int gain, int squaresX, int squaresY,
                                      double squareMm, double markerMm, QString dictionaryName,
                                      bool emitStructuredResult, bool keepLaserOn);

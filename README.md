@@ -409,6 +409,11 @@ config/weld_motion_config.yaml
 dry_run: true
 enable_robot_motion: false
 enable_arc: false
+physical_speed_mode: false
+safe_height_mm: 50.0
+retract_height_mm: 50.0
+travel_vel: 100.0
+weld_vel: 5.0
 ```
 
 ### 2. 编译并运行离线验证
@@ -426,6 +431,7 @@ cmake --build build --target CameraToBaseTest -j$(nproc)
 Start_base(mm): [278.08, -509.08, -48.82]
 End_base(mm):   [296.96, -515.72, -47.85]
 Line length(mm): 20.04
+Retract TCP: ...
 Dry-run: no robot motion sent.
 Camera-to-base test passed.
 ```
@@ -481,12 +487,13 @@ Current TCP pose
 Tool3 coord
 ```
 
-然后保持干运行，观察打印出的三个 TCP 目标：
+然后保持干运行，观察打印出的四个 TCP 目标：
 
 ```text
 Approach TCP   # 起点上方 safe_height_mm
 Start TCP      # 焊缝起点
 End TCP        # 焊缝终点
+Retract TCP    # 终点上方 retract_height_mm，默认 50mm
 ```
 
 确认无误后，才允许同时打开两个开关：
@@ -521,7 +528,7 @@ GetToolCoordWithID(3)
 MoveL
 ```
 
-默认速度很低，且 `enable_arc` 仍为 `false`，当前版本只做 TCP 直线运动验证，不启动焊机。
+`travel_vel` 用于接近、下探和结束抬高移动，`weld_vel` 用于 Start -> End 焊缝段。默认 `physical_speed_mode: false` 时，移动速度、焊接速度和加速度都是法奥 SDK 的百分比 `[0~100]`；打开 `physical_speed_mode: true` 或勾选 GUI 的 `物理速度(mm/s)` 后，界面速度单位为 `mm/s`，加速度单位为 `mm/s2`，最终下发物理速度为 `界面速度 * 倍率 / 100`。例如移动速度 `50 mm/s` 且倍率 `100%` 时下发 `50 mm/s`，倍率 `10%` 时下发 `5 mm/s`。`enable_arc` 仍只是配置标记，当前版本只做 TCP 直线运动验证，不启动焊机。
 
 ### 4. 在 VizumScanGUI 里操作机械臂
 
@@ -546,7 +553,7 @@ MoveL
 3. 切到 `机械臂控制` 页，端点会自动同步到 `焊缝 Camera 线段端点(mm)`。
 4. 点击 `连接机械臂`。
 5. 点击 `读取当前法兰/TCP`。
-6. 点击 `计算焊枪 TCP 点位`，先看日志里的：
+6. 点击 `计算并记录焊枪 TCP 点位`，先看日志里的：
 
 ```text
 Start_base
@@ -554,12 +561,17 @@ End_base
 Approach TCP
 Start TCP
 End TCP
+Retract TCP
 ```
 
-7. 保持 `干运行：只打印，不发运动` 勾选时，点击 `执行 MoveL 三点` 只会打印，不会动机器人。
+7. 保持 `干运行：只打印，不发运动` 勾选时，点击 `执行当前 MoveL 轨迹` 只会打印，不会动机器人。
 8. 真运动前，必须确认点位安全，再取消干运行并勾选 `允许真运动 MoveL`。
 
-`执行 MoveL 三点` 会在后台线程运行，不会阻塞 Qt 主界面。程序会把真实运动的 `MoveL` 按非阻塞方式下发，然后用 `GetRobotMotionDone` 轮询完成状态。运动过程中大部分控制按钮会临时禁用，但红色 `停止运动/急停移动` 按钮保持可用；点击后程序会通过同一个机器人连接发送 `StopMotion`，避免控制器拒绝第二个 RPC 连接时停止失败。正常关闭窗口时，如果检测到运动线程仍在执行，也会先尝试发送 `StopMotion` 再退出。
+`执行当前 MoveL 轨迹` 会在后台线程运行，不会阻塞 Qt 主界面。程序会按 Approach -> Start -> End -> Retract 下发 MoveL，其中 Approach、Start、Retract 使用移动速度，End 使用焊接速度。真实运动会用 `GetRobotMotionDone` 轮询完成状态。运动过程中大部分控制按钮会临时禁用，但红色 `停止运动/急停移动` 按钮保持可用；点击后程序会通过同一个机器人连接发送 `StopMotion`，避免控制器拒绝第二个 RPC 连接时停止失败。正常关闭窗口时，如果检测到运动线程仍在执行，也会先尝试发送 `StopMotion` 再退出。
+
+`执行上次轨迹` 会复用上一次计算或执行时记录的四个 TCP 点。适合先不启弧验证一次轨迹，再保持同一条轨迹进行下一次焊接流程；速度和干运行/允许运动开关仍读取当前界面值。
+
+机械臂控制页内还有 `轨迹曲线` 子页。真实运动时，程序会在每段 MoveL 等待完成的 100ms 轮询周期内读取 `GetActualTCPPose`，记录焊枪 TCP 的 X/Y/Z 随时间变化，并绘制三组曲线：X/Y/Z 方向位移、速度、加速度。位移曲线使用相对本次首个采样点的位移；速度和加速度由相邻采样点差分计算。每次记录会自动保存到 `data/robot_motion_trace_*.csv`。
 
 机械臂控制页按钮含义：
 
@@ -573,8 +585,9 @@ End TCP
 停止运动/急停移动       StopMotion，软件停止当前运动
 暂停运动                PauseMotion
 继续运动                ResumeMotion
-计算焊枪 TCP 点位       只计算并打印目标点
-执行 MoveL 三点          Approach -> Start -> End
+计算并记录焊枪 TCP 点位  计算、打印并缓存当前四段 TCP 轨迹
+执行当前 MoveL 轨迹      Approach -> Start -> End -> Retract
+执行上次轨迹             复用上一次缓存的四段 TCP 轨迹
 ```
 
 `停止运动/急停移动` 是 SDK 的 `StopMotion` 软件停止命令，不替代控制柜硬件急停。
