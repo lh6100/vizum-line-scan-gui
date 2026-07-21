@@ -1,0 +1,7 @@
+build/
+build-*/
+data/calibration/
+data/scans/
+config/*.tmp
+config/*.bak
+image.png

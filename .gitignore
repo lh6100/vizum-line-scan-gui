@@ -1,5 +1,7 @@
 # Build output
 /build/
+/install/
+/log/
 /cmake-build-*/
 
 # CMake generated files
@@ -21,11 +23,15 @@ SDK/*.zip
 SDK/DetectLaser_3.6.20.116_Windows&Linux&ARM/
 SDK/MulDetectLaser_3.6.20.110_All/
 VizumLog/
-ros2/
 *.ply
 *.pcd
 *.las
 *.log
+__pycache__/
+*.py[cod]
+
+# Keep the FR5 ROS 2 sources, launch files, and documentation in git. The
+# nested ros2_fr5/.gitignore excludes colcon output.
 
 # Editor and OS files
 .vscode/
