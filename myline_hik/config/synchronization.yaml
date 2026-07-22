@@ -1,0 +1,40 @@
+camera:
+  target_fps: 60.0
+  exposure_us: 1825.0
+  fixed_time_offset_us: 0.0
+  transport_delay_us: 0.0
+  timestamp_reference: exposure_start
+  queue_capacity: 256
+  clock_mapping_window: 600
+  mapping_max_residual_us: 2000.0
+
+robot:
+  cn_de_period_ms: 8.0
+  pose_buffer_duration_s: 5.0
+  queue_capacity: 2048
+  time_mode: period_fit
+  normal_gap_min_ms: 6.0
+  normal_gap_max_ms: 10.0
+  warning_gap_ms: 12.0
+  invalid_gap_ms: 16.0
+  bracket_wait_timeout_ms: 40
+
+scan:
+  speed_mm_s: 10.0
+  min_speed_mm_s: 10.0
+  max_speed_mm_s: 50.0
+  acceleration_mm_s2: 100.0
+  speed_tolerance_percent: 5.0
+  stable_sample_count: 5
+  discard_acceleration_segment: true
+  discard_deceleration_segment: true
+  pre_scan_distance_mm: 30.0
+  post_scan_distance_mm: 30.0
+
+output:
+  save_images: true
+  save_robot_raw_csv: true
+  save_camera_raw_csv: true
+  save_sync_csv: true
+  output_directory: "./data/scan"
+  writer_queue_capacity: 8192

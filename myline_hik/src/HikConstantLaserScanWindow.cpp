@@ -87,9 +87,10 @@ QString poseText(const hik_scan::Pose6D& pose) {
         .arg(pose.rx, 0, 'f', 3).arg(pose.ry, 0, 'f', 3).arg(pose.rz, 0, 'f', 3);
 }
 
-QString uniqueSession(const QString& root) {
-    const QString base = QStringLiteral("scan_%1")
-        .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz")));
+QString uniqueSession(const QString& root, const QString& prefix = QStringLiteral("scan")) {
+    const QString base = QStringLiteral("%1_%2").arg(
+        prefix,
+        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz")));
     for (int index = 0; index < 1000; ++index) {
         const QString name = index == 0 ? base
             : base + QStringLiteral("_%1").arg(index, 3, 10, QLatin1Char('0'));
@@ -107,10 +108,22 @@ QByteArray csvQuoted(const QString& text) {
 
 }  // namespace
 
-HikConstantLaserScanWindow::HikConstantLaserScanWindow(QWidget* parent)
+HikConstantLaserScanWindow::HikConstantLaserScanWindow(
+        QWidget* parent, double scanSpeedOverrideMmS)
     : QMainWindow(parent),
       sourceDir_(QDir::cleanPath(QString::fromUtf8(HIK_CALIBRATION_SOURCE_DIR))) {
     configDir_ = QDir(sourceDir_).absoluteFilePath(QStringLiteral("config"));
+    synchronizationConfigPath_ = QDir(configDir_).absoluteFilePath(
+        QStringLiteral("synchronization.yaml"));
+    std::string synchronizationError;
+    synchronizationConfigReady_ = hik_sync::SynchronizationConfig::loadYaml(
+        localPath(synchronizationConfigPath_), &synchronizationConfig_,
+        &synchronizationError);
+    if (synchronizationConfigReady_ && scanSpeedOverrideMmS >= 0.0) {
+        synchronizationConfig_.scanSpeedMmS = scanSpeedOverrideMmS;
+        synchronizationConfigReady_ = synchronizationConfig_.validate(
+            &synchronizationError);
+    }
     profileOptions_.reconstruction.stripe.minimumDifference = 10;
     profileOptions_.reconstruction.stripe.thresholdStddevScale = 2.0;
     profileOptions_.reconstruction.stripe.minPointCount = 80;
@@ -118,6 +131,18 @@ HikConstantLaserScanWindow::HikConstantLaserScanWindow(QWidget* parent)
     profileOptions_.reconstruction.maxLineRmsMm = 0.50;
     buildUi();
     setupWorkers();
+    if (synchronizationConfigReady_) {
+        appendLog(QStringLiteral(
+            "同步配置已加载：%1；目标=%2 fps，曝光=%3 us，扫描速度=%4 mm/s，机器人周期=%5 ms。")
+            .arg(synchronizationConfigPath_)
+            .arg(synchronizationConfig_.cameraTargetFps, 0, 'f', 3)
+            .arg(synchronizationConfig_.cameraExposureUs, 0, 'f', 3)
+            .arg(synchronizationConfig_.scanSpeedMmS, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3));
+    } else {
+        appendLog(QStringLiteral("同步配置不可用：%1")
+            .arg(QString::fromStdString(synchronizationError)));
+    }
     QString error;
     if (loadFormalCalibration(&error)) {
         appendLog(QStringLiteral("正式内参、激光平面和手眼标定已校验。"));
@@ -152,7 +177,7 @@ void HikConstantLaserScanWindow::buildUi() {
     exposureSpin_ = new QDoubleSpinBox(devices);
     exposureSpin_->setRange(1.0, 10000000.0);
     exposureSpin_->setDecimals(3);
-    exposureSpin_->setValue(1825.0);
+    exposureSpin_->setValue(synchronizationConfig_.cameraExposureUs);
     exposureSpin_->setSuffix(QStringLiteral(" us"));
     gainSpin_ = new QDoubleSpinBox(devices);
     gainSpin_->setRange(0.0, 48.0);
@@ -221,6 +246,15 @@ void HikConstantLaserScanWindow::buildUi() {
     velocitySpin_->setRange(1.0, 20.0);
     velocitySpin_->setValue(5.0);
     velocitySpin_->setSuffix(QStringLiteral(" %"));
+    scanSpeedSpin_ = new QDoubleSpinBox(path);
+    scanSpeedSpin_->setRange(10.0, 50.0);
+    scanSpeedSpin_->setDecimals(2);
+    scanSpeedSpin_->setSingleStep(10.0);
+    scanSpeedSpin_->setValue(synchronizationConfig_.scanSpeedMmS);
+    scanSpeedSpin_->setSuffix(QStringLiteral(" mm/s"));
+    scanSpeedSpin_->setToolTip(QStringLiteral(
+        "连续起点→终点段使用 FAIRINO MoveL velAccParamMode=1，按物理速度 mm/s 下发；"
+        "同时用于实际 TCP 速度质量判定。"));
     accelerationSpin_ = new QDoubleSpinBox(path);
     accelerationSpin_->setRange(1.0, 50.0);
     accelerationSpin_->setValue(20.0);
@@ -288,6 +322,11 @@ void HikConstantLaserScanWindow::buildUi() {
     pathLayout->addWidget(targetCountLimitCheck_, 6, 0, 1, 3);
     pathLayout->addWidget(new QLabel(QStringLiteral("最大目标数量"), path), 6, 3);
     pathLayout->addWidget(targetCountLimitSpin_, 6, 4, 1, 2);
+    pathLayout->addWidget(new QLabel(QStringLiteral("连续同步目标速度"), path), 7, 0);
+    pathLayout->addWidget(scanSpeedSpin_, 7, 1);
+    pathLayout->addWidget(new QLabel(
+        QStringLiteral("连续段按物理速度下发；上方速度百分比只用于移到起点/原停稳模式"), path),
+        7, 2, 1, 4);
     root->addWidget(path);
 
     QHBoxLayout* actions = new QHBoxLayout;
@@ -297,6 +336,8 @@ void HikConstantLaserScanWindow::buildUi() {
     dryRunButton_ = new QPushButton(QStringLiteral("生成并打印目标列表"), central);
     captureCurrentButton_ = new QPushButton(QStringLiteral("单点常亮验证（不移动）"), central);
     startScanButton_ = new QPushButton(QStringLiteral("开始停稳扫描"), central);
+    startContinuousButton_ = new QPushButton(
+        QStringLiteral("开始 60fps 连续同步扫描"), central);
     stopButton_ = new QPushButton(QStringLiteral("停止扫描 / StopMotion"), central);
     stopButton_->setStyleSheet(QStringLiteral("background:#b00020;color:white;font-weight:bold;"));
     actions->addWidget(dryRunCheck_);
@@ -304,6 +345,7 @@ void HikConstantLaserScanWindow::buildUi() {
     actions->addWidget(dryRunButton_);
     actions->addWidget(captureCurrentButton_);
     actions->addWidget(startScanButton_);
+    actions->addWidget(startContinuousButton_);
     actions->addWidget(stopButton_);
     root->addLayout(actions);
     scanStatusLabel_ = new QLabel(QStringLiteral("等待操作。"), central);
@@ -352,6 +394,8 @@ void HikConstantLaserScanWindow::buildUi() {
     connect(dryRunButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::generateDryRun);
     connect(captureCurrentButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::captureCurrentProfile);
     connect(startScanButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::startScan);
+    connect(startContinuousButton_, &QPushButton::clicked,
+            this, &HikConstantLaserScanWindow::startContinuousScan);
     connect(stopButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::stopScan);
     connect(reloadCalibrationButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::reloadCalibration);
     connect(dryRunCheck_, &QCheckBox::toggled, this, [this](bool checked) {
@@ -367,6 +411,8 @@ void HikConstantLaserScanWindow::buildUi() {
 }
 
 void HikConstantLaserScanWindow::setupWorkers() {
+    qRegisterMetaType<hik_sync::CameraFrame>("hik_sync::CameraFrame");
+    qRegisterMetaType<hik_sync::RobotSample>("hik_sync::RobotSample");
     cameraWorker_ = new HikCameraWorker;
     cameraWorker_->moveToThread(&cameraThread_);
     connect(&cameraThread_, &QThread::finished, cameraWorker_, &QObject::deleteLater);
@@ -376,6 +422,10 @@ void HikConstantLaserScanWindow::setupWorkers() {
             cameraWorker_, &HikCameraWorker::disconnectCamera, Qt::QueuedConnection);
     connect(this, &HikConstantLaserScanWindow::requestCaptureSingle,
             cameraWorker_, &HikCameraWorker::captureSingle, Qt::QueuedConnection);
+    connect(this, &HikConstantLaserScanWindow::requestStartContinuous,
+            cameraWorker_, &HikCameraWorker::startContinuous, Qt::QueuedConnection);
+    connect(this, &HikConstantLaserScanWindow::requestStopContinuous,
+            cameraWorker_, &HikCameraWorker::stopContinuous, Qt::QueuedConnection);
     connect(cameraWorker_, &HikCameraWorker::connectionChanged,
             this, &HikConstantLaserScanWindow::onCameraConnectionChanged, Qt::QueuedConnection);
     connect(cameraWorker_, &HikCameraWorker::identityChanged,
@@ -388,6 +438,23 @@ void HikConstantLaserScanWindow::setupWorkers() {
             this, &HikConstantLaserScanWindow::onCameraLog, Qt::QueuedConnection);
     connect(cameraWorker_, &HikCameraWorker::error,
             this, &HikConstantLaserScanWindow::onCameraError, Qt::QueuedConnection);
+    connect(cameraWorker_, &HikCameraWorker::continuousStarted,
+            this, &HikConstantLaserScanWindow::onContinuousCameraStarted,
+            Qt::QueuedConnection);
+    connect(cameraWorker_, &HikCameraWorker::continuousStopped,
+            this, &HikConstantLaserScanWindow::onContinuousCameraStopped,
+            Qt::QueuedConnection);
+    connect(cameraWorker_, &HikCameraWorker::continuousFrameRejected,
+            this, &HikConstantLaserScanWindow::onContinuousFrameRejected,
+            Qt::QueuedConnection);
+    connect(cameraWorker_, &HikCameraWorker::continuousFrameReady,
+            this, [this](hik_sync::CameraFrame frame) {
+                (void)synchronizationSession_.pushCamera(std::move(frame));
+            }, Qt::DirectConnection);
+    connect(cameraWorker_, &HikCameraWorker::imagePoolExhausted,
+            this, [this]() {
+                synchronizationSession_.noteImagePoolExhaustion();
+            }, Qt::DirectConnection);
     cameraThread_.start();
 
     robotWorker_ = new FairinoReadOnlyWorker;
@@ -401,6 +468,9 @@ void HikConstantLaserScanWindow::setupWorkers() {
             robotWorker_, &FairinoReadOnlyWorker::readFlangePose, Qt::QueuedConnection);
     connect(this, &HikConstantLaserScanWindow::requestMoveLinear,
             robotWorker_, &FairinoReadOnlyWorker::moveLinear, Qt::QueuedConnection);
+    connect(this, &HikConstantLaserScanWindow::requestMoveLinearPhysical,
+            robotWorker_, &FairinoReadOnlyWorker::moveLinearPhysical,
+            Qt::QueuedConnection);
     connect(this, &HikConstantLaserScanWindow::requestStopMotion,
             robotWorker_, &FairinoReadOnlyWorker::stopMotion, Qt::QueuedConnection);
     connect(robotWorker_, &FairinoReadOnlyWorker::connectionChanged,
@@ -417,12 +487,28 @@ void HikConstantLaserScanWindow::setupWorkers() {
             this, &HikConstantLaserScanWindow::onRobotLog, Qt::QueuedConnection);
     connect(robotWorker_, &FairinoReadOnlyWorker::error,
             this, &HikConstantLaserScanWindow::onRobotError, Qt::QueuedConnection);
+    connect(robotWorker_, &FairinoReadOnlyWorker::robotSampleReady,
+            this, [this](hik_sync::RobotSample sample) {
+                (void)synchronizationSession_.pushRobot(std::move(sample));
+            }, Qt::DirectConnection);
+    connect(robotWorker_, &FairinoReadOnlyWorker::realtimePeriodConfigured,
+            this, [this](int periodMs) {
+                appendLog(QStringLiteral("FR5 20004 实时反馈周期确认：%1 ms。")
+                          .arg(periodMs));
+            }, Qt::QueuedConnection);
     robotThread_.start();
 }
 
 void HikConstantLaserScanWindow::shutdownWorkers() {
     if (shuttingDown_) return;
     shuttingDown_ = true;
+    if (cameraWorker_ && cameraThread_.isRunning() &&
+        continuousState_ != ContinuousState::Idle) {
+        QMetaObject::invokeMethod(cameraWorker_, "stopContinuous",
+                                  Qt::BlockingQueuedConnection);
+    }
+    synchronizationSession_.stop();
+    continuousState_ = ContinuousState::Idle;
     if (robotWorker_ && robotThread_.isRunning()) {
         QMetaObject::invokeMethod(robotWorker_, "disconnectRobot", Qt::BlockingQueuedConnection);
         robotThread_.quit();
@@ -454,6 +540,7 @@ void HikConstantLaserScanWindow::showError(const QString& title, const QString& 
 
 void HikConstantLaserScanWindow::updateUi() {
     const bool idle = !shuttingDown_ && scanState_ == ScanState::Idle &&
+                      continuousState_ == ContinuousState::Idle &&
                       pendingRobotRequestId_ < 0 && pendingCameraRequestId_ < 0;
     connectCameraButton_->setEnabled(idle && !cameraConnected_ && !cameraBusy_);
     disconnectCameraButton_->setEnabled(idle && cameraConnected_ && !cameraBusy_);
@@ -475,10 +562,14 @@ void HikConstantLaserScanWindow::updateUi() {
     startScanButton_->setEnabled(idle && startTaught_ && endTaught_ &&
                                  (dryRunCheck_->isChecked() ||
                                   (cameraConnected_ && robotConnected_ && calibrationReady_)));
+    startContinuousButton_->setEnabled(
+        idle && synchronizationConfigReady_ && startTaught_ && endTaught_ &&
+        cameraConnected_ && robotConnected_ && calibrationReady_);
     stopButton_->setEnabled(!idle && robotConnected_);
     safetyConfirmCheck_->setEnabled(idle && !dryRunCheck_->isChecked());
     stepSpin_->setEnabled(idle);
     velocitySpin_->setEnabled(idle);
+    scanSpeedSpin_->setEnabled(idle && synchronizationConfigReady_);
     accelerationSpin_->setEnabled(idle);
     settleSpin_->setEnabled(idle);
     motionTimeoutSpin_->setEnabled(idle);
@@ -779,6 +870,240 @@ void HikConstantLaserScanWindow::startScan() {
     issueMoveForCurrentTarget();
 }
 
+void HikConstantLaserScanWindow::startContinuousScan() {
+    QString error;
+    if (!synchronizationConfigReady_) {
+        showError(QStringLiteral("无法开始连续同步"),
+                  QStringLiteral("同步配置未通过校验：%1")
+                      .arg(synchronizationConfigPath_));
+        return;
+    }
+    if (scanState_ != ScanState::Idle || continuousState_ != ContinuousState::Idle ||
+        pendingMotionRequestId_ >= 0) {
+        showError(QStringLiteral("无法开始连续同步"), QStringLiteral("当前已有任务在运行。"));
+        return;
+    }
+    if (dryRunCheck_->isChecked()) {
+        showError(QStringLiteral("无法开始连续同步"),
+                  QStringLiteral("连续扫描会真实执行一次 MoveL；请先完成 dry-run，再取消 dry-run。"));
+        return;
+    }
+    if (!cameraConnected_ || !robotConnected_ || !calibrationReady_ ||
+        !startTaught_ || !endTaught_) {
+        showError(QStringLiteral("无法开始连续同步"),
+                  QStringLiteral("请连接相机/FR5、加载正式标定并示教起点和终点。"));
+        return;
+    }
+    if (!safetyConfirmCheck_->isChecked()) {
+        showError(QStringLiteral("真运动未授权"),
+                  QStringLiteral("请确认路径、控制器状态和物理急停后勾选安全确认。"));
+        return;
+    }
+    if (!formalCalibrationFilesUnchanged(&error) ||
+        !calibrationIdentityMatches(&error)) {
+        showError(QStringLiteral("标定检查失败"), error);
+        return;
+    }
+    synchronizationConfig_.scanSpeedMmS = scanSpeedSpin_->value();
+    synchronizationConfig_.cameraExposureUs = exposureSpin_->value();
+    std::string validationError;
+    if (!synchronizationConfig_.validate(&validationError)) {
+        showError(QStringLiteral("同步参数无效"),
+                  QString::fromStdString(validationError));
+        return;
+    }
+    const double pathLength = cv::norm(cv::Vec3d(
+        endPose_.x - startPose_.x, endPose_.y - startPose_.y,
+        endPose_.z - startPose_.z));
+    if (pathLengthLimitCheck_->isChecked() &&
+        pathLength > pathLengthLimitSpin_->value()) {
+        showError(QStringLiteral("路径长度保护"),
+                  QStringLiteral("连续路径 %1 mm 超过保护门槛 %2 mm。")
+                      .arg(pathLength, 0, 'f', 3)
+                      .arg(pathLengthLimitSpin_->value(), 0, 'f', 3));
+        return;
+    }
+    const QString confirmation = QStringLiteral(
+        "将先移动到起点，再以自由运行 %1 fps 采图，并执行一条起点→终点 MoveL。\n"
+        "连续段使用 FAIRINO MoveL velAccParamMode=1：物理速度=%2 mm/s，物理加速度=%3 mm/s²。\n"
+        "移到起点仍使用低速 %4%%；若连续段实际 TCP 速度不在目标 ±%5%%，"
+        "图像仍保存但标为 SPEED_NOT_STABLE。\n路径长度=%6 mm。\n\n确认完整路径安全并开始？")
+        .arg(synchronizationConfig_.cameraTargetFps, 0, 'f', 3)
+        .arg(synchronizationConfig_.scanSpeedMmS, 0, 'f', 3)
+        .arg(synchronizationConfig_.scanAccelerationMmS2, 0, 'f', 3)
+        .arg(velocitySpin_->value(), 0, 'f', 2)
+        .arg(synchronizationConfig_.scanSpeedTolerancePercent, 0, 'f', 2)
+        .arg(pathLength, 0, 'f', 3);
+    if (QMessageBox::warning(this, QStringLiteral("确认连续同步真实扫描"),
+                             confirmation, QMessageBox::Yes | QMessageBox::No,
+                             QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    if (!createSynchronizationSession(&error)) {
+        showError(QStringLiteral("创建同步会话失败"), error);
+        return;
+    }
+
+    continuousAbortRequested_ = false;
+    continuousState_ = ContinuousState::MovingToStart;
+    pendingMotionRequestId_ = ++nextRobotRequestId_;
+    scanStatusLabel_->setText(QStringLiteral("正在移动到连续扫描起点：%1")
+                              .arg(poseText(startPose_)));
+    appendLog(scanStatusLabel_->text());
+    emit requestMoveLinear(pendingMotionRequestId_,
+                           startPose_.x, startPose_.y, startPose_.z,
+                           startPose_.rx, startPose_.ry, startPose_.rz,
+                           velocitySpin_->value(), accelerationSpin_->value(),
+                           motionTimeoutSpin_->value() * 1000);
+    updateUi();
+}
+
+bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
+    QString outputRoot = QString::fromStdString(
+        synchronizationConfig_.outputDirectory);
+    if (QDir::isRelativePath(outputRoot)) {
+        outputRoot = QDir(sourceDir_).absoluteFilePath(outputRoot);
+    }
+    synchronizationSessionDir_ = uniqueSession(outputRoot, QStringLiteral("sync_scan"));
+    if (synchronizationSessionDir_.isEmpty()) {
+        if (error) *error = QStringLiteral("无法生成唯一同步会话目录。根目录=%1").arg(outputRoot);
+        return false;
+    }
+    Eigen::Matrix4d flangeFromCamera = Eigen::Matrix4d::Identity();
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            flangeFromCamera(row, column) = handEye_.flangeFromCamera(row, column);
+        }
+    }
+    std::string coreError;
+    if (!synchronizationSession_.start(
+            synchronizationConfig_, localPath(synchronizationSessionDir_),
+            &flangeFromCamera, &coreError)) {
+        if (error) *error = QString::fromStdString(coreError);
+        return false;
+    }
+    const double spacing = synchronizationConfig_.scanSpeedMmS /
+                           synchronizationConfig_.cameraTargetFps;
+    const double motionDuringExposure = synchronizationConfig_.scanSpeedMmS *
+        synchronizationConfig_.cameraExposureUs / 1.0e6;
+    appendLog(QStringLiteral(
+        "同步会话=%1；相机初始模式=HOST_CALLBACK_FALLBACK（设备映射稳定后自动切换）；"
+        "机器人初始实际模式=HOST_RECEIVE、请求模式=%2（拟合稳定后自动切换）；"
+        "理论线间距=%3 mm/帧；曝光运动量=%4 mm。")
+        .arg(synchronizationSessionDir_)
+        .arg(QString::fromLatin1(hik_sync::robotTimeModeName(
+            synchronizationConfig_.robotTimeMode)))
+        .arg(spacing, 0, 'f', 6)
+        .arg(motionDuringExposure, 0, 'f', 6));
+    return true;
+}
+
+void HikConstantLaserScanWindow::onContinuousCameraStarted(
+        double actualExposureUs, double actualFps,
+        quint64 timestampFrequencyHz, QString timestampDescription) {
+    if (continuousState_ != ContinuousState::StartingCamera) {
+        if (continuousState_ == ContinuousState::Stopping) emit requestStopContinuous();
+        return;
+    }
+    appendLog(QStringLiteral(
+        "连续相机已就绪：actual exposure=%1 us, actual fps=%2, timestamp=%3, frequency=%4 Hz。")
+        .arg(actualExposureUs, 0, 'f', 3).arg(actualFps, 0, 'f', 3)
+        .arg(timestampDescription).arg(timestampFrequencyHz));
+    QTimer::singleShot(100, this, [this]() {
+        if (continuousState_ != ContinuousState::StartingCamera ||
+            continuousAbortRequested_) return;
+        continuousState_ = ContinuousState::Scanning;
+        pendingMotionRequestId_ = ++nextRobotRequestId_;
+        scanStatusLabel_->setText(QStringLiteral(
+            "60fps 连续同步采集中：MoveL 到终点；加减速帧会保留并标记。"));
+        appendLog(scanStatusLabel_->text());
+        emit requestMoveLinearPhysical(
+            pendingMotionRequestId_,
+            endPose_.x, endPose_.y, endPose_.z,
+            startPose_.rx, startPose_.ry, startPose_.rz,
+            synchronizationConfig_.scanSpeedMmS,
+            synchronizationConfig_.scanAccelerationMmS2,
+            motionTimeoutSpin_->value() * 1000);
+        updateUi();
+    });
+}
+
+void HikConstantLaserScanWindow::onContinuousCameraStopped() {
+    if (continuousState_ != ContinuousState::Stopping) return;
+    QTimer::singleShot(60, this, [this]() {
+        if (continuousState_ != ContinuousState::Stopping) return;
+        finalizeContinuousScan(!continuousAbortRequested_,
+            continuousAbortRequested_ ? QStringLiteral("扫描中止，已保存已采数据")
+                                      : QStringLiteral("连续扫描完成"));
+    });
+}
+
+void HikConstantLaserScanWindow::onContinuousFrameRejected(
+        quint64 frameNo, QString reason) {
+    appendLog(QStringLiteral("相机连续帧 %1 被拒绝：%2").arg(frameNo).arg(reason));
+}
+
+void HikConstantLaserScanWindow::abortContinuousScan(
+        const QString& reason, bool requestStop) {
+    if (continuousState_ == ContinuousState::Idle) return;
+    appendLog(QStringLiteral("连续同步扫描终止请求：%1").arg(reason));
+    continuousAbortRequested_ = true;
+    const ContinuousState previous = continuousState_;
+    if (requestStop && robotConnected_ && pendingMotionRequestId_ >= 0) {
+        emit requestStopMotion(++nextRobotRequestId_);
+    }
+    if (previous == ContinuousState::StartingCamera ||
+        previous == ContinuousState::Scanning ||
+        previous == ContinuousState::Stopping) {
+        continuousState_ = ContinuousState::Stopping;
+        emit requestStopContinuous();
+    } else if (previous == ContinuousState::MovingToStart &&
+               (!requestStop || pendingMotionRequestId_ < 0)) {
+        pendingMotionRequestId_ = -1;
+        finalizeContinuousScan(false, reason);
+    }
+    scanStatusLabel_->setText(QStringLiteral("正在安全停止连续同步扫描：%1").arg(reason));
+    updateUi();
+}
+
+void HikConstantLaserScanWindow::finalizeContinuousScan(
+        bool completed, const QString& reason) {
+    synchronizationSession_.stop();
+    const hik_sync::PipelineStatistics stats = synchronizationSession_.statistics();
+    const QString mode = QString::fromStdString(
+        synchronizationSession_.clockModeDescription());
+    continuousState_ = ContinuousState::Idle;
+    pendingMotionRequestId_ = -1;
+    safetyConfirmCheck_->setChecked(false);
+    scanStatusLabel_->setText(QStringLiteral(
+        "%1：frames=%2, camera_drop=%3, robot_drop=%4, valid=%5, invalid=%6, stable=%7；"
+        "pool_exhaust=%8, image_write_fail=%9, writer_overflow=%10；%11；目录=%12")
+        .arg(completed ? QStringLiteral("连续同步完成") : QStringLiteral("连续同步已终止"))
+        .arg(stats.totalCameraFrames).arg(stats.cameraFramesDropped)
+        .arg(stats.robotStatesDropped).arg(stats.successfulSyncFrames)
+        .arg(stats.invalidSyncFrames).arg(stats.stableSpeedFrames)
+        .arg(stats.imagePoolExhaustions).arg(stats.imageWriteFailures)
+        .arg(stats.writerQueueOverflows).arg(mode, synchronizationSessionDir_));
+    appendLog(QStringLiteral("%1；%2").arg(scanStatusLabel_->text(), reason));
+    if (stats.actualCameraFps > 0.0 &&
+        std::abs(stats.actualCameraFps - synchronizationConfig_.cameraTargetFps) >
+            synchronizationConfig_.cameraTargetFps * 0.05) {
+        appendLog(QStringLiteral(
+            "警告：相机实测平均帧率=%1 fps，偏离目标 %2 fps 超过 5%。")
+            .arg(stats.actualCameraFps, 0, 'f', 3)
+            .arg(synchronizationConfig_.cameraTargetFps, 0, 'f', 3));
+    }
+    if (stats.maximumRobotGapMs > synchronizationConfig_.robotWarningGapMs) {
+        appendLog(QStringLiteral(
+            "警告：FR5 最大主机接收间隔=%1 ms，超过警告门槛 %2 ms；异常间隔=%3。")
+            .arg(stats.maximumRobotGapMs, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotWarningGapMs, 0, 'f', 3)
+            .arg(stats.robotAbnormalIntervals));
+    }
+    continuousAbortRequested_ = false;
+    updateUi();
+}
+
 void HikConstantLaserScanWindow::captureCurrentProfile() {
     QString error;
     profileOptions_.reconstruction.maxLineRmsMm = lineRmsLimitSpin_->value();
@@ -805,6 +1130,11 @@ void HikConstantLaserScanWindow::captureCurrentProfile() {
 }
 
 void HikConstantLaserScanWindow::stopScan() {
+    if (continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(QStringLiteral("用户停止连续同步扫描。"),
+                            pendingMotionRequestId_ >= 0);
+        return;
+    }
     if (scanState_ == ScanState::Idle) return;
     const bool moving = pendingMotionRequestId_ >= 0;
     abortScan(moving
@@ -852,7 +1182,11 @@ void HikConstantLaserScanWindow::onCameraConnectionChanged(bool connected, QStri
     cameraConnected_ = connected;
     cameraStatusLabel_->setText(description);
     cameraStatusLabel_->setStyleSheet(connected ? QStringLiteral("color:#087f23;") : QStringLiteral("color:#b00020;"));
-    if (!connected && scanState_ != ScanState::Idle) abortScan(QStringLiteral("扫描中相机断开。"), true);
+    if (!connected && continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(QStringLiteral("连续同步扫描中相机断开。"), true);
+    } else if (!connected && scanState_ != ScanState::Idle) {
+        abortScan(QStringLiteral("扫描中相机断开。"), true);
+    }
     updateUi();
 }
 
@@ -866,7 +1200,9 @@ void HikConstantLaserScanWindow::onCameraLog(QString message) { appendLog(QStrin
 
 void HikConstantLaserScanWindow::onCameraError(int requestId, QString message) {
     if (requestId == pendingCameraRequestId_) pendingCameraRequestId_ = -1;
-    if (scanState_ != ScanState::Idle) abortScan(QStringLiteral("相机错误: %1").arg(message), false);
+    if (continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(QStringLiteral("相机错误: %1").arg(message), true);
+    } else if (scanState_ != ScanState::Idle) abortScan(QStringLiteral("相机错误: %1").arg(message), false);
     else showError(QStringLiteral("相机错误"), message);
     updateUi();
 }
@@ -875,7 +1211,11 @@ void HikConstantLaserScanWindow::onRobotConnectionChanged(bool connected, QStrin
     robotConnected_ = connected;
     robotStatusLabel_->setText(description);
     robotStatusLabel_->setStyleSheet(connected ? QStringLiteral("color:#087f23;") : QStringLiteral("color:#b00020;"));
-    if (!connected && scanState_ != ScanState::Idle) abortScan(QStringLiteral("扫描中 FR5 断开。"), false);
+    if (!connected && continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(QStringLiteral("连续同步扫描中 FR5 断开。"), false);
+    } else if (!connected && scanState_ != ScanState::Idle) {
+        abortScan(QStringLiteral("扫描中 FR5 断开。"), false);
+    }
     updateUi();
 }
 
@@ -884,7 +1224,9 @@ void HikConstantLaserScanWindow::onRobotLog(QString message) { appendLog(QString
 
 void HikConstantLaserScanWindow::onRobotError(int requestId, QString message) {
     if (requestId == pendingRobotRequestId_) { pendingRobotRequestId_ = -1; readRole_ = ReadRole::None; }
-    if (scanState_ != ScanState::Idle) abortScan(QStringLiteral("FR5 错误: %1").arg(message), true);
+    if (continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(QStringLiteral("FR5 错误: %1").arg(message), true);
+    } else if (scanState_ != ScanState::Idle) abortScan(QStringLiteral("FR5 错误: %1").arg(message), true);
     else showError(QStringLiteral("FR5 错误"), message);
     updateUi();
 }
@@ -936,6 +1278,40 @@ void HikConstantLaserScanWindow::onRobotMotionFinished(int requestId, bool succe
     }
     pendingMotionRequestId_ = -1;
     appendLog(QStringLiteral("FR5: %1").arg(description));
+    if (continuousState_ == ContinuousState::MovingToStart) {
+        if (!success || continuousAbortRequested_) {
+            finalizeContinuousScan(false, description);
+            return;
+        }
+        continuousState_ = ContinuousState::StartingCamera;
+        scanStatusLabel_->setText(QStringLiteral(
+            "已到连续扫描起点；预采机器人状态后启动相机。"));
+        QTimer::singleShot(100, this, [this]() {
+            if (continuousState_ != ContinuousState::StartingCamera) return;
+            emit requestStartContinuous(
+                synchronizationConfig_.cameraExposureUs,
+                gainSpin_->value(),
+                synchronizationConfig_.cameraTargetFps,
+                static_cast<int>(synchronizationConfig_.cameraQueueCapacity));
+        });
+        updateUi();
+        return;
+    }
+    if (continuousState_ == ContinuousState::Scanning) {
+        continuousState_ = ContinuousState::Stopping;
+        continuousAbortRequested_ = !success || continuousAbortRequested_;
+        emit requestStopContinuous();
+        scanStatusLabel_->setText(success
+            ? QStringLiteral("连续 MoveL 已完成，正在停止相机并清空同步/写入队列。")
+            : QStringLiteral("连续 MoveL 失败，正在停止相机并保存已采数据。"));
+        updateUi();
+        return;
+    }
+    if (continuousState_ == ContinuousState::Stopping) {
+        // StopMotion reports completion for the original active MoveL request.
+        // Camera shutdown owns final queue draining in this state.
+        return;
+    }
     if (!success || stopRequested_) {
         abortScan(description, false);
         return;

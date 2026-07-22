@@ -1,12 +1,21 @@
 #ifndef MYLINE_HIK_HIK_CAMERA_WORKER_H
 #define MYLINE_HIK_HIK_CAMERA_WORKER_H
 
+#include "HikSynchronizationCore.h"
+
 #include <QImage>
 #include <QObject>
 #include <QString>
 #include <QtGlobal>
 
 #include <atomic>
+#include <memory>
+
+#if defined(HAVE_HIK_MVS)
+#include <MvCameraControl.h>
+#endif
+
+Q_DECLARE_METATYPE(hik_sync::CameraFrame)
 
 // Single-owner wrapper for one Hikrobot MVS camera.
 //
@@ -33,6 +42,18 @@ public slots:
     // MV_FRAME_OUT_INFO_EX (the SDK does not document hostTimestamp's unit).
     void captureSingle(int requestId, double exposureUs, double gainDb, int timeoutMs);
 
+    // Starts free-running Mono8 acquisition. MVS invokes the registered image
+    // callback on an SDK thread; that callback only timestamps, copies into the
+    // bounded pool, publishes metadata, and returns.
+    void startContinuous(double exposureUs,
+                         double gainDb,
+                         double targetFps,
+                         int poolCapacity);
+    void stopContinuous();
+
+private slots:
+    void handleDeviceDisconnect();
+
 signals:
     void connectionChanged(bool connected, QString description);
     void identityChanged(QString model, QString serial, QString ipAddress);
@@ -46,6 +67,14 @@ signals:
                     double actualGain,
                     QString description);
     void log(QString message);
+    void continuousStarted(double actualExposureUs,
+                           double actualFps,
+                           quint64 deviceTimestampFrequencyHz,
+                           QString timestampDescription);
+    void continuousStopped();
+    void continuousFrameReady(hik_sync::CameraFrame frame);
+    void continuousFrameRejected(quint64 frameNo, QString reason);
+    void imagePoolExhausted();
     // requestId is -1 for connection/lifetime errors.
     void error(int requestId, QString message);
 
@@ -62,6 +91,11 @@ private:
     static QString formatSdkError(const QString& operation, int code);
     static QString sdkErrorName(int code);
     static void onSdkException(unsigned int messageType, void* userData);
+    static void onContinuousImage(unsigned char* data,
+                                  MV_FRAME_OUT_INFO_EX* frameInfo,
+                                  void* userData);
+    void handleContinuousImage(const unsigned char* data,
+                               const MV_FRAME_OUT_INFO_EX& frameInfo);
 #endif
 
     void* m_handle;
@@ -71,6 +105,11 @@ private:
     bool m_busy;
     QString m_cameraIp;
     std::atomic<bool> m_deviceDisconnected;
+    std::atomic<bool> m_continuousRunning{false};
+    double m_continuousExposureUs{0.0};
+    double m_continuousFps{0.0};
+    quint64 m_deviceTimestampFrequencyHz{0};
+    std::unique_ptr<hik_sync::ImageBufferPool> m_imagePool;
 };
 
 #endif // MYLINE_HIK_HIK_CAMERA_WORKER_H

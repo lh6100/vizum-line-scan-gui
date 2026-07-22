@@ -3,6 +3,7 @@
 
 #include "HikCalibrationCore.h"
 #include "HikScanCore.h"
+#include "HikSynchronizationCore.h"
 
 #include <QImage>
 #include <QMainWindow>
@@ -27,13 +28,19 @@ class HikConstantLaserScanWindow final : public QMainWindow {
     Q_OBJECT
 
 public:
-    explicit HikConstantLaserScanWindow(QWidget* parent = nullptr);
+    explicit HikConstantLaserScanWindow(QWidget* parent = nullptr,
+                                        double scanSpeedOverrideMmS = -1.0);
     ~HikConstantLaserScanWindow() override;
 
 signals:
     void requestConnectCamera(QString ipAddress);
     void requestDisconnectCamera();
     void requestCaptureSingle(int requestId, double exposureUs, double gainDb, int timeoutMs);
+    void requestStartContinuous(double exposureUs,
+                                double gainDb,
+                                double targetFps,
+                                int poolCapacity);
+    void requestStopContinuous();
     void requestConnectRobot(QString ipAddress);
     void requestDisconnectRobot();
     void requestReadFlangePose(int requestId);
@@ -43,6 +50,12 @@ signals:
                            double velocityPercent,
                            double accelerationPercent,
                            int timeoutMs);
+    void requestMoveLinearPhysical(int requestId,
+                                   double xMm, double yMm, double zMm,
+                                   double rxDeg, double ryDeg, double rzDeg,
+                                   double speedMmS,
+                                   double accelerationMmS2,
+                                   int timeoutMs);
     void requestStopMotion(int requestId);
 
 protected:
@@ -62,6 +75,7 @@ private slots:
     void captureCurrentProfile();
     void startScan();
     void stopScan();
+    void startContinuousScan();
     void reloadCalibration();
 
     void onCameraConnectionChanged(bool connected, QString description);
@@ -73,6 +87,12 @@ private slots:
                             QString description);
     void onCameraLog(QString message);
     void onCameraError(int requestId, QString message);
+    void onContinuousCameraStarted(double actualExposureUs,
+                                   double actualFps,
+                                   quint64 timestampFrequencyHz,
+                                   QString timestampDescription);
+    void onContinuousCameraStopped();
+    void onContinuousFrameRejected(quint64 frameNo, QString reason);
 
     void onRobotConnectionChanged(bool connected, QString description);
     void onRobotBusyChanged(bool busy);
@@ -87,6 +107,7 @@ private slots:
 
 private:
     enum class ScanState { Idle, Moving, Settling, ReadingBefore, Capturing, ReadingAfter };
+    enum class ContinuousState { Idle, MovingToStart, StartingCamera, Scanning, Stopping };
     enum class ReadRole { None, Manual, TeachStart, TeachEnd, ScanBefore, ScanAfter };
 
     struct PoseReading {
@@ -131,6 +152,9 @@ private:
     void finishProfile(const PoseReading& after);
     void continueOrFinish();
     void abortScan(const QString& reason, bool requestStop);
+    void abortContinuousScan(const QString& reason, bool requestStop);
+    void finalizeContinuousScan(bool completed, const QString& reason);
+    bool createSynchronizationSession(QString* error);
     bool createScanSession(QString* error);
     bool appendManifest(const ProfileRow& row,
                         quint64 frameNo,
@@ -151,6 +175,13 @@ private:
     QString sourceDir_;
     QString configDir_;
     bool shuttingDown_{false};
+    hik_sync::SynchronizationConfig synchronizationConfig_;
+    bool synchronizationConfigReady_{false};
+    QString synchronizationConfigPath_;
+    hik_sync::SynchronizationSession synchronizationSession_;
+    ContinuousState continuousState_{ContinuousState::Idle};
+    bool continuousAbortRequested_{false};
+    QString synchronizationSessionDir_;
 
     QThread cameraThread_;
     HikCameraWorker* cameraWorker_{nullptr};
@@ -239,6 +270,7 @@ private:
     QLabel* endPoseLabel_{nullptr};
     QDoubleSpinBox* stepSpin_{nullptr};
     QDoubleSpinBox* velocitySpin_{nullptr};
+    QDoubleSpinBox* scanSpeedSpin_{nullptr};
     QDoubleSpinBox* accelerationSpin_{nullptr};
     QSpinBox* settleSpin_{nullptr};
     QSpinBox* motionTimeoutSpin_{nullptr};
@@ -254,6 +286,7 @@ private:
     QPushButton* dryRunButton_{nullptr};
     QPushButton* captureCurrentButton_{nullptr};
     QPushButton* startScanButton_{nullptr};
+    QPushButton* startContinuousButton_{nullptr};
     QPushButton* stopButton_{nullptr};
     QLabel* scanStatusLabel_{nullptr};
     QTableWidget* profileTable_{nullptr};

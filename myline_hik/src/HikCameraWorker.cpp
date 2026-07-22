@@ -1,6 +1,7 @@
 #include "HikCameraWorker.h"
 
 #include <QByteArray>
+#include <QMetaObject>
 #include <QStringList>
 
 #include <algorithm>
@@ -191,13 +192,25 @@ void HikCameraWorker::onSdkException(unsigned int messageType, void* userData) {
         // SDK callbacks may run on an internal thread. Never close/destroy the
         // handle here; only publish an atomic notification to the owner thread.
         self->m_deviceDisconnected.store(true);
+        (void)QMetaObject::invokeMethod(self, "handleDeviceDisconnect",
+                                        Qt::QueuedConnection);
     }
 }
 
 #endif
 
+void HikCameraWorker::handleDeviceDisconnect() {
+    if (!m_deviceDisconnected.load()) return;
+    if (m_continuousRunning.load()) stopContinuous();
+    releaseDevice(false);
+    const QString message = QStringLiteral("海康相机网络连接已断开，请重新启动程序并连接设备");
+    emit error(kConnectionRequestId, message);
+    emit connectionChanged(false, message);
+}
+
 void HikCameraWorker::releaseDevice(bool reportErrors) {
 #if defined(HAVE_HIK_MVS)
+    m_continuousRunning.store(false);
     if (!m_handle) {
         m_grabbing = false;
         m_connected = false;
@@ -230,6 +243,7 @@ void HikCameraWorker::releaseDevice(bool reportErrors) {
     m_handle = nullptr;
     m_connected = false;
     m_grabbing = false;
+    m_imagePool.reset();
     m_cameraIp.clear();
     m_deviceDisconnected.store(false);
 }
@@ -482,7 +496,7 @@ void HikCameraWorker::connectCamera(QString ipAddress) {
 }
 
 void HikCameraWorker::disconnectCamera() {
-    if (m_busy) {
+    if (m_busy && !m_continuousRunning.load()) {
         emit error(kConnectionRequestId, QStringLiteral("相机正在执行其他操作，暂不能断开"));
         return;
     }
@@ -543,8 +557,18 @@ void HikCameraWorker::captureSingle(int requestId,
     unsigned int lostPackets = 0;
 
     do {
+        int code = MV_CC_SetEnumValueByString(m_handle, "TriggerMode", "On");
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("设置 TriggerMode=On"), code);
+            break;
+        }
+        code = MV_CC_SetEnumValueByString(m_handle, "TriggerSource", "Software");
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("设置 TriggerSource=Software"), code);
+            break;
+        }
         MVCC_FLOATVALUE exposureRange{};
-        int code = MV_CC_GetFloatValue(m_handle, "ExposureTime", &exposureRange);
+        code = MV_CC_GetFloatValue(m_handle, "ExposureTime", &exposureRange);
         if (code != MV_OK) {
             failure = formatSdkError(QStringLiteral("读取 ExposureTime 范围"), code);
             break;
@@ -740,3 +764,247 @@ void HikCameraWorker::captureSingle(int requestId,
 
     setBusy(false);
 }
+
+void HikCameraWorker::startContinuous(double exposureUs,
+                                      double gainDb,
+                                      double targetFps,
+                                      int poolCapacity) {
+    if (m_busy || m_continuousRunning.load()) {
+        emit error(kConnectionRequestId, QStringLiteral("相机已在采集或执行其他操作"));
+        return;
+    }
+    if (!m_connected || !m_handle) {
+        emit error(kConnectionRequestId, QStringLiteral("海康相机未连接"));
+        return;
+    }
+    if (!std::isfinite(exposureUs) || exposureUs <= 0.0 ||
+        !std::isfinite(gainDb) || !std::isfinite(targetFps) || targetFps <= 0.0 ||
+        poolCapacity < 2 || poolCapacity > 4096) {
+        emit error(kConnectionRequestId, QStringLiteral(
+            "连续采集参数无效: exposure=%1 us, gain=%2 dB, fps=%3, pool=%4")
+            .arg(exposureUs, 0, 'f', 3).arg(gainDb, 0, 'f', 3)
+            .arg(targetFps, 0, 'f', 3).arg(poolCapacity));
+        return;
+    }
+    setBusy(true);
+
+#if !defined(HAVE_HIK_MVS)
+    emit error(kConnectionRequestId,
+               QStringLiteral("当前程序未编译海康 MVS 支持（缺少 HAVE_HIK_MVS）"));
+    setBusy(false);
+#else
+    QString failure;
+    double actualExposure = exposureUs;
+    double actualFps = targetFps;
+    quint64 timestampFrequency = 0U;
+    do {
+        int code = MV_CC_SetEnumValueByString(m_handle, "ExposureAuto", "Off");
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("关闭自动曝光"), code);
+            break;
+        }
+        code = MV_CC_SetEnumValueByString(m_handle, "GainAuto", "Off");
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("关闭自动增益"), code);
+            break;
+        }
+        code = MV_CC_SetEnumValueByString(m_handle, "TriggerMode", "Off");
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("设置 TriggerMode=Off"), code);
+            break;
+        }
+        MVCC_FLOATVALUE exposureRange{};
+        code = MV_CC_GetFloatValue(m_handle, "ExposureTime", &exposureRange);
+        if (code != MV_OK || exposureUs < exposureRange.fMin ||
+            exposureUs > exposureRange.fMax) {
+            failure = code == MV_OK
+                ? QStringLiteral("曝光 %1 us 超出相机范围 [%2, %3] us")
+                      .arg(exposureUs, 0, 'f', 3)
+                      .arg(exposureRange.fMin, 0, 'f', 3)
+                      .arg(exposureRange.fMax, 0, 'f', 3)
+                : formatSdkError(QStringLiteral("读取 ExposureTime 范围"), code);
+            break;
+        }
+        MVCC_FLOATVALUE gainRange{};
+        code = MV_CC_GetFloatValue(m_handle, "Gain", &gainRange);
+        if (code != MV_OK || gainDb < gainRange.fMin || gainDb > gainRange.fMax) {
+            failure = code == MV_OK
+                ? QStringLiteral("增益 %1 dB 超出相机范围 [%2, %3] dB")
+                      .arg(gainDb, 0, 'f', 3)
+                      .arg(gainRange.fMin, 0, 'f', 3)
+                      .arg(gainRange.fMax, 0, 'f', 3)
+                : formatSdkError(QStringLiteral("读取 Gain 范围"), code);
+            break;
+        }
+        MVCC_FLOATVALUE fpsRange{};
+        code = MV_CC_GetFloatValue(m_handle, "AcquisitionFrameRate", &fpsRange);
+        if (code != MV_OK || targetFps < fpsRange.fMin || targetFps > fpsRange.fMax) {
+            failure = code == MV_OK
+                ? QStringLiteral("帧率 %1 fps 超出相机当前范围 [%2, %3] fps")
+                      .arg(targetFps, 0, 'f', 3)
+                      .arg(fpsRange.fMin, 0, 'f', 3)
+                      .arg(fpsRange.fMax, 0, 'f', 3)
+                : formatSdkError(QStringLiteral("读取 AcquisitionFrameRate 范围"), code);
+            break;
+        }
+        code = MV_CC_SetFloatValue(m_handle, "ExposureTime", static_cast<float>(exposureUs));
+        if (code == MV_OK) code = MV_CC_SetFloatValue(m_handle, "Gain", static_cast<float>(gainDb));
+        if (code == MV_OK) code = MV_CC_SetBoolValue(m_handle, "AcquisitionFrameRateEnable", true);
+        if (code == MV_OK) {
+            code = MV_CC_SetFloatValue(m_handle, "AcquisitionFrameRate",
+                                       static_cast<float>(targetFps));
+        }
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("配置自由运行曝光/增益/60fps"), code);
+            break;
+        }
+        MVCC_FLOATVALUE actualValue{};
+        if (MV_CC_GetFloatValue(m_handle, "ExposureTime", &actualValue) == MV_OK) {
+            actualExposure = actualValue.fCurValue;
+        }
+        std::memset(&actualValue, 0, sizeof(actualValue));
+        if (MV_CC_GetFloatValue(m_handle, "AcquisitionFrameRate", &actualValue) == MV_OK) {
+            actualFps = actualValue.fCurValue;
+        }
+
+        // GigE Vision exposes device timestamp ticks through this GenICam
+        // integer node when supported. The MVS frame struct itself documents
+        // only raw high/low words and does not define their unit.
+        MVCC_INTVALUE_EX frequencyValue{};
+        const int frequencyCode = MV_CC_GetIntValueEx(
+            m_handle, "GevTimestampTickFrequency", &frequencyValue);
+        if (frequencyCode == MV_OK && frequencyValue.nCurValue > 0) {
+            timestampFrequency = static_cast<quint64>(frequencyValue.nCurValue);
+        } else {
+            emit log(QStringLiteral(
+                "相机不提供可读 GevTimestampTickFrequency，设备时间戳单位无法确认；将使用 HOST_CALLBACK_FALLBACK。"));
+        }
+
+        code = MV_CC_SetImageNodeNum(m_handle, 16U);
+        if (code != MV_OK) {
+            emit log(formatSdkError(QStringLiteral("设置连续采集 SDK 缓存节点数=16"), code));
+        }
+        m_imagePool = std::make_unique<hik_sync::ImageBufferPool>(
+            static_cast<std::size_t>(poolCapacity));
+        m_continuousExposureUs = actualExposure;
+        m_continuousFps = actualFps;
+        m_deviceTimestampFrequencyHz = timestampFrequency;
+        code = MV_CC_RegisterImageCallBackEx(
+            m_handle, &HikCameraWorker::onContinuousImage, this);
+        if (code != MV_OK) {
+            failure = formatSdkError(QStringLiteral("MV_CC_RegisterImageCallBackEx"), code);
+            break;
+        }
+        m_continuousRunning.store(true);
+        code = MV_CC_StartGrabbing(m_handle);
+        if (code != MV_OK) {
+            m_continuousRunning.store(false);
+            failure = formatSdkError(QStringLiteral("MV_CC_StartGrabbing"), code);
+            break;
+        }
+        m_grabbing = true;
+    } while (false);
+
+    if (!failure.isEmpty()) {
+        m_continuousRunning.store(false);
+        m_imagePool.reset();
+        emit error(kConnectionRequestId, failure);
+        setBusy(false);
+        return;
+    }
+    const QString timestampDescription = timestampFrequency > 0U
+        ? QStringLiteral("DEVICE_TIMESTAMP_MAPPING, tick_frequency=%1 Hz")
+              .arg(timestampFrequency)
+        : QStringLiteral("HOST_CALLBACK_FALLBACK");
+    emit log(QStringLiteral(
+        "自由运行连续采集已启动: Mono8, exposure=%1 us, fps=%2, %3")
+        .arg(actualExposure, 0, 'f', 3).arg(actualFps, 0, 'f', 3)
+        .arg(timestampDescription));
+    emit continuousStarted(actualExposure, actualFps, timestampFrequency,
+                           timestampDescription);
+#endif
+}
+
+void HikCameraWorker::stopContinuous() {
+#if !defined(HAVE_HIK_MVS)
+    setBusy(false);
+    emit continuousStopped();
+#else
+    const bool wasRunning = m_continuousRunning.exchange(false);
+    if (m_grabbing && m_handle) {
+        const int code = MV_CC_StopGrabbing(m_handle);
+        if (code != MV_OK) {
+            emit log(formatSdkError(QStringLiteral("MV_CC_StopGrabbing"), code));
+        }
+        m_grabbing = false;
+    }
+    m_imagePool.reset();
+    if (wasRunning) emit log(QStringLiteral("自由运行连续采集已停止"));
+    setBusy(false);
+    emit continuousStopped();
+#endif
+}
+
+#if defined(HAVE_HIK_MVS)
+void HikCameraWorker::onContinuousImage(unsigned char* data,
+                                        MV_FRAME_OUT_INFO_EX* frameInfo,
+                                        void* userData) {
+    HikCameraWorker* self = static_cast<HikCameraWorker*>(userData);
+    if (!self || !frameInfo) return;
+    self->handleContinuousImage(data, *frameInfo);
+}
+
+void HikCameraWorker::handleContinuousImage(
+        const unsigned char* data, const MV_FRAME_OUT_INFO_EX& info) {
+    const int64_t callbackNs = hik_sync::getMonotonicRawNs();
+    if (!m_continuousRunning.load()) return;
+    const unsigned int width = info.nExtendWidth != 0 ? info.nExtendWidth : info.nWidth;
+    const unsigned int height = info.nExtendHeight != 0 ? info.nExtendHeight : info.nHeight;
+    const quint64 frameLength = info.nFrameLenEx != 0 ? info.nFrameLenEx : info.nFrameLen;
+    const quint64 requiredLength = static_cast<quint64>(width) * height;
+    if (!data || width == 0U || height == 0U || frameLength < requiredLength ||
+        info.enPixelType != PixelType_Gvsp_Mono8 || info.nLostPacket != 0U) {
+        emit continuousFrameRejected(info.nFrameNum,
+            info.nLostPacket != 0U
+                ? QStringLiteral("帧含 %1 个丢失网络包").arg(info.nLostPacket)
+                : QStringLiteral("帧为空、长度不足或不是 Mono8"));
+        return;
+    }
+    if (width > static_cast<unsigned int>(std::numeric_limits<int>::max()) ||
+        height > static_cast<unsigned int>(std::numeric_limits<int>::max()) ||
+        !m_imagePool) {
+        emit continuousFrameRejected(info.nFrameNum,
+                                     QStringLiteral("图像尺寸或内存池无效"));
+        return;
+    }
+    std::shared_ptr<hik_sync::ImageBuffer> image = m_imagePool->acquire(
+        static_cast<std::size_t>(requiredLength));
+    if (!image) {
+        emit imagePoolExhausted();
+        return;
+    }
+    image->width = static_cast<int>(width);
+    image->height = static_cast<int>(height);
+    image->stride = static_cast<int>(width);
+    image->pixelFormat = static_cast<int>(info.enPixelType);
+    std::memcpy(image->bytes.data(), data, static_cast<std::size_t>(requiredLength));
+
+    hik_sync::CameraFrame frame;
+    frame.frameId = info.nFrameNum;
+    frame.cameraTimestampRaw =
+        (static_cast<quint64>(info.nDevTimeStampHigh) << 32U) |
+        static_cast<quint64>(info.nDevTimeStampLow);
+    frame.cameraTimestampFrequencyHz = m_deviceTimestampFrequencyHz;
+    frame.cameraTimestampNs = hik_sync::cameraTicksToNs(
+        frame.cameraTimestampRaw, frame.cameraTimestampFrequencyHz,
+        &frame.timestampValid);
+    frame.hostCallbackNs = callbackNs;
+    frame.exposureUs = info.fExposureTime > 0.0F
+        ? static_cast<double>(info.fExposureTime) : m_continuousExposureUs;
+    frame.width = image->width;
+    frame.height = image->height;
+    frame.pixelFormat = image->pixelFormat;
+    frame.image = std::move(image);
+    emit continuousFrameReady(std::move(frame));
+}
+#endif

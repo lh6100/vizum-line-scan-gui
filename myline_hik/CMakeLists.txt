@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(HikLineLaserCalibration LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
@@ -10,6 +10,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d aruco)
+find_package(Eigen3 REQUIRED NO_MODULE)
 
 if(Qt5Core_DIR MATCHES "[Aa]naconda|[Cc]onda")
     message(FATAL_ERROR
@@ -43,6 +44,20 @@ target_include_directories(HikCalibrationCore PUBLIC
 )
 target_link_libraries(HikCalibrationCore PUBLIC ${OpenCV_LIBS})
 
+add_library(HikSynchronizationCore
+    src/HikSynchronizationCore.cpp
+    src/HikSynchronizationCore.h
+)
+target_include_directories(HikSynchronizationCore PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(HikSynchronizationCore PUBLIC
+    Eigen3::Eigen
+    ${OpenCV_LIBS}
+    pthread
+)
+
 add_library(HikCameraBackend
     src/HikCameraWorker.cpp
     src/HikCameraWorker.h
@@ -51,6 +66,7 @@ target_include_directories(HikCameraBackend PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(HikCameraBackend PUBLIC
+    HikSynchronizationCore
     Qt5::Core
     Qt5::Gui
 )
@@ -73,6 +89,7 @@ target_compile_definitions(HikLineLaserCalibration PRIVATE
 )
 target_link_libraries(HikLineLaserCalibration PRIVATE
     HikCalibrationCore
+    HikSynchronizationCore
     HikCameraBackend
     Qt5::Core
     Qt5::Gui
@@ -99,6 +116,7 @@ target_compile_definitions(HikConstantLaserScan PRIVATE
 )
 target_link_libraries(HikConstantLaserScan PRIVATE
     HikCalibrationCore
+    HikSynchronizationCore
     HikCameraBackend
     Qt5::Core
     Qt5::Gui
@@ -184,3 +202,15 @@ target_link_libraries(HikCalibrationCoreTest PRIVATE
     ${OpenCV_LIBS}
 )
 add_test(NAME HikCalibrationCoreTest COMMAND HikCalibrationCoreTest)
+
+add_executable(HikSynchronizationCoreTest
+    tests/test_hik_synchronization_core.cpp
+)
+target_include_directories(HikSynchronizationCoreTest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(HikSynchronizationCoreTest PRIVATE
+    HikSynchronizationCore
+    Eigen3::Eigen
+)
+add_test(NAME HikSynchronizationCoreTest COMMAND HikSynchronizationCoreTest)
