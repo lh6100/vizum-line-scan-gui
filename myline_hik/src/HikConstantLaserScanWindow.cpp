@@ -939,12 +939,8 @@ void HikConstantLaserScanWindow::startContinuousScan() {
                              QMessageBox::No) != QMessageBox::Yes) {
         return;
     }
-    if (!createSynchronizationSession(&error)) {
-        showError(QStringLiteral("创建同步会话失败"), error);
-        return;
-    }
-
     continuousAbortRequested_ = false;
+    synchronizationSessionDir_.clear();
     continuousState_ = ContinuousState::MovingToStart;
     pendingMotionRequestId_ = ++nextRobotRequestId_;
     scanStatusLabel_->setText(QStringLiteral("正在移动到连续扫描起点：%1")
@@ -989,12 +985,13 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
     appendLog(QStringLiteral(
         "同步会话=%1；相机初始模式=HOST_CALLBACK_FALLBACK（设备映射稳定后自动切换）；"
         "机器人初始实际模式=HOST_RECEIVE、请求模式=%2（拟合稳定后自动切换）；"
-        "理论线间距=%3 mm/帧；曝光运动量=%4 mm。")
+        "理论线间距=%3 mm/帧；曝光运动量=%4 mm；PNG并行写线程=%5。")
         .arg(synchronizationSessionDir_)
         .arg(QString::fromLatin1(hik_sync::robotTimeModeName(
             synchronizationConfig_.robotTimeMode)))
         .arg(spacing, 0, 'f', 6)
-        .arg(motionDuringExposure, 0, 'f', 6));
+        .arg(motionDuringExposure, 0, 'f', 6)
+        .arg(synchronizationConfig_.imageWriterThreads));
     return true;
 }
 
@@ -1068,30 +1065,41 @@ void HikConstantLaserScanWindow::abortContinuousScan(
 
 void HikConstantLaserScanWindow::finalizeContinuousScan(
         bool completed, const QString& reason) {
-    synchronizationSession_.stop();
-    const hik_sync::PipelineStatistics stats = synchronizationSession_.statistics();
-    const QString mode = QString::fromStdString(
-        synchronizationSession_.clockModeDescription());
+    const bool sessionStarted = synchronizationSession_.running();
+    if (sessionStarted) synchronizationSession_.stop();
+    const hik_sync::PipelineStatistics stats = sessionStarted
+        ? synchronizationSession_.statistics() : hik_sync::PipelineStatistics{};
+    const QString mode = sessionStarted
+        ? QString::fromStdString(synchronizationSession_.clockModeDescription())
+        : QStringLiteral("同步会话未启动");
     continuousState_ = ContinuousState::Idle;
     pendingMotionRequestId_ = -1;
     safetyConfirmCheck_->setChecked(false);
     scanStatusLabel_->setText(QStringLiteral(
-        "%1：frames=%2, camera_drop=%3, robot_drop=%4, valid=%5, invalid=%6, stable=%7；"
-        "pool_exhaust=%8, image_write_fail=%9, writer_overflow=%10；%11；目录=%12")
+        "%1：frames=%2, frame_id_skip=%3, frame_cnt_skip=%4(仅诊断), valid=%5, invalid=%6, stable=%7；"
+        "pool_exhaust=%8, image_queue_overflow=%9, images_written=%10, "
+        "image_write_fail=%11, writer_overflow=%12；%13；目录=%14")
         .arg(completed ? QStringLiteral("连续同步完成") : QStringLiteral("连续同步已终止"))
         .arg(stats.totalCameraFrames).arg(stats.cameraFramesDropped)
-        .arg(stats.robotStatesDropped).arg(stats.successfulSyncFrames)
+        .arg(stats.robotFrameCounterSkips).arg(stats.successfulSyncFrames)
         .arg(stats.invalidSyncFrames).arg(stats.stableSpeedFrames)
-        .arg(stats.imagePoolExhaustions).arg(stats.imageWriteFailures)
+        .arg(stats.imagePoolExhaustions).arg(stats.imageQueueOverflows)
+        .arg(stats.imageFramesWritten).arg(stats.imageWriteFailures)
         .arg(stats.writerQueueOverflows).arg(mode, synchronizationSessionDir_));
     appendLog(QStringLiteral("%1；%2").arg(scanStatusLabel_->text(), reason));
     if (stats.actualCameraFps > 0.0 &&
         std::abs(stats.actualCameraFps - synchronizationConfig_.cameraTargetFps) >
             synchronizationConfig_.cameraTargetFps * 0.05) {
         appendLog(QStringLiteral(
-            "警告：相机实测平均帧率=%1 fps，偏离目标 %2 fps 超过 5%。")
+            "警告：相机设备时间戳/FrameID 实测帧率=%1 fps，偏离目标 %2 fps 超过 5%。")
             .arg(stats.actualCameraFps, 0, 'f', 3)
             .arg(synchronizationConfig_.cameraTargetFps, 0, 'f', 3));
+    }
+    if (stats.acceptedCameraFps > 0.0 &&
+        stats.acceptedCameraFps < synchronizationConfig_.cameraTargetFps * 0.95) {
+        appendLog(QStringLiteral(
+            "警告：软件接受帧率=%1 fps；请检查图像池/图像队列统计。")
+            .arg(stats.acceptedCameraFps, 0, 'f', 3));
     }
     if (stats.maximumRobotGapMs > synchronizationConfig_.robotWarningGapMs) {
         appendLog(QStringLiteral(
@@ -1099,6 +1107,29 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
             .arg(stats.maximumRobotGapMs, 0, 'f', 3)
             .arg(synchronizationConfig_.robotWarningGapMs, 0, 'f', 3)
             .arg(stats.robotAbnormalIntervals));
+    }
+    appendLog(QStringLiteral(
+        "FR5 20004接收诊断：packet_sequence_gap=%1，frame_cnt_skip=%2，"
+        "frame_cnt_duplicate=%3，frame_cnt_out_of_order=%4；"
+        "getter mean=%5 us，P99=%6 us，max=%7 us，errors=%8。")
+        .arg(stats.robotReceiveSequenceGaps)
+        .arg(stats.robotFrameCounterSkips)
+        .arg(stats.robotFrameCounterDuplicates)
+        .arg(stats.robotFrameCounterOutOfOrder)
+        .arg(stats.robotGetterMeanUs, 0, 'f', 3)
+        .arg(stats.robotGetterP99Us, 0, 'f', 3)
+        .arg(stats.robotGetterMaximumUs, 0, 'f', 3)
+        .arg(stats.robotGetterErrors));
+    const double requestedRobotHz = 1000.0 / synchronizationConfig_.robotPeriodMs;
+    if (stats.actualRobotHz > 0.0 &&
+        std::abs(stats.actualRobotHz - requestedRobotHz) > requestedRobotHz * 0.10) {
+        appendLog(QStringLiteral(
+            "警告：FR5 20004完整包实测=%1 Hz，与请求周期 %2 ms（%3 Hz）偏差超过 10%；"
+            "到达时刻来自SDK RecvPkg成功返回处的 CLOCK_MONOTONIC_RAW；"
+            "frame_cnt仅作控制器内部计数诊断。")
+            .arg(stats.actualRobotHz, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3)
+            .arg(requestedRobotHz, 0, 'f', 3));
     }
     continuousAbortRequested_ = false;
     updateUi();
@@ -1281,6 +1312,14 @@ void HikConstantLaserScanWindow::onRobotMotionFinished(int requestId, bool succe
     if (continuousState_ == ContinuousState::MovingToStart) {
         if (!success || continuousAbortRequested_) {
             finalizeContinuousScan(false, description);
+            return;
+        }
+        QString sessionError;
+        if (!createSynchronizationSession(&sessionError)) {
+            continuousState_ = ContinuousState::Idle;
+            safetyConfirmCheck_->setChecked(false);
+            showError(QStringLiteral("创建同步会话失败"), sessionError);
+            updateUi();
             return;
         }
         continuousState_ = ContinuousState::StartingCamera;

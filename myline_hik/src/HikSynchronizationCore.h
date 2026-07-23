@@ -54,6 +54,17 @@ struct CounterUpdate {
     bool outOfOrder{false};
 };
 
+enum class MotionPhase {
+    WARMUP,
+    STOPPED,
+    ACCELERATING,
+    CONSTANT_SPEED,
+    DECELERATING,
+    UNSTABLE
+};
+
+const char* motionPhaseName(MotionPhase phase);
+
 // Unwraps an N-bit cyclic hardware counter while retaining gaps. Sequence
 // advances by the raw counter delta, so missing packets remain observable.
 class CyclicCounterUnwrapper {
@@ -74,8 +85,13 @@ struct RobotSample {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     uint64_t sequence{0};
+    uint64_t sdkReceiveSequence{0};
     uint32_t rawFrameCount{0};
+    uint64_t rawFrameSequence{0};
+    uint64_t rawFrameAdvance{0};
     int64_t hostReceiveNs{0};
+    int64_t getterDurationNs{-1};
+    int getterResult{0};
     int64_t robotTimestampNs{0};
     bool hasRobotTimestamp{false};
     int64_t alignedTimestampNs{0};
@@ -86,9 +102,11 @@ struct RobotSample {
     std::array<double, 6> jointPositionDeg{};
     std::array<double, 6> actualTcpSpeed{};
     double actualLinearSpeedMmS{0.0};
+    double filteredLinearSpeedMmS{0.0};
+    double positionFitSpeedMmS{0.0};
 
-    uint64_t droppedBefore{0};
     double receiveGapMs{0.0};
+    MotionPhase motionPhase{MotionPhase::WARMUP};
     bool speedStable{false};
     bool valid{false};
 };
@@ -104,7 +122,9 @@ struct CameraFrame {
     int height{0};
     int pixelFormat{0};
     std::shared_ptr<ImageBuffer> image;
+    std::string imageFilename;
     bool frameIdContinuous{true};
+    bool imageWriteQueued{true};
     bool timestampValid{false};
 };
 
@@ -115,7 +135,6 @@ enum class SyncQuality {
     ROBOT_GAP_TOO_LARGE,
     CAMERA_TIMESTAMP_INVALID,
     CAMERA_FRAME_DROPPED,
-    ROBOT_STATE_DROPPED,
     OUTSIDE_VALID_SCAN_SEGMENT,
     SPEED_NOT_STABLE
 };
@@ -146,6 +165,8 @@ struct SynchronizedFrame {
     Eigen::Matrix4d baseFromCamera{Eigen::Matrix4d::Identity()};
     bool hasBaseFromCamera{false};
     double actualScanSpeedMmS{0.0};
+    double filteredScanSpeedMmS{0.0};
+    MotionPhase motionPhase{MotionPhase::WARMUP};
     SyncQuality quality{SyncQuality::ROBOT_DATA_NOT_READY};
     std::shared_ptr<ImageBuffer> image;
     std::string imageFilename;
@@ -168,15 +189,15 @@ struct SynchronizationConfig {
     std::size_t cameraClockMappingWindow{600U};
     double cameraMappingMaxResidualUs{2000.0};
 
-    double robotPeriodMs{8.0};
+    double robotPeriodMs{10.0};
     double robotPoseBufferDurationS{5.0};
     std::size_t robotQueueCapacity{2048U};
-    RobotTimeMode robotTimeMode{RobotTimeMode::PeriodFit};
-    double robotNormalGapMinMs{6.0};
-    double robotNormalGapMaxMs{10.0};
-    double robotWarningGapMs{12.0};
-    double robotInvalidGapMs{16.0};
-    int robotBracketWaitTimeoutMs{40};
+    RobotTimeMode robotTimeMode{RobotTimeMode::ControllerTimestamp};
+    double robotNormalGapMinMs{8.0};
+    double robotNormalGapMaxMs{12.0};
+    double robotWarningGapMs{15.0};
+    double robotInvalidGapMs{20.0};
+    int robotBracketWaitTimeoutMs{50};
 
     double scanSpeedMmS{10.0};
     double scanMinSpeedMmS{10.0};
@@ -184,6 +205,7 @@ struct SynchronizationConfig {
     double scanSpeedTolerancePercent{5.0};
     double scanAccelerationMmS2{100.0};
     int scanStableSampleCount{5};
+    int scanSpeedFilterWindowSamples{15};
     bool discardAccelerationSegment{true};
     bool discardDecelerationSegment{true};
     double preScanDistanceMm{30.0};
@@ -195,6 +217,7 @@ struct SynchronizationConfig {
     bool saveSyncCsv{true};
     std::string outputDirectory{"./data/scan"};
     std::size_t writerQueueCapacity{8192U};
+    std::size_t imageWriterThreads{2U};
 
     bool validate(std::string* error = nullptr) const;
     static bool loadYaml(const std::string& path,
@@ -286,15 +309,31 @@ class SpeedStabilityDetector {
 public:
     SpeedStabilityDetector(double targetSpeedMmS,
                            double tolerancePercent,
-                           int requiredSamples);
-    bool update(double actualSpeedMmS);
+                           int requiredSamples,
+                           int filterWindowSamples = 15);
+    MotionPhase update(int64_t timestampNs,
+                       const Eigen::Vector3d& positionMm,
+                       double actualSpeedMmS,
+                       double* filteredSpeedMmS = nullptr,
+                       double* positionFitSpeedMmS = nullptr);
     void reset();
 
 private:
+    struct Observation {
+        int64_t timestampNs{0};
+        Eigen::Vector3d positionMm{Eigen::Vector3d::Zero()};
+        double reportedSpeedMmS{0.0};
+    };
+
     double targetSpeedMmS_;
     double toleranceFraction_;
     int requiredSamples_;
-    int consecutive_{0};
+    std::size_t filterWindowSamples_;
+    std::deque<Observation> observations_;
+    int enterConsecutive_{0};
+    int exitConsecutive_{0};
+    bool constantSpeed_{false};
+    bool reachedConstantSpeed_{false};
 };
 
 class RobotPoseBuffer {
@@ -330,19 +369,29 @@ struct PipelineStatistics {
     uint64_t cameraFramesDropped{0};
     uint64_t cameraQueueOverflows{0};
     uint64_t imagePoolExhaustions{0};
+    uint64_t imageQueueOverflows{0};
+    uint64_t imageFramesWritten{0};
     uint64_t imageWriteFailures{0};
     uint64_t totalRobotSamples{0};
-    uint64_t robotStatesDropped{0};
-    uint64_t robotDuplicateReads{0};
+    uint64_t robotFrameCounterSkips{0};
+    uint64_t robotFrameCounterDuplicates{0};
+    uint64_t robotFrameCounterOutOfOrder{0};
+    uint64_t robotReceiveSequenceGaps{0};
     uint64_t robotAbnormalIntervals{0};
+    uint64_t robotGetterErrors{0};
+    uint64_t robotGetterDurationSamples{0};
     uint64_t successfulSyncFrames{0};
     uint64_t invalidSyncFrames{0};
     uint64_t stableSpeedFrames{0};
     uint64_t writerQueueOverflows{0};
     double actualCameraFps{0.0};
+    double acceptedCameraFps{0.0};
     double actualRobotHz{0.0};
     double meanRobotGapMs{0.0};
     double maximumRobotGapMs{0.0};
+    double robotGetterMeanUs{0.0};
+    double robotGetterP99Us{0.0};
+    double robotGetterMaximumUs{0.0};
     ClockFitReport cameraClockFit;
     ClockFitReport robotClockFit;
 };

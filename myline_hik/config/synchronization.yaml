@@ -9,15 +9,15 @@ camera:
   mapping_max_residual_us: 2000.0
 
 robot:
-  cn_de_period_ms: 8.0
+  cn_de_period_ms: 10.0
   pose_buffer_duration_s: 5.0
   queue_capacity: 2048
-  time_mode: period_fit
-  normal_gap_min_ms: 6.0
-  normal_gap_max_ms: 10.0
-  warning_gap_ms: 12.0
-  invalid_gap_ms: 16.0
-  bracket_wait_timeout_ms: 40
+  time_mode: controller_timestamp
+  normal_gap_min_ms: 8.0
+  normal_gap_max_ms: 12.0
+  warning_gap_ms: 15.0
+  invalid_gap_ms: 20.0
+  bracket_wait_timeout_ms: 50
 
 scan:
   speed_mm_s: 10.0
@@ -26,6 +26,7 @@ scan:
   acceleration_mm_s2: 100.0
   speed_tolerance_percent: 5.0
   stable_sample_count: 5
+  speed_filter_window_samples: 15
   discard_acceleration_segment: true
   discard_deceleration_segment: true
   pre_scan_distance_mm: 30.0
@@ -38,3 +39,4 @@ output:
   save_sync_csv: true
   output_directory: "./data/scan"
   writer_queue_capacity: 8192
+  image_writer_threads: 2

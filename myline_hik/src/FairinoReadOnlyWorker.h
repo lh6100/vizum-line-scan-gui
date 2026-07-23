@@ -6,9 +6,14 @@
 #include <QObject>
 #include <QString>
 
+#include <atomic>
+#include <memory>
+#include <thread>
+
 Q_DECLARE_METATYPE(hik_sync::RobotSample)
 
 class FRRobot;
+class FairinoRealtimeReceiverState;
 class QTimer;
 
 class FairinoReadOnlyWorker final : public QObject {
@@ -64,9 +69,11 @@ signals:
 
 private slots:
     void pollMotionDone();
-    void pollRealtimeState();
 
 private:
+    bool startRealtimeReceiving();
+    void stopRealtimeReceiving();
+    void realtimeConsumerLoop();
     void moveLinearImpl(int requestId,
                         double xMm, double yMm, double zMm,
                         double rxDeg, double ryDeg, double rzDeg,
@@ -78,13 +85,13 @@ private:
     bool attempted_{false};
     bool terminal_{false};
     QTimer* motionPollTimer_{nullptr};
-    QTimer* realtimePollTimer_{nullptr};
+    std::atomic<bool> realtimeReceiving_{false};
+    std::thread realtimeThread_;
+    std::unique_ptr<FairinoRealtimeReceiverState> realtimeReceiver_;
     bool motionActive_{false};
     int motionRequestId_{-1};
     qint64 motionStartMs_{0};
     int motionTimeoutMs_{0};
-    bool haveRealtimeFrame_{false};
-    uint8_t lastRealtimeFrame_{0U};
 };
 
 #endif  // MYLINE_HIK_FAIRINO_READ_ONLY_WORKER_H

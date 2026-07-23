@@ -162,6 +162,33 @@ find_library(FAIRINO_LIBRARY
     NO_DEFAULT_PATH
 )
 if(FAIRINO_INCLUDE_DIR AND FAIRINO_LIBRARY)
+    file(READ "${FAIRINO_INCLUDE_DIR}/robot.h" FAIRINO_ROBOT_HEADER_CONTENT)
+    string(FIND "${FAIRINO_ROBOT_HEADER_CONTENT}"
+        "SetRobotRealtimeStateCallback" FAIRINO_CALLBACK_HEADER_POSITION)
+    if(FAIRINO_CALLBACK_HEADER_POSITION EQUAL -1)
+        message(FATAL_ERROR
+            "The FAIRINO SDK header does not include the required per-packet "
+            "20004 callback. Run tools/build_patched_fairino_sdk.sh first.")
+    endif()
+    if(UNIX)
+        find_program(FAIRINO_NM_EXECUTABLE NAMES nm)
+        if(FAIRINO_NM_EXECUTABLE)
+            execute_process(
+                COMMAND "${FAIRINO_NM_EXECUTABLE}" -D -C "${FAIRINO_LIBRARY}"
+                OUTPUT_VARIABLE FAIRINO_EXPORTED_SYMBOLS
+                ERROR_QUIET
+            )
+            string(FIND "${FAIRINO_EXPORTED_SYMBOLS}"
+                "FRRobot::SetRobotRealtimeStateCallback"
+                FAIRINO_CALLBACK_LIBRARY_POSITION)
+            if(FAIRINO_CALLBACK_LIBRARY_POSITION EQUAL -1)
+                message(FATAL_ERROR
+                    "The FAIRINO shared library does not export the required "
+                    "per-packet 20004 callback. Run "
+                    "tools/build_patched_fairino_sdk.sh first.")
+            endif()
+        endif()
+    endif()
     message(STATUS "Fairino SDK: ${FAIRINO_LIBRARY}")
     target_compile_definitions(HikLineLaserCalibration PRIVATE HAVE_FAIRINO_SDK=1)
     target_compile_definitions(HikConstantLaserScan PRIVATE HAVE_FAIRINO_SDK=1)

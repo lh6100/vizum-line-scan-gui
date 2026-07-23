@@ -29,6 +29,17 @@
 /home/zhulong/lh/vizum-line-scan-gui/SDK/fairino-cpp-sdk-3.9.4/
 ```
 
+本工程需要对 FAIRINO 3.9.4 增加20004逐包回调。两个启动脚本会自动调用
+`tools/build_patched_fairino_sdk.sh`：应用受版本控制的补丁、备份原始
+`libfairino.so.2.3.4`，并重建SDK。手工配置CMake前应先执行：
+
+```bash
+./tools/build_patched_fairino_sdk.sh
+```
+
+补丁只新增 `RecvPkg()` 成功返回处的 `CLOCK_MONOTONIC_RAW` 时间戳、完整包回调和
+互斥保护的getter快照；不会改变机器人运动指令。
+
 直接构建并运行：
 
 ```bash
@@ -529,7 +540,7 @@ Fairino SDK 同时只能由一个客户端持有连接。停止 `ros2_fr5` 的 `
 - 相机触发线与机器人控制器之间的硬件时间同步（当前已实现软件时间同步）；
 - 任意曲面轨迹规划、ROS 2 点云发布和 RViz 实时显示。
 
-完成低速短路径、重复和正反向扫描验证后，下一阶段才是 ROS 2/RViz 接入。当前连续模式使用设备时间戳映射、8 ms 状态时间轴和插值，精度仍受相机/网络固定延迟影响；需要更严格同步时应增加硬件触发。
+完成低速短路径、重复和正反向扫描验证后，下一阶段才是 ROS 2/RViz 接入。当前连续模式使用设备时间戳映射、控制器 `robotTime` 映射和位姿插值，精度仍受相机/网络固定延迟影响；需要更严格同步时应增加硬件触发。
 
 ## 15. 60 fps 连续扫描的软件时间同步
 
@@ -537,13 +548,15 @@ Fairino SDK 同时只能由一个客户端持有连接。停止 `ros2_fr5` 的 `
 
 ```text
 MVS 自由运行回调 → 有界相机队列 → 曝光中点时间
-FR5 20004 实时状态 → 8 位 frame_cnt 展开 → 5 秒位姿环形缓冲
+                     └→ 2 个独立 PNG 写线程
+FR5 SDK 20004 RecvPkg → CLOCK_MONOTONIC_RAW逐包时间戳 → SPSC队列
+                     → robotTime 映射 → 5 秒位姿环形缓冲
 曝光中点 → 二分查找前后状态 → XYZ 线性插值 + quaternion SLERP
           → synchronization.csv + 下游 SynchronizedFrame 接口
-独立 WriterThread → PNG、robot_raw.csv、camera_raw.csv、session_summary.json
+独立元数据 WriterThread → robot_raw.csv、camera_raw.csv、session_summary.json
 ```
 
-同步配置在 `config/synchronization.yaml`。电脑侧同步时间全部来自 `CLOCK_MONOTONIC_RAW`；UTC 日期只用于会话摘要和目录名。默认相机 60 fps、曝光 1825 μs、机器人反馈 8 ms，环形缓冲为 2048 条且至少覆盖 5 秒。
+同步配置在 `config/synchronization.yaml`。电脑侧同步时间全部来自 `CLOCK_MONOTONIC_RAW`；UTC 日期只用于会话摘要和目录名。默认相机 60 fps、曝光 1825 μs、机器人反馈请求周期 10 ms（100 Hz），环形缓冲为 2048 条且至少覆盖 5 秒。同步会话在机器人到达扫描起点后才创建，避免把移到起点的长时间运动混入连续扫描统计。
 
 ### 15.1 SDK 字段和当前可确认边界
 
@@ -559,11 +572,18 @@ FR5 20004 实时状态 → 8 位 frame_cnt 展开 → 5 秒位姿环形缓冲
 
 FR5 路径实际使用：
 
-- `SetRobotRealtimeStateSamplePeriod(8)` / `GetRobotRealtimeStateSamplePeriod`；
-- `GetRobotRealTimeState(ROBOT_STATE_PKG*)`；
+- `SetRobotRealtimeStateSamplePeriod(10)` / `GetRobotRealtimeStateSamplePeriod`；
+- 补丁新增的 `SetRobotRealtimeStateCallback(...)` 逐包回调；
+- `GetRobotRealTimeState(ROBOT_STATE_PKG*)` 一致快照及调用耗时诊断；
 - 状态中的 `frame_cnt`、`jt_cur_pos`、`flange_cur_pos`、`actual_TCP_Speed`、`actual_TCP_CmpSpeed` 和 `robotTime`。
 
-SDK 3.9.4 内部从 20004 端口接收状态，但没有公开逐包回调或“包到达主机时间”；本程序以 1 ms 精确定时器检测 SDK 最新快照的 `frame_cnt` 变化，并在 `GetRobotRealTimeState` 返回后立即记录单调时钟。这是该版本公开 API 能提供的最早主机侧时刻。`robot.time_mode` 默认 `period_fit`，也可选择 `controller_timestamp` 或 `host_receive`；拟合未稳定时自动降级为主机接收时间。
+原始SDK 3.9.4 没有公开20004逐包回调或包到达时间。本工程的受版本控制补丁在
+`RobotStateRoutineThread()` 中紧接 `RecvPkg()` 成功返回处记录
+`CLOCK_MONOTONIC_RAW`，再通过非阻塞SPSC队列把每个完整包交给应用线程。
+SDK逐包序号是判断回调/SPSC链路是否缺包的依据；`GetRobotRealTimeState()` 只作为
+互斥一致快照和阻塞耗时诊断，不再承担新包检测。
+
+`robot.time_mode` 默认 `controller_timestamp`：将控制器 `robotTime` 仿射映射到主机单调时钟，拟合稳定前自动使用 `HOST_RECEIVE`。`frame_cnt` 只作为循环计数诊断字段；它的跳变不再直接判定同步无效，真正的数据缺口由相邻位姿的时间间隔和 `ROBOT_GAP_TOO_LARGE` 判定。
 
 FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单位 deg。工程沿用已有手眼标定约定：`R = Rz(rz) * Ry(ry) * Rx(rx)`，先转四元数再做 SLERP，不线性插值欧拉角。
 
@@ -580,7 +600,7 @@ FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单�
 ./run_constant_laser_scan.sh --scan-speed 50
 ```
 
-超出 `10–50 mm/s` 会在创建窗口前拒绝启动。连续起点→终点段使用 FAIRINO 3.9.4 `MoveL(..., ovl=speed_mm_s, ..., oacc=acceleration_mm_s2, velAccParamMode=1)`，按物理速度和物理加速度下发；`scan.acceleration_mm_s2` 默认 100。界面中的“速度 %”只用于移到连续扫描起点和原停稳扫描。反馈的 `actual_TCP_CmpSpeed[0]` 仍独立参与 ±容差质量检查，不能仅凭命令值认定匀速。连续扫描流程为：示教起终点、完成 dry-run、取消 dry-run、勾选安全确认，然后点击“开始 60fps 连续同步扫描”。
+超出 `10–50 mm/s` 会在创建窗口前拒绝启动。连续起点→终点段使用 FAIRINO 3.9.4 `MoveL(..., ovl=speed_mm_s, ..., oacc=acceleration_mm_s2, velAccParamMode=1)`，按物理速度和物理加速度下发；`scan.acceleration_mm_s2` 默认 100。界面中的“速度 %”只用于移到连续扫描起点和原停稳扫描。反馈的 `actual_TCP_CmpSpeed[0]` 仍独立参与质量检查，不能仅凭命令值认定匀速。速度判定使用默认 15 点窗口：对反馈速度取中值，同时对三维法兰位置随控制器时间作线性回归，再通过带迟滞的状态机标记 `WARMUP/STOPPED/ACCELERATING/CONSTANT_SPEED/DECELERATING/UNSTABLE`。默认只把 `CONSTANT_SPEED` 作为有效建图段。连续扫描流程为：示教起终点、完成 dry-run、取消 dry-run、勾选安全确认，然后点击“开始 60fps 连续同步扫描”。
 
 启动时日志会打印理论线间距 `speed / fps` 和曝光运动量 `speed * exposure_us / 1e6`；它们只用于检查参数，不替代插值得到的实际法兰位姿。
 
@@ -588,11 +608,11 @@ FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单�
 
 默认输出到 `data/scan/sync_scan_<时间>/`：
 
-- `robot_raw.csv`：展开序号、原始 `frame_cnt`、主机接收时刻、控制器时刻、法兰、关节和实际速度；
-- `camera_raw.csv`：FrameID、设备 raw/ns 时间戳、回调时刻、曝光、尺寸、连续性和图片名；
-- `synchronization.csv`：曝光中点、前后状态、alpha、间隔、插值四元数、速度和质量；
-- `session_summary.json`：帧率、反馈频率、丢帧/丢包、队列溢出、有效帧和时钟拟合残差；
-- `images/frame_<FrameID>.png`：后台线程保存的 Mono8 原图。
+- `robot_raw.csv`：SDK逐包序号、原始及展开后的 `frame_cnt`、`RecvPkg`成功返回时刻、getter耗时/结果、控制器时刻、法兰、关节、原始/滤波/位置拟合速度和运动阶段；
+- `camera_raw.csv`：FrameID、设备 raw/ns 时间戳、回调时刻、曝光、尺寸、连续性、图片名和写盘入队状态；
+- `synchronization.csv`：曝光中点、前后状态、alpha、间隔、插值四元数、原始/滤波速度、运动阶段和质量；
+- `session_summary.json`：设备帧率、软件接受帧率、20004完整包频率、SDK逐包序号/frame_cnt诊断、getter平均/P99/最大耗时、队列溢出、有效帧和相机/机器人时钟拟合残差；
+- `images/frame_<FrameID>.png`：默认由 2 个独立后台线程以 PNG 压缩级别 1 保存的 Mono8 原图。
 
 查看有效同步记录：
 
@@ -601,7 +621,7 @@ column -s, -t < data/scan/sync_scan_*/synchronization.csv | less -S
 awk -F, 'NR==1 || $20 != "VALID"' data/scan/sync_scan_*/synchronization.csv
 ```
 
-`camera_raw.csv` 的 `frame_id_continuous=0` 或摘要中的 `camera_dropped_frames/camera_queue_overflows/image_pool_exhaustions` 表示相机链路丢帧。`robot_raw.csv` 中 `sequence` 不连续、摘要中的 `robot_state_packets_dropped` 非零，或同步质量为 `ROBOT_STATE_DROPPED/ROBOT_GAP_TOO_LARGE` 表示机器人状态缺失或间隔异常。加减速段仍保存，但默认标为 `SPEED_NOT_STABLE`，不计入有效建图帧。
+`actual_camera_device_fps` 由设备时间戳和 FrameID 跨度计算，`accepted_camera_callback_fps` 表示软件实际接受吞吐。`camera_raw.csv` 的 `frame_id_continuous=0`，或摘要中的 `camera_frame_id_skips/camera_queue_overflows/image_pool_exhaustions/image_queue_overflows` 非零，表示相机链路存在缺图。`robot_receive_sequence_gaps` 才表示SDK回调到SPSC消费链路确实缺少完整包；`robot_frame_counter_skips/robot_frame_counter_duplicates/robot_frame_counter_out_of_order` 仅为控制器内部计数诊断，不参与逐包去重。机器人同步有效性以 `robot_gap_max_ms` 和 `ROBOT_GAP_TOO_LARGE` 为准。加减速段仍保存，但默认标为 `SPEED_NOT_STABLE`，不计入有效建图帧。
 
 ### 15.4 固定时间偏差标定
 
@@ -634,4 +654,4 @@ cmake --build build --target HikSynchronizationCoreTest -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-仿真覆盖 125 Hz 机器人、60 fps 相机、匀速插值、丢失机器人状态和 FrameID 跳变，不连接相机或 FR5。
+仿真覆盖 100 Hz 机器人、60 fps 相机、控制器时间映射、滤波恒速识别、匀速插值、时间缺口、FrameID 跳变和多线程图片写盘，不连接相机或 FR5。

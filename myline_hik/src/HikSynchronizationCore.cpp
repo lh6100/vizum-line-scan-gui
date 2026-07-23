@@ -399,9 +399,20 @@ const char* syncQualityName(SyncQuality quality) {
     case SyncQuality::ROBOT_GAP_TOO_LARGE: return "ROBOT_GAP_TOO_LARGE";
     case SyncQuality::CAMERA_TIMESTAMP_INVALID: return "CAMERA_TIMESTAMP_INVALID";
     case SyncQuality::CAMERA_FRAME_DROPPED: return "CAMERA_FRAME_DROPPED";
-    case SyncQuality::ROBOT_STATE_DROPPED: return "ROBOT_STATE_DROPPED";
     case SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT: return "OUTSIDE_VALID_SCAN_SEGMENT";
     case SyncQuality::SPEED_NOT_STABLE: return "SPEED_NOT_STABLE";
+    }
+    return "UNKNOWN";
+}
+
+const char* motionPhaseName(MotionPhase phase) {
+    switch (phase) {
+    case MotionPhase::WARMUP: return "WARMUP";
+    case MotionPhase::STOPPED: return "STOPPED";
+    case MotionPhase::ACCELERATING: return "ACCELERATING";
+    case MotionPhase::CONSTANT_SPEED: return "CONSTANT_SPEED";
+    case MotionPhase::DECELERATING: return "DECELERATING";
+    case MotionPhase::UNSTABLE: return "UNSTABLE";
     }
     return "UNKNOWN";
 }
@@ -441,15 +452,22 @@ bool SynchronizationConfig::validate(std::string* error) const {
         return fail("invalid camera synchronization configuration");
     }
     if (!(robotPeriodMs > 0.0) || !(robotPoseBufferDurationS >= 5.0) ||
-        robotQueueCapacity < 625U || robotBracketWaitTimeoutMs < 1 ||
+        robotBracketWaitTimeoutMs < 1 ||
         robotNormalGapMinMs < 0.0 ||
         robotNormalGapMinMs > robotNormalGapMaxMs ||
         robotNormalGapMaxMs > robotWarningGapMs ||
         robotWarningGapMs > robotInvalidGapMs) {
         return fail("invalid robot synchronization configuration");
     }
+    const std::size_t minimumRobotQueueCapacity = static_cast<std::size_t>(
+        std::ceil(robotPoseBufferDurationS * 1000.0 / robotPeriodMs)) + 2U;
+    if (robotQueueCapacity < minimumRobotQueueCapacity) {
+        return fail("robot.queue_capacity cannot cover pose_buffer_duration_s at cn_de_period_ms");
+    }
     if (!(scanSpeedTolerancePercent >= 0.0) || !(scanAccelerationMmS2 > 0.0) ||
         !std::isfinite(scanAccelerationMmS2) || scanStableSampleCount < 1 ||
+        scanSpeedFilterWindowSamples < scanStableSampleCount ||
+        imageWriterThreads < 1U || imageWriterThreads > 16U ||
         writerQueueCapacity < cameraQueueCapacity) {
         return fail("invalid scan/writer synchronization configuration");
     }
@@ -526,6 +544,7 @@ bool SynchronizationConfig::loadYaml(const std::string& path,
         else if (full == "scan.speed_tolerance_percent") ok = parseDouble(value, &parsed.scanSpeedTolerancePercent);
         else if (full == "scan.acceleration_mm_s2") ok = parseDouble(value, &parsed.scanAccelerationMmS2);
         else if (full == "scan.stable_sample_count") ok = parseInteger(value, &parsed.scanStableSampleCount);
+        else if (full == "scan.speed_filter_window_samples") ok = parseInteger(value, &parsed.scanSpeedFilterWindowSamples);
         else if (full == "scan.discard_acceleration_segment") ok = parseBool(value, &parsed.discardAccelerationSegment);
         else if (full == "scan.discard_deceleration_segment") ok = parseBool(value, &parsed.discardDecelerationSegment);
         else if (full == "scan.pre_scan_distance_mm") ok = parseDouble(value, &parsed.preScanDistanceMm);
@@ -536,6 +555,7 @@ bool SynchronizationConfig::loadYaml(const std::string& path,
         else if (full == "output.save_sync_csv") ok = parseBool(value, &parsed.saveSyncCsv);
         else if (full == "output.output_directory") parsed.outputDirectory = unquote(value);
         else if (full == "output.writer_queue_capacity") ok = parseSize(value, &parsed.writerQueueCapacity);
+        else if (full == "output.image_writer_threads") ok = parseSize(value, &parsed.imageWriterThreads);
         if (!ok) {
             if (error) *error = "invalid value for " + full + " at line " +
                                 std::to_string(lineNumber);
@@ -753,23 +773,118 @@ void RobotClockMapper::reset() {
 
 SpeedStabilityDetector::SpeedStabilityDetector(double targetSpeedMmS,
                                                double tolerancePercent,
-                                               int requiredSamples)
+                                               int requiredSamples,
+                                               int filterWindowSamples)
     : targetSpeedMmS_(targetSpeedMmS),
       toleranceFraction_(std::max(0.0, tolerancePercent) / 100.0),
-      requiredSamples_(std::max(1, requiredSamples)) {}
+      requiredSamples_(std::max(1, requiredSamples)),
+      filterWindowSamples_(static_cast<std::size_t>(
+          std::max(std::max(5, requiredSamples), filterWindowSamples))) {}
 
-bool SpeedStabilityDetector::update(double actualSpeedMmS) {
-    if (std::isfinite(actualSpeedMmS) &&
-        std::abs(actualSpeedMmS - targetSpeedMmS_) <=
-            targetSpeedMmS_ * toleranceFraction_) {
-        consecutive_ = std::min(requiredSamples_, consecutive_ + 1);
-    } else {
-        consecutive_ = 0;
+MotionPhase SpeedStabilityDetector::update(
+        int64_t timestampNs, const Eigen::Vector3d& positionMm,
+        double actualSpeedMmS, double* filteredSpeedMmS,
+        double* positionFitSpeedMmS) {
+    if (filteredSpeedMmS) *filteredSpeedMmS = 0.0;
+    if (positionFitSpeedMmS) *positionFitSpeedMmS = 0.0;
+    if (timestampNs <= 0 || !positionMm.allFinite() ||
+        !std::isfinite(actualSpeedMmS)) {
+        enterConsecutive_ = 0;
+        return MotionPhase::UNSTABLE;
     }
-    return consecutive_ >= requiredSamples_;
+
+    observations_.push_back({timestampNs, positionMm, actualSpeedMmS});
+    while (observations_.size() > filterWindowSamples_) observations_.pop_front();
+
+    std::vector<double> reportedSpeeds;
+    reportedSpeeds.reserve(observations_.size());
+    for (const Observation& observation : observations_) {
+        reportedSpeeds.push_back(observation.reportedSpeedMmS);
+    }
+    const double reportedMedian = median(std::move(reportedSpeeds));
+
+    double fittedSpeed = reportedMedian;
+    if (observations_.size() >= 3U) {
+        const int64_t referenceNs = observations_.back().timestampNs;
+        long double meanTime = 0.0L;
+        Eigen::Vector3d meanPosition = Eigen::Vector3d::Zero();
+        for (const Observation& observation : observations_) {
+            meanTime += static_cast<long double>(
+                observation.timestampNs - referenceNs) / kNsPerSecond;
+            meanPosition += observation.positionMm;
+        }
+        meanTime /= static_cast<long double>(observations_.size());
+        meanPosition /= static_cast<double>(observations_.size());
+        long double denominator = 0.0L;
+        Eigen::Vector3d numerator = Eigen::Vector3d::Zero();
+        for (const Observation& observation : observations_) {
+            const long double time = static_cast<long double>(
+                observation.timestampNs - referenceNs) / kNsPerSecond;
+            const double centeredTime = static_cast<double>(time - meanTime);
+            denominator += static_cast<long double>(centeredTime) * centeredTime;
+            numerator += centeredTime * (observation.positionMm - meanPosition);
+        }
+        if (denominator > 1.0e-12L) {
+            fittedSpeed = (numerator / static_cast<double>(denominator)).norm();
+        }
+    }
+
+    // The position fit suppresses sample-to-sample TCP-speed noise, while the
+    // median feedback keeps the estimate responsive during acceleration.
+    const double filtered = observations_.size() >= filterWindowSamples_
+        ? 0.75 * fittedSpeed + 0.25 * reportedMedian
+        : reportedMedian;
+    if (filteredSpeedMmS) *filteredSpeedMmS = filtered;
+    if (positionFitSpeedMmS) *positionFitSpeedMmS = fittedSpeed;
+
+    if (observations_.size() < filterWindowSamples_) return MotionPhase::WARMUP;
+
+    const double enterTolerance = targetSpeedMmS_ * toleranceFraction_;
+    const double exitTolerance = std::max(enterTolerance * 2.0,
+                                          targetSpeedMmS_ * 0.02);
+    const bool insideEnter = std::abs(filtered - targetSpeedMmS_) <= enterTolerance;
+    const bool insideExit = std::abs(filtered - targetSpeedMmS_) <= exitTolerance;
+
+    if (constantSpeed_) {
+        if (insideExit) {
+            exitConsecutive_ = 0;
+            return MotionPhase::CONSTANT_SPEED;
+        }
+        ++exitConsecutive_;
+        if (exitConsecutive_ < requiredSamples_) return MotionPhase::CONSTANT_SPEED;
+        constantSpeed_ = false;
+        enterConsecutive_ = 0;
+    }
+
+    if (insideEnter) {
+        enterConsecutive_ = std::min(requiredSamples_, enterConsecutive_ + 1);
+        if (enterConsecutive_ >= requiredSamples_) {
+            constantSpeed_ = true;
+            reachedConstantSpeed_ = true;
+            exitConsecutive_ = 0;
+            return MotionPhase::CONSTANT_SPEED;
+        }
+    } else {
+        enterConsecutive_ = 0;
+    }
+
+    if (filtered <= targetSpeedMmS_ * 0.10) return MotionPhase::STOPPED;
+    if (!reachedConstantSpeed_ && filtered < targetSpeedMmS_ + exitTolerance) {
+        return MotionPhase::ACCELERATING;
+    }
+    if (reachedConstantSpeed_ && filtered < targetSpeedMmS_ - enterTolerance) {
+        return MotionPhase::DECELERATING;
+    }
+    return MotionPhase::UNSTABLE;
 }
 
-void SpeedStabilityDetector::reset() { consecutive_ = 0; }
+void SpeedStabilityDetector::reset() {
+    observations_.clear();
+    enterConsecutive_ = 0;
+    exitConsecutive_ = 0;
+    constantSpeed_ = false;
+    reachedConstantSpeed_ = false;
+}
 
 RobotPoseBuffer::RobotPoseBuffer(std::size_t capacity, double durationSeconds)
     : capacity_(std::max<std::size_t>(2U, capacity)),
@@ -878,6 +993,11 @@ struct WriterEvent {
     std::string imageFilename;
 };
 
+struct ImageWriteTask {
+    std::shared_ptr<ImageBuffer> image;
+    std::string imageFilename;
+};
+
 }  // namespace
 
 struct SynchronizationSession::Impl {
@@ -887,6 +1007,7 @@ struct SynchronizationSession::Impl {
     bool hasFlangeFromCamera{false};
     std::unique_ptr<BoundedQueue<CameraFrame>> cameraQueue;
     std::unique_ptr<BoundedQueue<WriterEvent>> writerQueue;
+    std::unique_ptr<BoundedQueue<ImageWriteTask>> imageQueue;
     RobotPoseBuffer robotBuffer;
     CameraClockMapper cameraMapper;
     RobotClockMapper robotMapper;
@@ -895,6 +1016,7 @@ struct SynchronizationSession::Impl {
     CyclicCounterUnwrapper cameraCounter{32U};
     std::thread synchronizationThread;
     std::thread writerThread;
+    std::vector<std::thread> imageWriterThreads;
     std::atomic<bool> accepting{false};
     mutable std::mutex stateMutex;
     mutable std::mutex statisticsMutex;
@@ -903,12 +1025,23 @@ struct SynchronizationSession::Impl {
     std::function<void(const SynchronizedFrame&)> synchronizedCallback;
     int64_t firstCameraNs{0};
     int64_t lastCameraNs{0};
+    int64_t firstCameraDeviceNs{0};
+    int64_t lastCameraDeviceNs{0};
+    uint64_t firstCameraDeviceSequence{0};
+    uint64_t lastCameraDeviceSequence{0};
+    uint64_t firstCameraSequence{0};
+    uint64_t lastCameraSequence{0};
+    bool haveCameraSequence{false};
     int64_t firstRobotNs{0};
     int64_t lastRobotNs{0};
     int64_t lastRobotReceiveNs{0};
     int64_t lastRobotAlignedNs{0};
+    uint64_t observedRobotSequence{0};
+    uint64_t lastSdkReceiveSequence{0};
     long double robotGapSumMs{0.0L};
     uint64_t robotGapCount{0U};
+    long double robotGetterDurationSumNs{0.0L};
+    std::vector<int64_t> robotGetterDurationsNs;
     std::string startUtc;
     std::string endUtc;
     std::ofstream robotCsv;
@@ -922,6 +1055,8 @@ struct SynchronizationSession::Impl {
               requestedConfig.cameraQueueCapacity)),
           writerQueue(std::make_unique<BoundedQueue<WriterEvent>>(
               requestedConfig.writerQueueCapacity)),
+          imageQueue(std::make_unique<BoundedQueue<ImageWriteTask>>(
+              requestedConfig.cameraQueueCapacity)),
           robotBuffer(requestedConfig.robotQueueCapacity,
                       requestedConfig.robotPoseBufferDurationS),
           cameraMapper(requestedConfig.cameraClockMappingWindow,
@@ -930,7 +1065,8 @@ struct SynchronizationSession::Impl {
                       requestedConfig.robotPeriodMs),
           speedDetector(requestedConfig.scanSpeedMmS,
                         requestedConfig.scanSpeedTolerancePercent,
-                        requestedConfig.scanStableSampleCount) {}
+                        requestedConfig.scanStableSampleCount,
+                        requestedConfig.scanSpeedFilterWindowSamples) {}
 
     bool queueWriter(WriterEvent event) {
         if (writerQueue->tryPush(std::move(event))) return true;
@@ -948,7 +1084,7 @@ struct SynchronizationSession::Impl {
             output.cameraDeviceTimestampNs = camera.cameraTimestampNs;
             output.hostCallbackNs = camera.hostCallbackNs;
             output.image = camera.image;
-            output.imageFilename = frameFilename(camera.frameId, config.saveImages);
+            output.imageFilename = camera.imageFilename;
 
             int64_t referenceHostNs = 0;
             bool mappedDeviceTimestamp = false;
@@ -1009,14 +1145,23 @@ struct SynchronizationSession::Impl {
                         output.actualScanSpeedMmS =
                             (1.0 - output.interpolationAlpha) * before.actualLinearSpeedMmS +
                             output.interpolationAlpha * after.actualLinearSpeedMmS;
+                        output.filteredScanSpeedMmS =
+                            (1.0 - output.interpolationAlpha) * before.filteredLinearSpeedMmS +
+                            output.interpolationAlpha * after.filteredLinearSpeedMmS;
+                        output.motionPhase = before.motionPhase == after.motionPhase
+                            ? before.motionPhase : MotionPhase::UNSTABLE;
                         if (output.robotGapMs > config.robotInvalidGapMs) {
                             output.quality = SyncQuality::ROBOT_GAP_TOO_LARGE;
-                        } else if (!camera.frameIdContinuous) {
+                        } else if (!camera.frameIdContinuous ||
+                                   !camera.imageWriteQueued) {
                             output.quality = SyncQuality::CAMERA_FRAME_DROPPED;
-                        } else if (after.sequence != before.sequence + 1U ||
-                                   after.droppedBefore != 0U) {
-                            output.quality = SyncQuality::ROBOT_STATE_DROPPED;
-                        } else if (!before.speedStable || !after.speedStable) {
+                        } else if ((!before.speedStable || !after.speedStable) &&
+                                   !((!config.discardAccelerationSegment &&
+                                      before.motionPhase == MotionPhase::ACCELERATING &&
+                                      after.motionPhase == MotionPhase::ACCELERATING) ||
+                                     (!config.discardDecelerationSegment &&
+                                      before.motionPhase == MotionPhase::DECELERATING &&
+                                      after.motionPhase == MotionPhase::DECELERATING))) {
                             output.quality = SyncQuality::SPEED_NOT_STABLE;
                         } else {
                             output.quality = SyncQuality::VALID;
@@ -1027,9 +1172,11 @@ struct SynchronizationSession::Impl {
 
             {
                 std::lock_guard<std::mutex> lock(statisticsMutex);
+                if (output.motionPhase == MotionPhase::CONSTANT_SPEED) {
+                    ++stats.stableSpeedFrames;
+                }
                 if (output.quality == SyncQuality::VALID) {
                     ++stats.successfulSyncFrames;
-                    ++stats.stableSpeedFrames;
                 } else {
                     ++stats.invalidSyncFrames;
                 }
@@ -1037,6 +1184,7 @@ struct SynchronizationSession::Impl {
             WriterEvent event;
             event.type = WriterEvent::Type::Synchronized;
             event.synchronized = output;
+            event.synchronized.image.reset();
             queueWriter(std::move(event));
             std::function<void(const SynchronizedFrame&)> callback;
             {
@@ -1068,22 +1216,41 @@ struct SynchronizationSession::Impl {
                 << "    \"scan_speed_mm_s\": " << config.scanSpeedMmS << ",\n"
                 << "    \"scan_acceleration_mm_s2\": " << config.scanAccelerationMmS2 << ",\n"
                 << "    \"speed_tolerance_percent\": "
-                << config.scanSpeedTolerancePercent << "\n"
+                << config.scanSpeedTolerancePercent << ",\n"
+                << "    \"speed_filter_window_samples\": "
+                << config.scanSpeedFilterWindowSamples << ",\n"
+                << "    \"image_writer_threads\": " << config.imageWriterThreads << "\n"
                 << "  },\n"
-                << "  \"actual_camera_average_fps\": " << snapshot.actualCameraFps << ",\n"
+                << "  \"actual_camera_device_fps\": " << snapshot.actualCameraFps << ",\n"
+                << "  \"accepted_camera_callback_fps\": "
+                << snapshot.acceptedCameraFps << ",\n"
                 << "  \"actual_robot_average_feedback_hz\": " << snapshot.actualRobotHz << ",\n"
-                << "  \"total_image_frames\": " << snapshot.totalCameraFrames << ",\n"
-                << "  \"camera_dropped_frames\": " << snapshot.cameraFramesDropped << ",\n"
+                << "  \"total_camera_frames_accepted\": " << snapshot.totalCameraFrames << ",\n"
+                << "  \"camera_frame_id_skips\": " << snapshot.cameraFramesDropped << ",\n"
                 << "  \"camera_queue_overflows\": " << snapshot.cameraQueueOverflows << ",\n"
                 << "  \"image_pool_exhaustions\": " << snapshot.imagePoolExhaustions << ",\n"
+                << "  \"image_queue_overflows\": " << snapshot.imageQueueOverflows << ",\n"
+                << "  \"image_frames_written\": " << snapshot.imageFramesWritten << ",\n"
                 << "  \"image_write_failures\": " << snapshot.imageWriteFailures << ",\n"
                 << "  \"total_robot_samples\": " << snapshot.totalRobotSamples << ",\n"
-                << "  \"robot_state_packets_dropped\": " << snapshot.robotStatesDropped << ",\n"
-                << "  \"robot_duplicate_reads\": " << snapshot.robotDuplicateReads << ",\n"
+                << "  \"robot_receive_sequence_gaps\": "
+                << snapshot.robotReceiveSequenceGaps << ",\n"
+                << "  \"robot_frame_counter_skips\": "
+                << snapshot.robotFrameCounterSkips << ",\n"
+                << "  \"robot_frame_counter_duplicates\": "
+                << snapshot.robotFrameCounterDuplicates << ",\n"
+                << "  \"robot_frame_counter_out_of_order\": "
+                << snapshot.robotFrameCounterOutOfOrder << ",\n"
                 << "  \"robot_abnormal_intervals\": " << snapshot.robotAbnormalIntervals << ",\n"
+                << "  \"robot_getter_errors\": " << snapshot.robotGetterErrors << ",\n"
+                << "  \"robot_getter_duration_samples\": "
+                << snapshot.robotGetterDurationSamples << ",\n"
+                << "  \"robot_getter_mean_us\": " << snapshot.robotGetterMeanUs << ",\n"
+                << "  \"robot_getter_p99_us\": " << snapshot.robotGetterP99Us << ",\n"
+                << "  \"robot_getter_max_us\": " << snapshot.robotGetterMaximumUs << ",\n"
                 << "  \"successful_sync_frames\": " << snapshot.successfulSyncFrames << ",\n"
                 << "  \"invalid_sync_frames\": " << snapshot.invalidSyncFrames << ",\n"
-                << "  \"constant_speed_valid_frames\": " << snapshot.stableSpeedFrames << ",\n"
+                << "  \"constant_speed_frames\": " << snapshot.stableSpeedFrames << ",\n"
                 << "  \"robot_gap_mean_ms\": " << snapshot.meanRobotGapMs << ",\n"
                 << "  \"robot_gap_max_ms\": " << snapshot.maximumRobotGapMs << ",\n"
                 << "  \"camera_clock_scale\": " << snapshot.cameraClockFit.scale << ",\n"
@@ -1092,10 +1259,43 @@ struct SynchronizationSession::Impl {
                 << snapshot.cameraClockFit.residualRmsNs << ",\n"
                 << "  \"camera_clock_mapping_stable\": "
                 << (snapshot.cameraClockFit.stable ? "true" : "false") << ",\n"
+                << "  \"robot_clock_scale\": " << snapshot.robotClockFit.scale << ",\n"
+                << "  \"robot_clock_offset_ns\": " << snapshot.robotClockFit.offsetNs << ",\n"
+                << "  \"robot_clock_residual_rms_ns\": "
+                << snapshot.robotClockFit.residualRmsNs << ",\n"
+                << "  \"robot_clock_mapping_stable\": "
+                << (snapshot.robotClockFit.stable ? "true" : "false") << ",\n"
                 << "  \"writer_queue_overflows\": " << snapshot.writerQueueOverflows << ",\n"
                 << "  \"run_started_utc\": \"" << jsonEscape(startUtc) << "\",\n"
                 << "  \"run_ended_utc\": \"" << jsonEscape(endUtc) << "\"\n"
                 << "}\n";
+    }
+
+    void imageWriterLoop() {
+        ImageWriteTask task;
+        while (imageQueue->pop(&task)) {
+            bool written = false;
+            if (task.image && !task.image->bytes.empty() &&
+                !task.imageFilename.empty()) {
+                const ImageBuffer& buffer = *task.image;
+                const cv::Mat image(buffer.height, buffer.width, CV_8UC1,
+                                    const_cast<uint8_t*>(buffer.bytes.data()),
+                                    static_cast<std::size_t>(buffer.stride));
+                try {
+                    written = cv::imwrite(
+                        directory + "/" + task.imageFilename, image,
+                        {cv::IMWRITE_PNG_COMPRESSION, 1});
+                } catch (const cv::Exception&) {
+                    written = false;
+                }
+            }
+            std::lock_guard<std::mutex> lock(statisticsMutex);
+            if (written) {
+                ++stats.imageFramesWritten;
+            } else {
+                ++stats.imageWriteFailures;
+            }
+        }
     }
 
     void writerLoop() {
@@ -1104,32 +1304,18 @@ struct SynchronizationSession::Impl {
         while (writerQueue->pop(&event)) {
             if (event.type == WriterEvent::Type::Robot && robotCsv) {
                 const RobotSample& value = event.robot;
-                robotCsv << value.sequence << ',' << value.rawFrameCount << ','
-                         << value.hostReceiveNs << ',' << value.robotTimestampNs;
+                robotCsv << value.sequence << ',' << value.sdkReceiveSequence << ','
+                         << value.rawFrameCount << ',' << value.hostReceiveNs << ','
+                         << value.getterDurationNs << ',' << value.getterResult << ','
+                         << value.robotTimestampNs;
                 for (const double pose : value.flangePoseRaw) robotCsv << ',' << pose;
                 for (const double joint : value.jointPositionDeg) robotCsv << ',' << joint;
                 robotCsv << ',' << value.actualLinearSpeedMmS << ','
-                         << (value.valid ? 1 : 0) << '\n';
+                         << (value.valid ? 1 : 0) << ',' << value.rawFrameSequence << ','
+                         << value.rawFrameAdvance << ',' << value.filteredLinearSpeedMmS << ','
+                         << value.positionFitSpeedMmS << ','
+                         << motionPhaseName(value.motionPhase) << '\n';
             } else if (event.type == WriterEvent::Type::Camera) {
-                if (config.saveImages && event.camera.image &&
-                    !event.camera.image->bytes.empty()) {
-                    const ImageBuffer& buffer = *event.camera.image;
-                    const cv::Mat image(buffer.height, buffer.width, CV_8UC1,
-                                        const_cast<uint8_t*>(buffer.bytes.data()),
-                                        static_cast<std::size_t>(buffer.stride));
-                    bool written = false;
-                    try {
-                        written = cv::imwrite(
-                            directory + "/" + event.imageFilename, image,
-                            {cv::IMWRITE_PNG_COMPRESSION, 1});
-                    } catch (const cv::Exception&) {
-                        written = false;
-                    }
-                    if (!written) {
-                        std::lock_guard<std::mutex> lock(statisticsMutex);
-                        ++stats.imageWriteFailures;
-                    }
-                }
                 if (cameraCsv) {
                     const CameraFrame& value = event.camera;
                     cameraCsv << value.frameId << ',' << value.cameraTimestampRaw << ','
@@ -1137,7 +1323,8 @@ struct SynchronizationSession::Impl {
                               << value.exposureUs << ',' << value.width << ',' << value.height
                               << ',' << (value.frameIdContinuous ? 1 : 0) << ','
                               << (value.timestampValid ? 1 : 0) << ','
-                              << event.imageFilename << '\n';
+                              << event.imageFilename << ','
+                              << (value.imageWriteQueued ? 1 : 0) << '\n';
                 }
             } else if (event.type == WriterEvent::Type::Synchronized && syncCsv) {
                 const SynchronizedFrame& value = event.synchronized;
@@ -1151,7 +1338,8 @@ struct SynchronizationSession::Impl {
                         << value.flangeOrientation.x() << ',' << value.flangeOrientation.y() << ','
                         << value.flangeOrientation.z() << ',' << value.flangeOrientation.w() << ','
                         << value.actualScanSpeedMmS << ',' << syncQualityName(value.quality) << ','
-                        << value.imageFilename << '\n';
+                        << value.imageFilename << ',' << value.filteredScanSpeedMmS << ','
+                        << motionPhaseName(value.motionPhase) << '\n';
             }
             if (++pendingFlush >= 128U) {
                 if (robotCsv) robotCsv.flush();
@@ -1163,16 +1351,25 @@ struct SynchronizationSession::Impl {
         if (robotCsv) robotCsv.flush();
         if (cameraCsv) cameraCsv.flush();
         if (syncCsv) syncCsv.flush();
-        endUtc = isoUtcNow();
-        writeSummary();
     }
 
     PipelineStatistics statisticsSnapshot() const {
         std::lock_guard<std::mutex> lock(statisticsMutex);
         PipelineStatistics snapshot = stats;
         if (lastCameraNs > firstCameraNs && stats.totalCameraFrames > 1U) {
-            snapshot.actualCameraFps =
+            snapshot.acceptedCameraFps =
                 static_cast<double>(stats.totalCameraFrames - 1U) * kNsPerSecond /
+                static_cast<double>(lastCameraNs - firstCameraNs);
+        }
+        if (lastCameraDeviceNs > firstCameraDeviceNs &&
+            lastCameraDeviceSequence > firstCameraDeviceSequence) {
+            snapshot.actualCameraFps = static_cast<double>(
+                lastCameraDeviceSequence - firstCameraDeviceSequence) * kNsPerSecond /
+                static_cast<double>(lastCameraDeviceNs - firstCameraDeviceNs);
+        } else if (lastCameraNs > firstCameraNs && haveCameraSequence &&
+                   lastCameraSequence > firstCameraSequence) {
+            snapshot.actualCameraFps = static_cast<double>(
+                lastCameraSequence - firstCameraSequence) * kNsPerSecond /
                 static_cast<double>(lastCameraNs - firstCameraNs);
         }
         if (lastRobotNs > firstRobotNs && stats.totalRobotSamples > 1U) {
@@ -1182,6 +1379,23 @@ struct SynchronizationSession::Impl {
         }
         snapshot.meanRobotGapMs = robotGapCount == 0U ? 0.0
             : static_cast<double>(robotGapSumMs / robotGapCount);
+        snapshot.robotGetterDurationSamples = robotGetterDurationsNs.size();
+        if (!robotGetterDurationsNs.empty()) {
+            snapshot.robotGetterMeanUs = static_cast<double>(
+                robotGetterDurationSumNs /
+                static_cast<long double>(robotGetterDurationsNs.size()) / 1000.0L);
+            snapshot.robotGetterMaximumUs = static_cast<double>(
+                *std::max_element(robotGetterDurationsNs.begin(),
+                                  robotGetterDurationsNs.end())) / 1000.0;
+            std::vector<int64_t> sortedDurations = robotGetterDurationsNs;
+            std::sort(sortedDurations.begin(), sortedDurations.end());
+            const std::size_t percentileIndex = std::min(
+                sortedDurations.size() - 1U,
+                static_cast<std::size_t>(
+                    std::ceil(0.99 * static_cast<double>(sortedDurations.size()))) - 1U);
+            snapshot.robotGetterP99Us =
+                static_cast<double>(sortedDurations[percentileIndex]) / 1000.0;
+        }
         snapshot.cameraClockFit = cameraMapper.report();
         snapshot.robotClockFit = robotMapper.report();
         return snapshot;
@@ -1230,10 +1444,12 @@ bool SynchronizationSession::start(const SynchronizationConfig& config,
             if (error) *error = "cannot create robot_raw.csv";
             return false;
         }
-        created->robotCsv << "sequence,raw_frame_count,host_receive_ns,robot_timestamp_ns,"
+        created->robotCsv << "sequence,sdk_receive_sequence,raw_frame_count,host_receive_ns,"
+            "getter_duration_ns,getter_result,robot_timestamp_ns,"
             "flange_x_mm,flange_y_mm,flange_z_mm,flange_rx_deg,flange_ry_deg,flange_rz_deg,"
             "joint_1_deg,joint_2_deg,joint_3_deg,joint_4_deg,joint_5_deg,joint_6_deg,"
-            "actual_linear_speed_mm_s,valid\n";
+            "actual_linear_speed_mm_s,valid,raw_frame_sequence,raw_frame_advance,"
+            "filtered_linear_speed_mm_s,position_fit_speed_mm_s,motion_phase\n";
     }
     if (config.saveCameraRawCsv) {
         created->cameraCsv.open(sessionDirectory + "/camera_raw.csv",
@@ -1243,7 +1459,8 @@ bool SynchronizationSession::start(const SynchronizationConfig& config,
             return false;
         }
         created->cameraCsv << "frame_id,camera_timestamp_raw,camera_timestamp_ns,host_callback_ns,"
-            "exposure_us,width,height,frame_id_continuous,timestamp_valid,image_filename\n";
+            "exposure_us,width,height,frame_id_continuous,timestamp_valid,image_filename,"
+            "image_write_queued\n";
     }
     if (config.saveSyncCsv) {
         created->syncCsv.open(sessionDirectory + "/synchronization.csv",
@@ -1256,13 +1473,21 @@ bool SynchronizationSession::start(const SynchronizationConfig& config,
             "aligned_timestamp_ns,robot_sequence_before,robot_sequence_after,robot_time_before_ns,"
             "robot_time_after_ns,interpolation_alpha,robot_gap_ms,flange_x_mm,flange_y_mm,"
             "flange_z_mm,flange_qx,flange_qy,flange_qz,flange_qw,actual_scan_speed_mm_s,"
-            "sync_quality,image_filename\n";
+            "sync_quality,image_filename,filtered_scan_speed_mm_s,motion_phase\n";
     }
     created->startUtc = isoUtcNow();
     created->accepting.store(true);
     created->writerThread = std::thread([pointer = created.get()] {
         pointer->writerLoop();
     });
+    if (config.saveImages) {
+        created->imageWriterThreads.reserve(config.imageWriterThreads);
+        for (std::size_t index = 0; index < config.imageWriterThreads; ++index) {
+            created->imageWriterThreads.emplace_back([pointer = created.get()] {
+                pointer->imageWriterLoop();
+            });
+        }
+    }
     created->synchronizationThread = std::thread([pointer = created.get()] {
         pointer->synchronizationLoop();
     });
@@ -1283,6 +1508,20 @@ bool SynchronizationSession::pushCamera(CameraFrame frame) {
     if (!implementation || !implementation->accepting.load()) return false;
     const CounterUpdate update = implementation->cameraCounter.update(frame.frameId);
     frame.frameIdContinuous = update.first || update.continuous;
+    frame.imageFilename = frameFilename(frame.frameId,
+                                        implementation->config.saveImages);
+    if (implementation->config.saveImages) {
+        ImageWriteTask imageTask;
+        imageTask.image = frame.image;
+        imageTask.imageFilename = frame.imageFilename;
+        if (!imageTask.image ||
+            !implementation->imageQueue->tryPush(std::move(imageTask))) {
+            std::lock_guard<std::mutex> lock(implementation->statisticsMutex);
+            ++implementation->stats.imageQueueOverflows;
+            frame.imageFilename.clear();
+            frame.imageWriteQueued = false;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(implementation->statisticsMutex);
         ++implementation->stats.totalCameraFrames;
@@ -1291,12 +1530,25 @@ bool SynchronizationSession::pushCamera(CameraFrame frame) {
             implementation->firstCameraNs = frame.hostCallbackNs;
         }
         implementation->lastCameraNs = frame.hostCallbackNs;
+        if (!implementation->haveCameraSequence) {
+            implementation->firstCameraSequence = update.sequence;
+            implementation->haveCameraSequence = true;
+        }
+        implementation->lastCameraSequence = update.sequence;
+        if (frame.timestampValid && frame.cameraTimestampNs > 0) {
+            if (implementation->firstCameraDeviceNs == 0) {
+                implementation->firstCameraDeviceNs = frame.cameraTimestampNs;
+                implementation->firstCameraDeviceSequence = update.sequence;
+            }
+            implementation->lastCameraDeviceNs = frame.cameraTimestampNs;
+            implementation->lastCameraDeviceSequence = update.sequence;
+        }
     }
     WriterEvent rawEvent;
     rawEvent.type = WriterEvent::Type::Camera;
     rawEvent.camera = frame;
-    rawEvent.imageFilename = frameFilename(frame.frameId,
-                                           implementation->config.saveImages);
+    rawEvent.camera.image.reset();
+    rawEvent.imageFilename = frame.imageFilename;
     implementation->queueWriter(std::move(rawEvent));
     if (!implementation->cameraQueue->tryPush(frame)) {
         {
@@ -1310,8 +1562,7 @@ bool SynchronizationSession::pushCamera(CameraFrame frame) {
         dropped.cameraDeviceTimestampNs = frame.cameraTimestampNs;
         dropped.hostCallbackNs = frame.hostCallbackNs;
         dropped.quality = SyncQuality::CAMERA_FRAME_DROPPED;
-        dropped.imageFilename = frameFilename(
-            frame.frameId, implementation->config.saveImages);
+        dropped.imageFilename = frame.imageFilename;
         WriterEvent droppedEvent;
         droppedEvent.type = WriterEvent::Type::Synchronized;
         droppedEvent.synchronized = std::move(dropped);
@@ -1326,13 +1577,22 @@ bool SynchronizationSession::pushRobot(RobotSample sample) {
     Impl* implementation = impl_.get();
     if (!implementation || !implementation->accepting.load()) return false;
     const CounterUpdate update = implementation->robotCounter.update(sample.rawFrameCount);
-    if (update.duplicate || update.outOfOrder) {
-        std::lock_guard<std::mutex> lock(implementation->statisticsMutex);
-        ++implementation->stats.robotDuplicateReads;
-        return false;
+    sample.sequence = ++implementation->observedRobotSequence;
+    sample.rawFrameSequence = update.sequence;
+    sample.rawFrameAdvance =
+        update.first || update.duplicate || update.outOfOrder
+            ? 0U : update.dropped + 1U;
+    uint64_t receiveSequenceGap = 0U;
+    if (sample.sdkReceiveSequence > 0U) {
+        if (implementation->lastSdkReceiveSequence > 0U &&
+            sample.sdkReceiveSequence >
+                implementation->lastSdkReceiveSequence + 1U) {
+            receiveSequenceGap = sample.sdkReceiveSequence -
+                implementation->lastSdkReceiveSequence - 1U;
+        }
+        implementation->lastSdkReceiveSequence = std::max(
+            implementation->lastSdkReceiveSequence, sample.sdkReceiveSequence);
     }
-    sample.sequence = update.sequence;
-    sample.droppedBefore = update.dropped;
     if (implementation->lastRobotReceiveNs > 0) {
         sample.receiveGapMs = static_cast<double>(
             sample.hostReceiveNs - implementation->lastRobotReceiveNs) / kNsPerMs;
@@ -1343,13 +1603,34 @@ bool SynchronizationSession::pushRobot(RobotSample sample) {
         sample.alignedTimestampNs = implementation->lastRobotAlignedNs + 1;
     }
     implementation->lastRobotAlignedNs = sample.alignedTimestampNs;
-    sample.speedStable = implementation->speedDetector.update(
-        sample.actualLinearSpeedMmS);
+    const int64_t motionTimestampNs = sample.hasRobotTimestamp &&
+        sample.robotTimestampNs > 0 ? sample.robotTimestampNs : sample.hostReceiveNs;
+    sample.motionPhase = implementation->speedDetector.update(
+        motionTimestampNs, sample.flangePositionMm,
+        sample.actualLinearSpeedMmS, &sample.filteredLinearSpeedMmS,
+        &sample.positionFitSpeedMmS);
+    sample.speedStable = sample.motionPhase == MotionPhase::CONSTANT_SPEED;
     implementation->robotBuffer.push(sample);
     {
         std::lock_guard<std::mutex> lock(implementation->statisticsMutex);
         ++implementation->stats.totalRobotSamples;
-        implementation->stats.robotStatesDropped += update.dropped;
+        implementation->stats.robotReceiveSequenceGaps += receiveSequenceGap;
+        implementation->stats.robotFrameCounterSkips += update.dropped;
+        if (update.duplicate) {
+            ++implementation->stats.robotFrameCounterDuplicates;
+        }
+        if (update.outOfOrder) {
+            ++implementation->stats.robotFrameCounterOutOfOrder;
+        }
+        if (sample.getterResult != 0) {
+            ++implementation->stats.robotGetterErrors;
+        }
+        if (sample.getterDurationNs >= 0) {
+            implementation->robotGetterDurationSumNs +=
+                static_cast<long double>(sample.getterDurationNs);
+            implementation->robotGetterDurationsNs.push_back(
+                sample.getterDurationNs);
+        }
         if (sample.receiveGapMs > implementation->config.robotWarningGapMs) {
             ++implementation->stats.robotAbnormalIntervals;
         }
@@ -1389,7 +1670,13 @@ void SynchronizationSession::stop() {
         stopping->synchronizationThread.join();
     }
     stopping->writerQueue->close();
+    stopping->imageQueue->close();
     if (stopping->writerThread.joinable()) stopping->writerThread.join();
+    for (std::thread& writer : stopping->imageWriterThreads) {
+        if (writer.joinable()) writer.join();
+    }
+    stopping->endUtc = isoUtcNow();
+    stopping->writeSummary();
     lastStatistics_ = stopping->statisticsSnapshot();
     lastSessionDirectory_ = stopping->directory;
     const ClockFitReport camera = stopping->cameraMapper.report();

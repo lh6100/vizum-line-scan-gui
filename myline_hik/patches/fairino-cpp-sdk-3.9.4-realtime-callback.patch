@@ -1,0 +1,115 @@
+--- a/libfairino/src/include/Robot-CN/robot.h
++++ b/libfairino/src/include/Robot-CN/robot.h
+@@ -21,0 +22,16 @@
++struct FRRobotRealtimeBridge;
++
++/**
++ * @brief Callback invoked once for every complete packet received from port
++ * 20004.
++ *
++ * The packet pointer is valid only for the duration of the callback. The
++ * callback runs on the SDK receive thread and must return without blocking.
++ * hostReceiveNs uses CLOCK_MONOTONIC_RAW on Linux. receiveSequence is a
++ * process-local packet sequence starting at one for each RPC session.
++ */
++using RobotRealtimeStateCallback = void (*)(
++		const ROBOT_STATE_PKG* pkg,
++		int64_t hostReceiveNs,
++		uint64_t receiveSequence,
++		void* userData);
+@@ -2542,0 +2559,11 @@
++
++	/**
++	 * @brief Register a per-packet callback for port 20004 realtime state.
++	 * @param [in] callback Callback function, or nullptr to unregister.
++	 * @param [in] userData Opaque pointer returned to the callback.
++	 *
++	 * Unregistering waits for an in-flight callback to finish, so userData can
++	 * be safely released after this function returns.
++	 */
++	errno_t SetRobotRealtimeStateCallback(
++			RobotRealtimeStateCallback callback, void* userData);
+@@ -5058,0 +5086 @@
++	std::shared_ptr<FRRobotRealtimeBridge> realtime_state_bridge;
+--- a/libfairino/src/src/Robot/robot.cpp
++++ b/libfairino/src/src/Robot/robot.cpp
+@@ -14,0 +15,2 @@
++#include <atomic>
++#include <mutex>
+@@ -79,0 +82,24 @@
++struct FRRobotRealtimeBridge
++{
++    std::mutex snapshotMutex;
++    std::mutex callbackMutex;
++    ROBOT_STATE_PKG snapshot{};
++    RobotRealtimeStateCallback callback = nullptr;
++    void* callbackUserData = nullptr;
++    std::atomic<uint64_t> receiveSequence{0};
++};
++
++static int64_t GetRealtimeMonotonicNs()
++{
++#ifdef LINUX_OPTION
++    timespec value{};
++    if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) == 0)
++    {
++        return static_cast<int64_t>(value.tv_sec) * 1000000000LL +
++               static_cast<int64_t>(value.tv_nsec);
++    }
++#endif
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+@@ -96,0 +123 @@
++    realtime_state_bridge = std::make_shared<FRRobotRealtimeBridge>();
+@@ -132 +159,27 @@
+-            memcpy(robot_state_pkg.get(), pkgBuf, sizeof(ROBOT_STATE_PKG));
++            // Capture the earliest userspace instant available after a full,
++            // checksum-validated 20004 packet has arrived.
++            const int64_t hostReceiveNs = GetRealtimeMonotonicNs();
++            ROBOT_STATE_PKG receivedPkg{};
++            memcpy(&receivedPkg, pkgBuf, sizeof(ROBOT_STATE_PKG));
++            const uint64_t receiveSequence =
++                realtime_state_bridge->receiveSequence.fetch_add(
++                    1, std::memory_order_relaxed) + 1;
++            {
++                std::lock_guard<std::mutex> lock(
++                    realtime_state_bridge->snapshotMutex);
++                realtime_state_bridge->snapshot = receivedPkg;
++            }
++            memcpy(robot_state_pkg.get(), &receivedPkg, sizeof(ROBOT_STATE_PKG));
++            {
++                // Holding this mutex through the callback makes unregistering
++                // a synchronization point. The callback contract requires a
++                // bounded, non-blocking handoff such as an SPSC queue.
++                std::lock_guard<std::mutex> lock(
++                    realtime_state_bridge->callbackMutex);
++                if (realtime_state_bridge->callback != nullptr)
++                {
++                    realtime_state_bridge->callback(
++                        &receivedPkg, hostReceiveNs, receiveSequence,
++                        realtime_state_bridge->callbackUserData);
++                }
++            }
+@@ -293,0 +347 @@
++    realtime_state_bridge->receiveSequence.store(0, std::memory_order_relaxed);
+@@ -361,0 +416,4 @@
++    {
++        std::lock_guard<std::mutex> lock(realtime_state_bridge->snapshotMutex);
++        memset(&realtime_state_bridge->snapshot, 0, sizeof(ROBOT_STATE_PKG));
++    }
+@@ -11481 +11539,12 @@
+-    memcpy(pkg, robot_state_pkg.get(), sizeof(ROBOT_STATE_PKG));
++    std::lock_guard<std::mutex> lock(realtime_state_bridge->snapshotMutex);
++    memcpy(pkg, &realtime_state_bridge->snapshot, sizeof(ROBOT_STATE_PKG));
++    return 0;
++}
++
++errno_t FRRobot::SetRobotRealtimeStateCallback(
++        RobotRealtimeStateCallback callback, void* userData)
++{
++    std::lock_guard<std::mutex> lock(realtime_state_bridge->callbackMutex);
++    realtime_state_bridge->callback = callback;
++    realtime_state_bridge->callbackUserData =
++        callback == nullptr ? nullptr : userData;

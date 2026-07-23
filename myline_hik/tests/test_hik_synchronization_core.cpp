@@ -2,6 +2,7 @@
 
 #include <Eigen/Geometry>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -157,16 +158,35 @@ void testExposureAndSpeed() {
                end.alignedTimestampNs == 1001050000LL,
                "exposure-end and fixed-offset calculation");
 
-    hik_sync::SpeedStabilityDetector detector(20.0, 5.0, 5);
-    for (int index = 0; index < 4; ++index) {
-        CHECK_TRUE(!detector.update(20.5), "speed not stable before required count");
+    hik_sync::SpeedStabilityDetector detector(20.0, 5.0, 3, 7);
+    hik_sync::MotionPhase phase = hik_sync::MotionPhase::WARMUP;
+    double filtered = 0.0;
+    double fitted = 0.0;
+    for (int index = 0; index < 12; ++index) {
+        const int64_t timestamp = 1000000000LL + index * 10000000LL;
+        const double position = index * 0.010 * 20.0;
+        const double noisyFeedback = index % 2 == 0 ? 18.5 : 21.5;
+        phase = detector.update(timestamp, Eigen::Vector3d(position, 0.0, 0.0),
+                                noisyFeedback, &filtered, &fitted);
     }
-    CHECK_TRUE(detector.update(19.5), "speed stable after consecutive samples");
-    CHECK_TRUE(!detector.update(18.0), "speed deviation resets stability");
+    CHECK_TRUE(phase == hik_sync::MotionPhase::CONSTANT_SPEED,
+               "position fit and median filter recognize constant speed");
+    CHECK_TRUE(near(fitted, 20.0, 1e-9) && near(filtered, 20.375, 0.5),
+               "filtered speed suppresses noisy instantaneous feedback");
+    for (int index = 12; index < 28; ++index) {
+        phase = detector.update(1000000000LL + index * 10000000LL,
+                                Eigen::Vector3d(12 * 0.010 * 20.0, 0.0, 0.0),
+                                0.0, &filtered, &fitted);
+    }
+    CHECK_TRUE(phase == hik_sync::MotionPhase::STOPPED ||
+               phase == hik_sync::MotionPhase::DECELERATING,
+               "filtered state machine leaves constant phase after deceleration");
 }
 
 void testConfigurationAndControllerTime() {
     hik_sync::SynchronizationConfig config;
+    CHECK_TRUE(config.robotTimeMode == hik_sync::RobotTimeMode::ControllerTimestamp,
+               "controller RobotTime is the default robot clock");
     std::string error;
     config.scanSpeedMmS = 10.0;
     CHECK_TRUE(config.validate(&error), "minimum scan speed accepted");
@@ -178,9 +198,24 @@ void testConfigurationAndControllerTime() {
     const int64_t first = hik_sync::controllerCalendarToNs(
         2026, 7, 22, 12, 0, 0, 0, &valid);
     const int64_t second = hik_sync::controllerCalendarToNs(
-        2026, 7, 22, 12, 0, 0, 8, &valid);
-    CHECK_TRUE(valid && second - first == 8000000LL,
+        2026, 7, 22, 12, 0, 0, 10, &valid);
+    CHECK_TRUE(valid && second - first == 10000000LL,
                "FAIRINO RobotTime millisecond conversion");
+
+    hik_sync::RobotClockMapper mapper(
+        hik_sync::RobotTimeMode::ControllerTimestamp, 10.0, 100U);
+    for (uint64_t index = 0; index < 100U; ++index) {
+        hik_sync::RobotSample sample;
+        sample.sequence = index + 1U;
+        sample.robotTimestampNs = first + static_cast<int64_t>(index) * 10000000LL;
+        sample.hostReceiveNs = sample.robotTimestampNs + 500000000LL +
+            static_cast<int64_t>(index % 3U) * 10000LL;
+        sample.hasRobotTimestamp = true;
+        mapper.align(&sample);
+    }
+    CHECK_TRUE(mapper.activeMode() == hik_sync::RobotTimeMode::ControllerTimestamp &&
+               mapper.report().stable,
+               "controller RobotTime affine mapping becomes active");
 }
 
 void testSyntheticPipeline() {
@@ -188,7 +223,7 @@ void testSyntheticPipeline() {
     config.robotTimeMode = hik_sync::RobotTimeMode::HostReceive;
     config.scanSpeedMmS = 20.0;
     config.scanStableSampleCount = 5;
-    config.saveImages = false;
+    config.saveImages = true;
     config.saveRobotRawCsv = true;
     config.saveCameraRawCsv = true;
     config.saveSyncCsv = true;
@@ -211,11 +246,11 @@ void testSyntheticPipeline() {
         });
 
     const int64_t base = hik_sync::getMonotonicRawNs() + 100000000LL;
-    // 125 Hz robot: one missing state tests discontinuity; two adjacent
-    // missing states create a gap larger than the configured invalid limit.
+    // 100 Hz robot: raw frame-counter skips remain diagnostic; two adjacent
+    // missing observations create a time gap larger than the invalid limit.
     for (uint64_t index = 0U; index <= 150U; ++index) {
         if (index == 50U || index == 90U || index == 91U) continue;
-        const int64_t timestamp = base + static_cast<int64_t>(index) * 8000000LL;
+        const int64_t timestamp = base + static_cast<int64_t>(index) * 10000000LL;
         hik_sync::RobotSample robot = sampleAt(
             index, timestamp, 20.0 * (timestamp - base) / 1.0e9, 20.0);
         session.pushRobot(robot);
@@ -231,20 +266,22 @@ void testSyntheticPipeline() {
         camera.exposureUs = 2000.0;
         camera.width = 1;
         camera.height = 1;
+        camera.image = std::make_shared<hik_sync::ImageBuffer>();
+        camera.image->width = 1;
+        camera.image->height = 1;
+        camera.image->stride = 1;
+        camera.image->bytes.assign(1U, static_cast<uint8_t>(index));
         session.pushCamera(camera);
     }
     session.stop();
+    const hik_sync::PipelineStatistics stats = session.statistics();
 
     CHECK_TRUE(synchronized.size() == 60U,
                "every simulated camera frame produces an association result");
-    bool sawRobotDrop = false;
     bool sawRobotGapTooLarge = false;
     bool sawCameraDrop = false;
     double maximumValidPositionError = 0.0;
     for (const hik_sync::SynchronizedFrame& frame : synchronized) {
-        sawRobotDrop = sawRobotDrop ||
-            frame.quality == hik_sync::SyncQuality::ROBOT_STATE_DROPPED ||
-            frame.quality == hik_sync::SyncQuality::ROBOT_GAP_TOO_LARGE;
         sawRobotGapTooLarge = sawRobotGapTooLarge ||
             frame.quality == hik_sync::SyncQuality::ROBOT_GAP_TOO_LARGE;
         sawCameraDrop = sawCameraDrop ||
@@ -259,8 +296,7 @@ void testSyntheticPipeline() {
         }
     }
     CHECK_TRUE(maximumValidPositionError < 1e-9,
-               "125 Hz to 60 Hz position interpolation matches theory");
-    CHECK_TRUE(sawRobotDrop, "missing simulated robot state changes quality");
+               "100 Hz to 60 Hz position interpolation matches theory");
     CHECK_TRUE(sawRobotGapTooLarge,
                "robot gap above invalid threshold is marked too large");
     CHECK_TRUE(sawCameraDrop, "simulated camera FrameID jump changes quality");
@@ -269,6 +305,55 @@ void testSyntheticPipeline() {
                std::filesystem::exists(output / "synchronization.csv") &&
                std::filesystem::exists(output / "session_summary.json"),
                "writer produces all raw, synchronized, and summary files");
+    CHECK_TRUE(stats.robotFrameCounterSkips == 3U,
+               "raw robot frame counter skips remain diagnostic");
+    CHECK_TRUE(stats.imageFramesWritten == 60U &&
+               stats.imageWriteFailures == 0U &&
+               std::filesystem::exists(output / "images/frame_000000000000.png"),
+               "parallel image writers drain all queued images");
+    std::error_code removeError;
+    std::filesystem::remove_all(output, removeError);
+}
+
+void testRobotPacketsDoNotDependOnFrameCounter() {
+    hik_sync::SynchronizationConfig config;
+    config.robotTimeMode = hik_sync::RobotTimeMode::HostReceive;
+    config.saveImages = false;
+    config.saveRobotRawCsv = false;
+    config.saveCameraRawCsv = false;
+    config.saveSyncCsv = false;
+    const std::filesystem::path output = std::filesystem::temp_directory_path() /
+        ("hik_sync_packet_test_" +
+         std::to_string(hik_sync::getMonotonicRawNs()));
+
+    hik_sync::SynchronizationSession session;
+    std::string error;
+    CHECK_TRUE(session.start(config, output.string(), nullptr, &error),
+               std::string("packet session starts: ") + error);
+    const int64_t base = hik_sync::getMonotonicRawNs();
+    const std::array<uint64_t, 3> receiveSequences{{1U, 2U, 4U}};
+    const std::array<int64_t, 3> getterDurations{{1000, 2000, 100000}};
+    for (std::size_t index = 0; index < receiveSequences.size(); ++index) {
+        hik_sync::RobotSample robot = sampleAt(
+            7U, base + static_cast<int64_t>(index) * 10000000LL,
+            static_cast<double>(index), 10.0);
+        robot.sdkReceiveSequence = receiveSequences[index];
+        robot.getterDurationNs = getterDurations[index];
+        session.pushRobot(robot);
+    }
+    session.stop();
+    const hik_sync::PipelineStatistics stats = session.statistics();
+    CHECK_TRUE(stats.totalRobotSamples == 3U,
+               "every SDK packet is accepted even when frame_cnt repeats");
+    CHECK_TRUE(stats.robotFrameCounterDuplicates == 2U,
+               "repeated frame_cnt values remain diagnostic");
+    CHECK_TRUE(stats.robotReceiveSequenceGaps == 1U,
+               "SDK receive sequence reports a real callback/SPSC gap");
+    CHECK_TRUE(stats.robotGetterDurationSamples == 3U &&
+               std::abs(stats.robotGetterMeanUs - 34.3333333333) < 1e-6 &&
+               std::abs(stats.robotGetterP99Us - 100.0) < 1e-9 &&
+               std::abs(stats.robotGetterMaximumUs - 100.0) < 1e-9,
+               "getter mean, P99 and maximum are reported");
     std::error_code removeError;
     std::filesystem::remove_all(output, removeError);
 }
@@ -284,6 +369,7 @@ int main() {
     testExposureAndSpeed();
     testConfigurationAndControllerTime();
     testSyntheticPipeline();
+    testRobotPacketsDoNotDependOnFrameCounter();
     if (failures != 0) {
         std::cerr << failures << " synchronization test(s) failed\n";
         return 1;

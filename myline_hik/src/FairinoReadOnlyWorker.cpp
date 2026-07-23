@@ -6,29 +6,107 @@
 #include "robot.h"
 #endif
 
+#include <chrono>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <mutex>
+
+#ifdef HAVE_FAIRINO_SDK
+class FairinoRealtimeReceiverState {
+public:
+    struct Packet {
+        ROBOT_STATE_PKG state{};
+        int64_t hostReceiveNs{0};
+        uint64_t receiveSequence{0};
+    };
+
+    static constexpr std::size_t kCapacity = 1024U;
+
+    bool push(const ROBOT_STATE_PKG* state,
+              int64_t hostReceiveNs,
+              uint64_t receiveSequence) noexcept {
+        if (!state) return false;
+        const std::size_t head = head_.load(std::memory_order_relaxed);
+        const std::size_t next = (head + 1U) % kCapacity;
+        if (next == tail_.load(std::memory_order_acquire)) {
+            droppedPackets.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        slots_[head].state = *state;
+        slots_[head].hostReceiveNs = hostReceiveNs;
+        slots_[head].receiveSequence = receiveSequence;
+        head_.store(next, std::memory_order_release);
+        condition.notify_one();
+        return true;
+    }
+
+    bool pop(Packet* packet) noexcept {
+        if (!packet) return false;
+        const std::size_t tail = tail_.load(std::memory_order_relaxed);
+        if (tail == head_.load(std::memory_order_acquire)) return false;
+        *packet = slots_[tail];
+        tail_.store((tail + 1U) % kCapacity, std::memory_order_release);
+        return true;
+    }
+
+    bool empty() const noexcept {
+        return tail_.load(std::memory_order_acquire) ==
+               head_.load(std::memory_order_acquire);
+    }
+
+    void reset() {
+        head_.store(0U, std::memory_order_relaxed);
+        tail_.store(0U, std::memory_order_relaxed);
+        droppedPackets.store(0U, std::memory_order_relaxed);
+    }
+
+    std::mutex waitMutex;
+    std::condition_variable condition;
+    std::atomic<uint64_t> droppedPackets{0U};
+
+private:
+    std::array<Packet, kCapacity> slots_{};
+    std::atomic<std::size_t> head_{0U};
+    std::atomic<std::size_t> tail_{0U};
+};
+
+namespace {
+
+void fairinoRealtimeStateCallback(const ROBOT_STATE_PKG* state,
+                                  int64_t hostReceiveNs,
+                                  uint64_t receiveSequence,
+                                  void* userData) {
+    auto* receiver = static_cast<FairinoRealtimeReceiverState*>(userData);
+    if (receiver) {
+        (void)receiver->push(state, hostReceiveNs, receiveSequence);
+    }
+}
+
+}  // namespace
+#else
+class FairinoRealtimeReceiverState {};
+#endif
 
 FairinoReadOnlyWorker::FairinoReadOnlyWorker(QObject* parent)
     : QObject(parent) {
 #ifdef HAVE_FAIRINO_SDK
     robot_ = new FRRobot;
+    realtimeReceiver_ = std::make_unique<FairinoRealtimeReceiverState>();
 #endif
     motionPollTimer_ = new QTimer(this);
     motionPollTimer_->setInterval(100);
     connect(motionPollTimer_, &QTimer::timeout,
             this, &FairinoReadOnlyWorker::pollMotionDone);
-    realtimePollTimer_ = new QTimer(this);
-    realtimePollTimer_->setTimerType(Qt::PreciseTimer);
-    // The SDK owns the blocking TCP receive thread and exposes no per-packet
-    // callback. Poll its lock-free snapshot faster than the configured 8 ms
-    // period, then publish only when frame_cnt changes.
-    realtimePollTimer_->setInterval(1);
-    connect(realtimePollTimer_, &QTimer::timeout,
-            this, &FairinoReadOnlyWorker::pollRealtimeState);
 }
 
 FairinoReadOnlyWorker::~FairinoReadOnlyWorker() {
 #ifdef HAVE_FAIRINO_SDK
+    stopRealtimeReceiving();
     if (connected_ && robot_) {
         (void)robot_->CloseRPC();
     }
@@ -73,36 +151,42 @@ void FairinoReadOnlyWorker::connectRobot(QString ipAddress) {
     connected_ = true;
     int actualPeriodMs = 0;
     errno_t periodResult = robot_->GetRobotRealtimeStateSamplePeriod(actualPeriodMs);
-    if (periodResult != 0 || actualPeriodMs != 8) {
-        periodResult = robot_->SetRobotRealtimeStateSamplePeriod(8);
+    if (periodResult != 0 || actualPeriodMs != 10) {
+        periodResult = robot_->SetRobotRealtimeStateSamplePeriod(10);
         if (periodResult == 0) {
             periodResult = robot_->GetRobotRealtimeStateSamplePeriod(actualPeriodMs);
         }
     }
-    if (periodResult != 0 || actualPeriodMs != 8) {
+    if (periodResult != 0 || actualPeriodMs != 10) {
         (void)robot_->CloseRPC();
         connected_ = false;
         terminal_ = true;
         emit connectionChanged(false, QStringLiteral("FR5 实时反馈周期配置失败"));
         emit error(-1, QStringLiteral(
-            "FR5 20004 实时状态周期必须为 8 ms；Set/GetRobotRealtimeStateSamplePeriod 失败，err=%1，读回=%2 ms。")
+            "FR5 20004 实时状态周期必须为 10 ms；Set/GetRobotRealtimeStateSamplePeriod 失败，err=%1，读回=%2 ms。")
             .arg(periodResult).arg(actualPeriodMs));
         return;
     }
-    haveRealtimeFrame_ = false;
-    realtimePollTimer_->start();
+    if (!startRealtimeReceiving()) {
+        (void)robot_->CloseRPC();
+        connected_ = false;
+        terminal_ = true;
+        emit connectionChanged(false, QStringLiteral("FR5 20004逐包接收启动失败"));
+        return;
+    }
     emit realtimePeriodConfigured(actualPeriodMs);
     emit connectionChanged(true, QStringLiteral("FR5 连接成功：%1").arg(ipAddress));
     emit log(QStringLiteral(
-        "FR5 SDK 会话已建立；20004 实时状态周期已读取/配置为 %1 ms；程序不会自动使能或切换控制器模式。")
+        "FR5 SDK 会话已建立；20004 实时状态周期已读取/配置为 %1 ms；"
+        "已启用SDK接收线程 CLOCK_MONOTONIC_RAW 逐包时间戳和SPSC消费线程；"
+        "程序不会自动使能或切换控制器模式。")
         .arg(actualPeriodMs));
 #endif
 }
 
 void FairinoReadOnlyWorker::disconnectRobot() {
 #ifdef HAVE_FAIRINO_SDK
-    realtimePollTimer_->stop();
-    haveRealtimeFrame_ = false;
+    stopRealtimeReceiving();
     if (motionActive_ && robot_) {
         (void)robot_->StopMotion();
         motionPollTimer_->stop();
@@ -334,56 +418,118 @@ void FairinoReadOnlyWorker::pollMotionDone() {
 #endif
 }
 
-void FairinoReadOnlyWorker::pollRealtimeState() {
+bool FairinoReadOnlyWorker::startRealtimeReceiving() {
 #ifdef HAVE_FAIRINO_SDK
-    if (!connected_ || !robot_) return;
-    ROBOT_STATE_PKG state{};
-    const errno_t result = robot_->GetRobotRealTimeState(&state);
-    // This is the earliest host-side instant available through SDK 3.9.4: the
-    // public getter copies the most recently received 20004 packet but exposes
-    // no receive callback or receive timestamp.
-    const int64_t receiveNs = hik_sync::getMonotonicRawNs();
-    if (result != 0) {
-        realtimePollTimer_->stop();
+    stopRealtimeReceiving();
+    if (!connected_ || !robot_ || !realtimeReceiver_) return false;
+    realtimeReceiver_->reset();
+    realtimeReceiving_.store(true, std::memory_order_release);
+    const errno_t callbackResult = robot_->SetRobotRealtimeStateCallback(
+        &fairinoRealtimeStateCallback, realtimeReceiver_.get());
+    if (callbackResult != 0) {
+        realtimeReceiving_.store(false, std::memory_order_release);
         emit error(-1, QStringLiteral(
-            "GetRobotRealTimeState 失败，err=%1；实时同步流已停止。").arg(result));
-        return;
+            "注册FR5 20004逐包回调失败，err=%1。").arg(callbackResult));
+        return false;
     }
-    if (haveRealtimeFrame_ && state.frame_cnt == lastRealtimeFrame_) return;
-    haveRealtimeFrame_ = true;
-    lastRealtimeFrame_ = state.frame_cnt;
+    try {
+        realtimeThread_ = std::thread([this] { realtimeConsumerLoop(); });
+    } catch (const std::exception& exception) {
+        (void)robot_->SetRobotRealtimeStateCallback(nullptr, nullptr);
+        realtimeReceiving_.store(false, std::memory_order_release);
+        emit error(-1, QStringLiteral(
+            "启动FR5 SPSC消费线程失败：%1").arg(exception.what()));
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
 
-    hik_sync::RobotSample sample;
-    sample.rawFrameCount = state.frame_cnt;
-    sample.hostReceiveNs = receiveNs;
-    bool controllerTimeValid = false;
-    sample.robotTimestampNs = hik_sync::controllerCalendarToNs(
-        state.robotTime.year, state.robotTime.mouth, state.robotTime.day,
-        state.robotTime.hour, state.robotTime.minute, state.robotTime.second,
-        state.robotTime.millisecond, &controllerTimeValid);
-    sample.hasRobotTimestamp = controllerTimeValid;
-    bool finite = state.frame_head == 0x5A5AU;
-    for (int index = 0; index < 6; ++index) {
-        sample.flangePoseRaw[static_cast<std::size_t>(index)] =
-            state.flange_cur_pos[index];
-        sample.jointPositionDeg[static_cast<std::size_t>(index)] =
-            state.jt_cur_pos[index];
-        sample.actualTcpSpeed[static_cast<std::size_t>(index)] =
-            state.actual_TCP_Speed[index];
-        finite = finite && std::isfinite(state.flange_cur_pos[index]) &&
-                 std::isfinite(state.jt_cur_pos[index]) &&
-                 std::isfinite(state.actual_TCP_Speed[index]);
+void FairinoReadOnlyWorker::stopRealtimeReceiving() {
+#ifdef HAVE_FAIRINO_SDK
+    if (robot_) {
+        // The patched SDK waits for an in-flight callback before unregistering.
+        (void)robot_->SetRobotRealtimeStateCallback(nullptr, nullptr);
     }
-    sample.flangePositionMm = Eigen::Vector3d(
-        state.flange_cur_pos[0], state.flange_cur_pos[1],
-        state.flange_cur_pos[2]);
-    sample.flangeOrientation = hik_sync::fairinoFixedAxisRpyDegrees(
-        state.flange_cur_pos[3], state.flange_cur_pos[4],
-        state.flange_cur_pos[5]);
-    sample.actualLinearSpeedMmS = state.actual_TCP_CmpSpeed[0];
-    finite = finite && std::isfinite(sample.actualLinearSpeedMmS) &&
-             sample.flangeOrientation.coeffs().allFinite();
-    sample.valid = finite;
-    emit robotSampleReady(std::move(sample));
+    realtimeReceiving_.store(false, std::memory_order_release);
+    if (realtimeReceiver_) realtimeReceiver_->condition.notify_all();
+    if (realtimeThread_.joinable() &&
+        realtimeThread_.get_id() != std::this_thread::get_id()) {
+        realtimeThread_.join();
+    }
+    if (realtimeReceiver_) {
+        const uint64_t dropped = realtimeReceiver_->droppedPackets.load(
+            std::memory_order_relaxed);
+        if (dropped > 0U) {
+            emit log(QStringLiteral(
+                "警告：FR5 20004 SPSC队列累计丢包=%1。").arg(dropped));
+        }
+    }
+#endif
+}
+
+void FairinoReadOnlyWorker::realtimeConsumerLoop() {
+#ifdef HAVE_FAIRINO_SDK
+    while (realtimeReceiver_) {
+        FairinoRealtimeReceiverState::Packet packet;
+        if (!realtimeReceiver_->pop(&packet)) {
+            if (!realtimeReceiving_.load(std::memory_order_acquire)) break;
+            std::unique_lock<std::mutex> lock(realtimeReceiver_->waitMutex);
+            realtimeReceiver_->condition.wait_for(
+                lock, std::chrono::milliseconds(100), [this] {
+                    return !realtimeReceiving_.load(std::memory_order_acquire) ||
+                           !realtimeReceiver_->empty();
+                });
+            continue;
+        }
+
+        ROBOT_STATE_PKG getterSnapshot{};
+        const int64_t getterStartNs = hik_sync::getMonotonicRawNs();
+        const errno_t getterResult =
+            robot_->GetRobotRealTimeState(&getterSnapshot);
+        const int64_t getterEndNs = hik_sync::getMonotonicRawNs();
+        const int64_t getterDurationNs = std::max<int64_t>(
+            0, getterEndNs - getterStartNs);
+
+        const ROBOT_STATE_PKG& state = packet.state;
+        hik_sync::RobotSample sample;
+        sample.sdkReceiveSequence = packet.receiveSequence;
+        sample.rawFrameCount = state.frame_cnt;
+        sample.hostReceiveNs = packet.hostReceiveNs;
+        sample.getterDurationNs = getterDurationNs;
+        sample.getterResult = getterResult;
+        bool controllerTimeValid = false;
+        sample.robotTimestampNs = hik_sync::controllerCalendarToNs(
+            state.robotTime.year, state.robotTime.mouth, state.robotTime.day,
+            state.robotTime.hour, state.robotTime.minute, state.robotTime.second,
+            state.robotTime.millisecond, &controllerTimeValid);
+        sample.hasRobotTimestamp = controllerTimeValid;
+        bool finite = state.frame_head == 0x5A5AU &&
+                      packet.hostReceiveNs > 0;
+        for (int index = 0; index < 6; ++index) {
+            sample.flangePoseRaw[static_cast<std::size_t>(index)] =
+                state.flange_cur_pos[index];
+            sample.jointPositionDeg[static_cast<std::size_t>(index)] =
+                state.jt_cur_pos[index];
+            sample.actualTcpSpeed[static_cast<std::size_t>(index)] =
+                state.actual_TCP_Speed[index];
+            finite = finite && std::isfinite(state.flange_cur_pos[index]) &&
+                     std::isfinite(state.jt_cur_pos[index]) &&
+                     std::isfinite(state.actual_TCP_Speed[index]);
+        }
+        sample.flangePositionMm = Eigen::Vector3d(
+            state.flange_cur_pos[0], state.flange_cur_pos[1],
+            state.flange_cur_pos[2]);
+        sample.flangeOrientation = hik_sync::fairinoFixedAxisRpyDegrees(
+            state.flange_cur_pos[3], state.flange_cur_pos[4],
+            state.flange_cur_pos[5]);
+        sample.actualLinearSpeedMmS = state.actual_TCP_CmpSpeed[0];
+        finite = finite && std::isfinite(sample.actualLinearSpeedMmS) &&
+                 sample.flangeOrientation.coeffs().allFinite();
+        sample.valid = finite;
+        emit robotSampleReady(std::move(sample));
+    }
 #endif
 }
