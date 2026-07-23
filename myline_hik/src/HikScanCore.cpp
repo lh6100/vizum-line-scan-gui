@@ -235,12 +235,26 @@ bool appendProfileInBase(const hik_calibration::StaticProfileResult& profile,
                          int profileIndex,
                          std::vector<CloudPoint>* cloud,
                          std::string* error) {
-    if (!cloud || !profile.ok || profile.points.empty() ||
-        !finiteTransform(baseFromFlange) || !finiteTransform(flangeFromCamera)) {
+    if (!finiteTransform(baseFromFlange) || !finiteTransform(flangeFromCamera)) {
         setError("cannot append invalid profile or transform", error);
         return false;
     }
     const cv::Matx44d baseFromCamera = baseFromFlange * flangeFromCamera;
+    return appendProfileUsingBaseFromCamera(
+        profile, baseFromCamera, profileIndex, cloud, error);
+}
+
+bool appendProfileUsingBaseFromCamera(
+        const hik_calibration::StaticProfileResult& profile,
+        const cv::Matx44d& baseFromCamera,
+        int profileIndex,
+        std::vector<CloudPoint>* cloud,
+        std::string* error) {
+    if (!cloud || !profile.ok || profile.points.empty() ||
+        !finiteTransform(baseFromCamera)) {
+        setError("cannot append invalid profile or T_base_camera", error);
+        return false;
+    }
     for (std::size_t index = 0; index < profile.points.size(); ++index) {
         const hik_calibration::StaticProfilePoint& input = profile.points[index];
         const cv::Vec4d camera(input.cameraPointMm.x, input.cameraPointMm.y,

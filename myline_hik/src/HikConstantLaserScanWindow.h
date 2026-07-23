@@ -2,6 +2,7 @@
 #define MYLINE_HIK_HIK_CONSTANT_LASER_SCAN_WINDOW_H
 
 #include "HikCalibrationCore.h"
+#include "HikContinuousReconstruction.h"
 #include "HikScanCore.h"
 #include "HikSynchronizationCore.h"
 
@@ -179,6 +180,7 @@ private:
     bool synchronizationConfigReady_{false};
     QString synchronizationConfigPath_;
     hik_sync::SynchronizationSession synchronizationSession_;
+    hik_scan::ContinuousReconstructionPipeline continuousReconstruction_;
     ContinuousState continuousState_{ContinuousState::Idle};
     bool continuousAbortRequested_{false};
     QString synchronizationSessionDir_;

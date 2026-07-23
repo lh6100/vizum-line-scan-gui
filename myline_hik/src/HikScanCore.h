@@ -64,6 +64,16 @@ bool appendProfileInBase(const hik_calibration::StaticProfileResult& profile,
                          std::vector<CloudPoint>* cloud,
                          std::string* error = 0);
 
+// Continuous acquisition already computes T_base_camera at the exposure
+// midpoint. Use it directly so reconstruction cannot accidentally fall back to
+// a before/after or callback-time robot pose.
+bool appendProfileUsingBaseFromCamera(
+    const hik_calibration::StaticProfileResult& profile,
+    const cv::Matx44d& baseFromCamera,
+    int profileIndex,
+    std::vector<CloudPoint>* cloud,
+    std::string* error = 0);
+
 std::vector<CloudPoint> voxelDownsample(const std::vector<CloudPoint>& cloud,
                                         double voxelSizeMm);
 

@@ -847,6 +847,18 @@ void testConstantLaserScanCore() {
                    nearlyEqual(cloud[0].basePointMm.y, 22.0, 1e-12) &&
                    nearlyEqual(cloud[0].basePointMm.z, 3.0, 1e-12),
                "cloud transform must apply T_base_flange*T_flange_camera");
+    cv::Matx44d exposureMidpointBaseFromCamera = cv::Matx44d::eye();
+    exposureMidpointBaseFromCamera(2, 3) = 40.0;
+    std::vector<hik_scan::CloudPoint> directlyTransformed;
+    CHECK_TRUE(hik_scan::appendProfileUsingBaseFromCamera(
+                   onePointProfile, exposureMidpointBaseFromCamera, 8,
+                   &directlyTransformed, &error),
+               std::string("direct T_base_camera append failed: ") + error);
+    CHECK_TRUE(directlyTransformed.size() == 1 &&
+                   nearlyEqual(directlyTransformed[0].basePointMm.x, 1.0, 1e-12) &&
+                   nearlyEqual(directlyTransformed[0].basePointMm.y, 2.0, 1e-12) &&
+                   nearlyEqual(directlyTransformed[0].basePointMm.z, 43.0, 1e-12),
+               "continuous cloud must use exposure-midpoint T_base_camera directly");
     hik_scan::CloudPoint nearby = cloud.front();
     nearby.basePointMm.x += 0.1;
     cloud.push_back(nearby);

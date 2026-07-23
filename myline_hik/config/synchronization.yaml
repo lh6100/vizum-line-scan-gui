@@ -41,3 +41,5 @@ output:
   output_directory: "./data/scan"
   writer_queue_capacity: 8192
   image_writer_threads: 2
+  reconstruction_queue_capacity: 64
+  reconstruction_threads: 2

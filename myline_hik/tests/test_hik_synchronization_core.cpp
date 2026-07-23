@@ -190,7 +190,9 @@ void testConfigurationAndControllerTime() {
     CHECK_TRUE(near(config.robotPeriodMs, 10.0, 0.0) &&
                near(config.robotExpectedFeedbackPeriodMs, 12.0, 0.0) &&
                near(config.robotWarningGapMs, 18.0, 0.0) &&
-               near(config.robotInvalidGapMs, 25.0, 0.0),
+               near(config.robotInvalidGapMs, 25.0, 0.0) &&
+               config.reconstructionQueueCapacity == 64U &&
+               config.reconstructionThreads == 2U,
                "10 ms CNDE request uses measured 12 ms feedback thresholds");
     std::string error;
     config.scanSpeedMmS = 10.0;

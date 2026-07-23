@@ -58,6 +58,22 @@ target_link_libraries(HikSynchronizationCore PUBLIC
     pthread
 )
 
+add_library(HikContinuousReconstruction
+    src/HikContinuousReconstruction.cpp
+    src/HikContinuousReconstruction.h
+)
+target_include_directories(HikContinuousReconstruction PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(HikContinuousReconstruction PUBLIC
+    HikCalibrationCore
+    HikSynchronizationCore
+    Eigen3::Eigen
+    ${OpenCV_LIBS}
+    pthread
+)
+
 add_library(HikCameraBackend
     src/HikCameraWorker.cpp
     src/HikCameraWorker.h
@@ -116,6 +132,7 @@ target_compile_definitions(HikConstantLaserScan PRIVATE
 )
 target_link_libraries(HikConstantLaserScan PRIVATE
     HikCalibrationCore
+    HikContinuousReconstruction
     HikSynchronizationCore
     HikCameraBackend
     Qt5::Core
@@ -241,3 +258,16 @@ target_link_libraries(HikSynchronizationCoreTest PRIVATE
     Eigen3::Eigen
 )
 add_test(NAME HikSynchronizationCoreTest COMMAND HikSynchronizationCoreTest)
+
+add_executable(HikContinuousReconstructionTest
+    tests/test_hik_continuous_reconstruction.cpp
+)
+target_include_directories(HikContinuousReconstructionTest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(HikContinuousReconstructionTest PRIVATE
+    HikContinuousReconstruction
+    Eigen3::Eigen
+)
+add_test(NAME HikContinuousReconstructionTest
+         COMMAND HikContinuousReconstructionTest)

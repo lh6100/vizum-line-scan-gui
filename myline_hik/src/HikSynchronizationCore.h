@@ -222,6 +222,8 @@ struct SynchronizationConfig {
     std::string outputDirectory{"./data/scan"};
     std::size_t writerQueueCapacity{8192U};
     std::size_t imageWriterThreads{2U};
+    std::size_t reconstructionQueueCapacity{64U};
+    std::size_t reconstructionThreads{2U};
 
     bool validate(std::string* error = nullptr) const;
     static bool loadYaml(const std::string& path,

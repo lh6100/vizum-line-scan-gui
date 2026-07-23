@@ -473,6 +473,8 @@ bool SynchronizationConfig::validate(std::string* error) const {
         !std::isfinite(scanAccelerationMmS2) || scanStableSampleCount < 1 ||
         scanSpeedFilterWindowSamples < scanStableSampleCount ||
         imageWriterThreads < 1U || imageWriterThreads > 16U ||
+        reconstructionQueueCapacity < 1U ||
+        reconstructionThreads < 1U || reconstructionThreads > 16U ||
         writerQueueCapacity < cameraQueueCapacity) {
         return fail("invalid scan/writer synchronization configuration");
     }
@@ -564,6 +566,12 @@ bool SynchronizationConfig::loadYaml(const std::string& path,
         else if (full == "output.output_directory") parsed.outputDirectory = unquote(value);
         else if (full == "output.writer_queue_capacity") ok = parseSize(value, &parsed.writerQueueCapacity);
         else if (full == "output.image_writer_threads") ok = parseSize(value, &parsed.imageWriterThreads);
+        else if (full == "output.reconstruction_queue_capacity") {
+            ok = parseSize(value, &parsed.reconstructionQueueCapacity);
+        }
+        else if (full == "output.reconstruction_threads") {
+            ok = parseSize(value, &parsed.reconstructionThreads);
+        }
         if (!ok) {
             if (error) *error = "invalid value for " + full + " at line " +
                                 std::to_string(lineNumber);
@@ -1249,7 +1257,11 @@ struct SynchronizationSession::Impl {
                 << config.scanSpeedTolerancePercent << ",\n"
                 << "    \"speed_filter_window_samples\": "
                 << config.scanSpeedFilterWindowSamples << ",\n"
-                << "    \"image_writer_threads\": " << config.imageWriterThreads << "\n"
+                << "    \"image_writer_threads\": " << config.imageWriterThreads << ",\n"
+                << "    \"reconstruction_queue_capacity\": "
+                << config.reconstructionQueueCapacity << ",\n"
+                << "    \"reconstruction_threads\": "
+                << config.reconstructionThreads << "\n"
                 << "  },\n"
                 << "  \"actual_camera_device_fps\": " << snapshot.actualCameraFps << ",\n"
                 << "  \"accepted_camera_callback_fps\": "

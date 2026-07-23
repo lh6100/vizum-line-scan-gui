@@ -134,13 +134,16 @@ HikConstantLaserScanWindow::HikConstantLaserScanWindow(
     if (synchronizationConfigReady_) {
         appendLog(QStringLiteral(
             "同步配置已加载：%1；目标=%2 fps，曝光=%3 us，扫描速度=%4 mm/s，"
-            "CNDE请求周期=%5 ms，预期实际反馈周期=%6 ms。")
+            "CNDE请求周期=%5 ms，预期实际反馈周期=%6 ms；"
+            "连续重建线程=%7、非阻塞队列=%8。")
             .arg(synchronizationConfigPath_)
             .arg(synchronizationConfig_.cameraTargetFps, 0, 'f', 3)
             .arg(synchronizationConfig_.cameraExposureUs, 0, 'f', 3)
             .arg(synchronizationConfig_.scanSpeedMmS, 0, 'f', 3)
             .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3)
-            .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3));
+            .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3)
+            .arg(synchronizationConfig_.reconstructionThreads)
+            .arg(synchronizationConfig_.reconstructionQueueCapacity));
     } else {
         appendLog(QStringLiteral("同步配置不可用：%1")
             .arg(QString::fromStdString(synchronizationError)));
@@ -510,6 +513,12 @@ void HikConstantLaserScanWindow::shutdownWorkers() {
                                   Qt::BlockingQueuedConnection);
     }
     synchronizationSession_.stop();
+    if (continuousReconstruction_.running()) {
+        hik_scan::ContinuousReconstructionStatistics ignoredStatistics;
+        std::string ignoredError;
+        (void)continuousReconstruction_.stopAndSave(
+            &ignoredStatistics, &ignoredError);
+    }
     continuousState_ = ContinuousState::Idle;
     if (robotWorker_ && robotThread_.isRunning()) {
         QMetaObject::invokeMethod(robotWorker_, "disconnectRobot", Qt::BlockingQueuedConnection);
@@ -908,6 +917,8 @@ void HikConstantLaserScanWindow::startContinuousScan() {
     }
     synchronizationConfig_.scanSpeedMmS = scanSpeedSpin_->value();
     synchronizationConfig_.cameraExposureUs = exposureSpin_->value();
+    profileOptions_.reconstruction.maxLineRmsMm =
+        lineRmsLimitSpin_->value();
     std::string validationError;
     if (!synchronizationConfig_.validate(&validationError)) {
         showError(QStringLiteral("同步参数无效"),
@@ -980,6 +991,36 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
         if (error) *error = QString::fromStdString(coreError);
         return false;
     }
+    hik_scan::ContinuousReconstructionOptions reconstructionOptions;
+    reconstructionOptions.queueCapacity =
+        synchronizationConfig_.reconstructionQueueCapacity;
+    reconstructionOptions.workerThreads =
+        synchronizationConfig_.reconstructionThreads;
+    reconstructionOptions.voxelSizeMm = voxelSpin_->value();
+    reconstructionOptions.outputDirectory =
+        localPath(synchronizationSessionDir_);
+    reconstructionOptions.intrinsicsSha256 =
+        localPath(intrinsicsSha256_);
+    reconstructionOptions.laserPlaneSha256 =
+        localPath(laserPlaneSha256_);
+    reconstructionOptions.handEyeSha256 =
+        localPath(handEyeSha256_);
+    if (!continuousReconstruction_.start(
+            reconstructionOptions, intrinsics_, laserPlane_,
+            profileOptions_, &coreError)) {
+        synchronizationSession_.stop();
+        if (error) {
+            *error = QStringLiteral("连续点云后台流水线启动失败：%1")
+                .arg(QString::fromStdString(coreError));
+        }
+        return false;
+    }
+    synchronizationSession_.setSynchronizedFrameCallback(
+        [this](const hik_sync::SynchronizedFrame& frame) {
+            // Deliberately best-effort and non-blocking. Reconstruction queue
+            // pressure must never propagate to camera or FR5 receive threads.
+            (void)continuousReconstruction_.tryEnqueue(frame);
+        });
     const double spacing = synchronizationConfig_.scanSpeedMmS /
                            synchronizationConfig_.cameraTargetFps;
     const double motionDuringExposure = synchronizationConfig_.scanSpeedMmS *
@@ -988,7 +1029,8 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
         "同步会话=%1；相机初始模式=HOST_CALLBACK_FALLBACK（设备映射稳定后自动切换）；"
         "机器人初始实际模式=HOST_RECEIVE、请求模式=%2（拟合稳定后自动切换）；"
         "CNDE请求周期=%3 ms、预期实际反馈周期=%4 ms；"
-        "理论线间距=%5 mm/帧；曝光运动量=%6 mm；PNG并行写线程=%7。")
+        "理论线间距=%5 mm/帧；曝光运动量=%6 mm；PNG并行写线程=%7；"
+        "连续重建线程=%8、非阻塞队列=%9。")
         .arg(synchronizationSessionDir_)
         .arg(QString::fromLatin1(hik_sync::robotTimeModeName(
             synchronizationConfig_.robotTimeMode)))
@@ -996,7 +1038,9 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
         .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3)
         .arg(spacing, 0, 'f', 6)
         .arg(motionDuringExposure, 0, 'f', 6)
-        .arg(synchronizationConfig_.imageWriterThreads));
+        .arg(synchronizationConfig_.imageWriterThreads)
+        .arg(synchronizationConfig_.reconstructionThreads)
+        .arg(synchronizationConfig_.reconstructionQueueCapacity));
     return true;
 }
 
@@ -1077,6 +1121,16 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
     const QString mode = sessionStarted
         ? QString::fromStdString(synchronizationSession_.clockModeDescription())
         : QStringLiteral("同步会话未启动");
+    hik_scan::ContinuousReconstructionStatistics reconstructionStats;
+    std::string reconstructionError;
+    bool cloudSaved = false;
+    if (continuousReconstruction_.running()) {
+        scanStatusLabel_->setText(QStringLiteral(
+            "同步数据已清空，正在等待后台条纹重建完成并保存连续点云……"));
+        appendLog(scanStatusLabel_->text());
+        cloudSaved = continuousReconstruction_.stopAndSave(
+            &reconstructionStats, &reconstructionError);
+    }
     continuousState_ = ContinuousState::Idle;
     pendingMotionRequestId_ = -1;
     safetyConfirmCheck_->setChecked(false);
@@ -1092,6 +1146,43 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
         .arg(stats.imageFramesWritten).arg(stats.imageWriteFailures)
         .arg(stats.writerQueueOverflows).arg(mode, synchronizationSessionDir_));
     appendLog(QStringLiteral("%1；%2").arg(scanStatusLabel_->text(), reason));
+    if (reconstructionStats.synchronizedFramesSeen > 0U) {
+        appendLog(QStringLiteral(
+            "连续点云：seen=%1，sync_invalid_skip=%2，reconstructed=%3，"
+            "reconstruct_fail=%4，line_quality_warning=%5，"
+            "missing_image_skip=%6，invalid_transform_skip=%7，"
+            "queue_full_drop=%8，queue_contention_drop=%9，"
+            "reconstruct_mean=%10 ms，max=%11 ms，"
+            "raw_points=%12，voxel_points=%13；raw=%14；voxel=%15。")
+            .arg(reconstructionStats.synchronizedFramesSeen)
+            .arg(reconstructionStats.invalidSyncFramesSkipped)
+            .arg(reconstructionStats.reconstructedFrames)
+            .arg(reconstructionStats.reconstructionFailures)
+            .arg(reconstructionStats.lineQualityWarnings)
+            .arg(reconstructionStats.missingImageFramesSkipped)
+            .arg(reconstructionStats.invalidTransformFramesSkipped)
+            .arg(reconstructionStats.queueFullDrops)
+            .arg(reconstructionStats.queueContentionDrops)
+            .arg(reconstructionStats.meanReconstructionMs, 0, 'f', 3)
+            .arg(reconstructionStats.maximumReconstructionMs, 0, 'f', 3)
+            .arg(reconstructionStats.rawPointCount)
+            .arg(reconstructionStats.voxelPointCount)
+            .arg(QString::fromStdString(reconstructionStats.rawPlyPath))
+            .arg(QString::fromStdString(reconstructionStats.voxelPlyPath)));
+        if (!cloudSaved) {
+            appendLog(QStringLiteral("警告：连续点云保存未完整成功：%1；详情=%2")
+                .arg(QString::fromStdString(reconstructionError),
+                     QString::fromStdString(reconstructionStats.detailCsvPath)));
+        }
+        if (reconstructionStats.queueFullDrops > 0U ||
+            reconstructionStats.queueContentionDrops > 0U) {
+            appendLog(QStringLiteral(
+                "警告：连续重建采用非阻塞丢弃策略，共跳过%1帧；"
+                "相机采集、FR5接收、同步CSV和原图保存未被反压。")
+                .arg(reconstructionStats.queueFullDrops +
+                     reconstructionStats.queueContentionDrops));
+        }
+    }
     if (stats.actualCameraFps > 0.0 &&
         std::abs(stats.actualCameraFps - synchronizationConfig_.cameraTargetFps) >
             synchronizationConfig_.cameraTargetFps * 0.05) {
