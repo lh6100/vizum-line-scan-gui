@@ -1,0 +1,31 @@
+schema_version: 1
+
+# Fairino's official FR5 URDF uses wrist3_link as its terminal moving link and
+# does not declare a separate fixed flange/tool0 frame. The controller and
+# hand-eye calibration use its reported physical flange frame. Identity is
+# only a temporary candidate until those two frame conventions are verified.
+wrist3_to_reported_flange:
+  verified: false
+  transform_convention: "T_parent_child maps child coordinates into parent coordinates"
+  parent_frame: "wrist3_link"
+  child_frame: "fairino_flange_reported"
+  translation_unit: m
+  matrix_row_major: [1, 0, 0, 0,
+                     0, 1, 0, 0,
+                     0, 0, 1, 0,
+                     0, 0, 0, 1]
+
+camera:
+  # MV-CS016-10GM pixel pitch. Together with calibrated fx/fy this produces
+  # the physical USD focal/aperture scale; image FOV still comes from K.
+  pixel_size_um: 3.45
+  clipping_range_m: [0.05, 3.0]
+
+laser_plane_visualization:
+  half_width_m: 0.30
+
+simulation:
+  # This output is a directly launchable standalone scene, not a robot asset
+  # intended to be referenced from another scene containing its own PhysicsScene.
+  time_codes_per_second: 60
+  gravity_m_s2: 9.81

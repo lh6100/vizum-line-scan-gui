@@ -18,6 +18,7 @@ ui_*.h
 
 # Runtime output
 data/
+isaacSim/generated/
 SDK/fairino-cpp-sdk-3.9.4/
 SDK/*.zip
 SDK/DetectLaser_3.6.20.116_Windows&Linux&ARM/
