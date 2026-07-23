@@ -10,13 +10,14 @@ camera:
 
 robot:
   cn_de_period_ms: 10.0
+  expected_feedback_period_ms: 12.0
   pose_buffer_duration_s: 5.0
   queue_capacity: 2048
   time_mode: controller_timestamp
-  normal_gap_min_ms: 8.0
-  normal_gap_max_ms: 12.0
-  warning_gap_ms: 15.0
-  invalid_gap_ms: 20.0
+  normal_gap_min_ms: 10.0
+  normal_gap_max_ms: 14.0
+  warning_gap_ms: 18.0
+  invalid_gap_ms: 25.0
   bracket_wait_timeout_ms: 50
 
 scan:

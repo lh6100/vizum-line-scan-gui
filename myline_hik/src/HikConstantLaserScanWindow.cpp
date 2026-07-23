@@ -133,12 +133,14 @@ HikConstantLaserScanWindow::HikConstantLaserScanWindow(
     setupWorkers();
     if (synchronizationConfigReady_) {
         appendLog(QStringLiteral(
-            "同步配置已加载：%1；目标=%2 fps，曝光=%3 us，扫描速度=%4 mm/s，机器人周期=%5 ms。")
+            "同步配置已加载：%1；目标=%2 fps，曝光=%3 us，扫描速度=%4 mm/s，"
+            "CNDE请求周期=%5 ms，预期实际反馈周期=%6 ms。")
             .arg(synchronizationConfigPath_)
             .arg(synchronizationConfig_.cameraTargetFps, 0, 'f', 3)
             .arg(synchronizationConfig_.cameraExposureUs, 0, 'f', 3)
             .arg(synchronizationConfig_.scanSpeedMmS, 0, 'f', 3)
-            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3));
+            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3));
     } else {
         appendLog(QStringLiteral("同步配置不可用：%1")
             .arg(QString::fromStdString(synchronizationError)));
@@ -985,10 +987,13 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
     appendLog(QStringLiteral(
         "同步会话=%1；相机初始模式=HOST_CALLBACK_FALLBACK（设备映射稳定后自动切换）；"
         "机器人初始实际模式=HOST_RECEIVE、请求模式=%2（拟合稳定后自动切换）；"
-        "理论线间距=%3 mm/帧；曝光运动量=%4 mm；PNG并行写线程=%5。")
+        "CNDE请求周期=%3 ms、预期实际反馈周期=%4 ms；"
+        "理论线间距=%5 mm/帧；曝光运动量=%6 mm；PNG并行写线程=%7。")
         .arg(synchronizationSessionDir_)
         .arg(QString::fromLatin1(hik_sync::robotTimeModeName(
             synchronizationConfig_.robotTimeMode)))
+        .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3)
+        .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3)
         .arg(spacing, 0, 'f', 6)
         .arg(motionDuringExposure, 0, 'f', 6)
         .arg(synchronizationConfig_.imageWriterThreads));
@@ -1120,16 +1125,27 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
         .arg(stats.robotGetterP99Us, 0, 'f', 3)
         .arg(stats.robotGetterMaximumUs, 0, 'f', 3)
         .arg(stats.robotGetterErrors));
-    const double requestedRobotHz = 1000.0 / synchronizationConfig_.robotPeriodMs;
+    const double expectedRobotHz =
+        1000.0 / synchronizationConfig_.robotExpectedFeedbackPeriodMs;
     if (stats.actualRobotHz > 0.0 &&
-        std::abs(stats.actualRobotHz - requestedRobotHz) > requestedRobotHz * 0.10) {
+        std::abs(stats.actualRobotHz - expectedRobotHz) > expectedRobotHz * 0.10) {
         appendLog(QStringLiteral(
-            "警告：FR5 20004完整包实测=%1 Hz，与请求周期 %2 ms（%3 Hz）偏差超过 10%；"
+            "警告：FR5 20004完整包实测=%1 Hz，与预期实际反馈周期 %2 ms（%3 Hz）"
+            "偏差超过 10%；CNDE请求周期=%4 ms；"
             "到达时刻来自SDK RecvPkg成功返回处的 CLOCK_MONOTONIC_RAW；"
             "frame_cnt仅作控制器内部计数诊断。")
             .arg(stats.actualRobotHz, 0, 'f', 3)
-            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3)
-            .arg(requestedRobotHz, 0, 'f', 3));
+            .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3)
+            .arg(expectedRobotHz, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3));
+    } else if (stats.actualRobotHz > 0.0) {
+        appendLog(QStringLiteral(
+            "FR5 20004完整包实测=%1 Hz，符合当前控制器预期实际反馈周期 %2 ms"
+            "（%3 Hz）；CNDE请求周期=%4 ms，frame_cnt仅作诊断。")
+            .arg(stats.actualRobotHz, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotExpectedFeedbackPeriodMs, 0, 'f', 3)
+            .arg(expectedRobotHz, 0, 'f', 3)
+            .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3));
     }
     continuousAbortRequested_ = false;
     updateUi();

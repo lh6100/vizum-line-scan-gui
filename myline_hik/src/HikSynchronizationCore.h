@@ -132,6 +132,7 @@ enum class SyncQuality {
     VALID,
     ROBOT_DATA_NOT_READY,
     ROBOT_BRACKET_NOT_FOUND,
+    ROBOT_PACKET_SEQUENCE_GAP,
     ROBOT_GAP_TOO_LARGE,
     CAMERA_TIMESTAMP_INVALID,
     CAMERA_FRAME_DROPPED,
@@ -154,6 +155,8 @@ struct SynchronizedFrame {
 
     uint64_t robotSequenceBefore{0};
     uint64_t robotSequenceAfter{0};
+    uint64_t robotSdkSequenceBefore{0};
+    uint64_t robotSdkSequenceAfter{0};
     int64_t robotTimeBeforeNs{0};
     int64_t robotTimeAfterNs{0};
     double interpolationAlpha{0.0};
@@ -190,13 +193,14 @@ struct SynchronizationConfig {
     double cameraMappingMaxResidualUs{2000.0};
 
     double robotPeriodMs{10.0};
+    double robotExpectedFeedbackPeriodMs{12.0};
     double robotPoseBufferDurationS{5.0};
     std::size_t robotQueueCapacity{2048U};
     RobotTimeMode robotTimeMode{RobotTimeMode::ControllerTimestamp};
-    double robotNormalGapMinMs{8.0};
-    double robotNormalGapMaxMs{12.0};
-    double robotWarningGapMs{15.0};
-    double robotInvalidGapMs{20.0};
+    double robotNormalGapMinMs{10.0};
+    double robotNormalGapMaxMs{14.0};
+    double robotWarningGapMs{18.0};
+    double robotInvalidGapMs{25.0};
     int robotBracketWaitTimeoutMs{50};
 
     double scanSpeedMmS{10.0};

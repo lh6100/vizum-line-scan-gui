@@ -187,6 +187,11 @@ void testConfigurationAndControllerTime() {
     hik_sync::SynchronizationConfig config;
     CHECK_TRUE(config.robotTimeMode == hik_sync::RobotTimeMode::ControllerTimestamp,
                "controller RobotTime is the default robot clock");
+    CHECK_TRUE(near(config.robotPeriodMs, 10.0, 0.0) &&
+               near(config.robotExpectedFeedbackPeriodMs, 12.0, 0.0) &&
+               near(config.robotWarningGapMs, 18.0, 0.0) &&
+               near(config.robotInvalidGapMs, 25.0, 0.0),
+               "10 ms CNDE request uses measured 12 ms feedback thresholds");
     std::string error;
     config.scanSpeedMmS = 10.0;
     CHECK_TRUE(config.validate(&error), "minimum scan speed accepted");
@@ -358,6 +363,122 @@ void testRobotPacketsDoNotDependOnFrameCounter() {
     std::filesystem::remove_all(output, removeError);
 }
 
+void testSdkPacketSequenceGapInvalidatesInterpolation() {
+    hik_sync::SynchronizationConfig config;
+    config.robotTimeMode = hik_sync::RobotTimeMode::HostReceive;
+    config.saveImages = false;
+    config.saveRobotRawCsv = false;
+    config.saveCameraRawCsv = false;
+    config.saveSyncCsv = false;
+    const std::filesystem::path output = std::filesystem::temp_directory_path() /
+        ("hik_sync_sequence_quality_test_" +
+         std::to_string(hik_sync::getMonotonicRawNs()));
+
+    hik_sync::SynchronizationSession session;
+    std::string error;
+    CHECK_TRUE(session.start(config, output.string(), nullptr, &error),
+               std::string("sequence-quality session starts: ") + error);
+    std::mutex outputMutex;
+    std::vector<hik_sync::SynchronizedFrame,
+                Eigen::aligned_allocator<hik_sync::SynchronizedFrame>> synchronized;
+    session.setSynchronizedFrameCallback(
+        [&outputMutex, &synchronized](const hik_sync::SynchronizedFrame& frame) {
+            std::lock_guard<std::mutex> lock(outputMutex);
+            synchronized.push_back(frame);
+        });
+
+    const int64_t base = hik_sync::getMonotonicRawNs() + 100000000LL;
+    const std::array<uint64_t, 3> receiveSequences{{1U, 2U, 4U}};
+    for (std::size_t index = 0; index < receiveSequences.size(); ++index) {
+        hik_sync::RobotSample robot = sampleAt(
+            static_cast<uint64_t>(index + 1U),
+            base + static_cast<int64_t>(index) * 12000000LL,
+            static_cast<double>(index), 10.0);
+        robot.sdkReceiveSequence = receiveSequences[index];
+        session.pushRobot(robot);
+    }
+
+    hik_sync::CameraFrame camera;
+    camera.frameId = 1U;
+    camera.hostCallbackNs = base + 18000000LL + 1000000LL;
+    camera.exposureUs = 2000.0;
+    session.pushCamera(camera);
+    session.stop();
+
+    CHECK_TRUE(synchronized.size() == 1U,
+               "sequence-quality camera frame produces one association");
+    if (synchronized.size() == 1U) {
+        const hik_sync::SynchronizedFrame& frame = synchronized.front();
+        CHECK_TRUE(frame.robotSdkSequenceBefore == 2U &&
+                   frame.robotSdkSequenceAfter == 4U,
+                   "bracketing SDK packet sequences are retained");
+        CHECK_TRUE(
+            frame.quality == hik_sync::SyncQuality::ROBOT_PACKET_SEQUENCE_GAP,
+            "non-contiguous SDK packet sequence invalidates interpolation");
+    }
+    std::error_code removeError;
+    std::filesystem::remove_all(output, removeError);
+}
+
+void testContiguousSdkPacketsAllow21MsControllerGap() {
+    hik_sync::SynchronizationConfig config;
+    config.robotTimeMode = hik_sync::RobotTimeMode::HostReceive;
+    config.saveImages = false;
+    config.saveRobotRawCsv = false;
+    config.saveCameraRawCsv = false;
+    config.saveSyncCsv = false;
+    const std::filesystem::path output = std::filesystem::temp_directory_path() /
+        ("hik_sync_contiguous_gap_test_" +
+         std::to_string(hik_sync::getMonotonicRawNs()));
+
+    hik_sync::SynchronizationSession session;
+    std::string error;
+    CHECK_TRUE(session.start(config, output.string(), nullptr, &error),
+               std::string("contiguous-gap session starts: ") + error);
+    std::mutex outputMutex;
+    std::vector<hik_sync::SynchronizedFrame,
+                Eigen::aligned_allocator<hik_sync::SynchronizedFrame>> synchronized;
+    session.setSynchronizedFrameCallback(
+        [&outputMutex, &synchronized](const hik_sync::SynchronizedFrame& frame) {
+            std::lock_guard<std::mutex> lock(outputMutex);
+            synchronized.push_back(frame);
+        });
+
+    const int64_t base = hik_sync::getMonotonicRawNs() + 100000000LL;
+    int64_t timestamp = base;
+    for (uint64_t index = 0U; index <= 21U; ++index) {
+        if (index > 0U) timestamp += index == 21U ? 21000000LL : 12000000LL;
+        const double xMm = 10.0 * static_cast<double>(timestamp - base) / 1.0e9;
+        hik_sync::RobotSample robot = sampleAt(index + 1U, timestamp, xMm, 10.0);
+        robot.sdkReceiveSequence = index + 1U;
+        session.pushRobot(robot);
+    }
+
+    const int64_t gapStart = base + 20LL * 12000000LL;
+    const int64_t exposureMidpoint = gapStart + 10500000LL;
+    hik_sync::CameraFrame camera;
+    camera.frameId = 1U;
+    camera.hostCallbackNs = exposureMidpoint + 1000000LL;
+    camera.exposureUs = 2000.0;
+    session.pushCamera(camera);
+    session.stop();
+
+    CHECK_TRUE(synchronized.size() == 1U,
+               "21 ms contiguous-gap camera frame produces one association");
+    if (synchronized.size() == 1U) {
+        const hik_sync::SynchronizedFrame& frame = synchronized.front();
+        CHECK_TRUE(frame.robotSdkSequenceBefore == 21U &&
+                   frame.robotSdkSequenceAfter == 22U,
+                   "21 ms gap retains contiguous SDK packet sequences");
+        CHECK_TRUE(near(frame.robotGapMs, 21.0, 1e-9),
+                   "controller gap is measured as 21 ms");
+        CHECK_TRUE(frame.quality == hik_sync::SyncQuality::VALID,
+                   "contiguous 21 ms controller gap remains valid below 25 ms");
+    }
+    std::error_code removeError;
+    std::filesystem::remove_all(output, removeError);
+}
+
 }  // namespace
 
 int main() {
@@ -370,6 +491,8 @@ int main() {
     testConfigurationAndControllerTime();
     testSyntheticPipeline();
     testRobotPacketsDoNotDependOnFrameCounter();
+    testSdkPacketSequenceGapInvalidatesInterpolation();
+    testContiguousSdkPacketsAllow21MsControllerGap();
     if (failures != 0) {
         std::cerr << failures << " synchronization test(s) failed\n";
         return 1;

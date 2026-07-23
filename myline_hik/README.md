@@ -556,7 +556,7 @@ FR5 SDK 20004 RecvPkg → CLOCK_MONOTONIC_RAW逐包时间戳 → SPSC队列
 独立元数据 WriterThread → robot_raw.csv、camera_raw.csv、session_summary.json
 ```
 
-同步配置在 `config/synchronization.yaml`。电脑侧同步时间全部来自 `CLOCK_MONOTONIC_RAW`；UTC 日期只用于会话摘要和目录名。默认相机 60 fps、曝光 1825 μs、机器人反馈请求周期 10 ms（100 Hz），环形缓冲为 2048 条且至少覆盖 5 秒。同步会话在机器人到达扫描起点后才创建，避免把移到起点的长时间运动混入连续扫描统计。
+同步配置在 `config/synchronization.yaml`。电脑侧同步时间全部来自 `CLOCK_MONOTONIC_RAW`；UTC 日期只用于会话摘要和目录名。默认相机 60 fps、曝光 1825 μs，FR5 CNDE 请求周期保持 10 ms；当前控制器经逐包实测的正常反馈周期是约 12 ms（83.3 Hz），由独立的 `robot.expected_feedback_period_ms` 表达。环形缓冲为 2048 条且至少覆盖 5 秒。同步会话在机器人到达扫描起点后才创建，避免把移到起点的长时间运动混入连续扫描统计。
 
 ### 15.1 SDK 字段和当前可确认边界
 
@@ -583,7 +583,7 @@ FR5 路径实际使用：
 SDK逐包序号是判断回调/SPSC链路是否缺包的依据；`GetRobotRealTimeState()` 只作为
 互斥一致快照和阻塞耗时诊断，不再承担新包检测。
 
-`robot.time_mode` 默认 `controller_timestamp`：将控制器 `robotTime` 仿射映射到主机单调时钟，拟合稳定前自动使用 `HOST_RECEIVE`。`frame_cnt` 只作为循环计数诊断字段；它的跳变不再直接判定同步无效，真正的数据缺口由相邻位姿的时间间隔和 `ROBOT_GAP_TOO_LARGE` 判定。
+`robot.time_mode` 默认 `controller_timestamp`：将控制器 `robotTime` 仿射映射到主机单调时钟，拟合稳定前自动使用 `HOST_RECEIVE`。`frame_cnt` 只作为循环计数诊断字段，它的跳变不直接判定同步无效。前后位姿样本的 SDK 逐包序号必须连续，否则标为 `ROBOT_PACKET_SEQUENCE_GAP`；序号连续时再按时间跨度判断，超过 25 ms 才标为 `ROBOT_GAP_TOO_LARGE`。默认正常接收间隔按 10–14 ms 识别，主机接收间隔超过 18 ms 才告警。因此控制器偶发 `robotTime` 跨 21 ms、但SDK序号连续的样本仍可在恒速段合理插值。
 
 FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单位 deg。工程沿用已有手眼标定约定：`R = Rz(rz) * Ry(ry) * Rx(rx)`，先转四元数再做 SLERP，不线性插值欧拉角。
 
@@ -610,7 +610,7 @@ FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单�
 
 - `robot_raw.csv`：SDK逐包序号、原始及展开后的 `frame_cnt`、`RecvPkg`成功返回时刻、getter耗时/结果、控制器时刻、法兰、关节、原始/滤波/位置拟合速度和运动阶段；
 - `camera_raw.csv`：FrameID、设备 raw/ns 时间戳、回调时刻、曝光、尺寸、连续性、图片名和写盘入队状态；
-- `synchronization.csv`：曝光中点、前后状态、alpha、间隔、插值四元数、原始/滤波速度、运动阶段和质量；
+- `synchronization.csv`：曝光中点、前后状态、alpha、间隔、插值四元数、原始/滤波速度、运动阶段、前后SDK逐包序号和质量；
 - `session_summary.json`：设备帧率、软件接受帧率、20004完整包频率、SDK逐包序号/frame_cnt诊断、getter平均/P99/最大耗时、队列溢出、有效帧和相机/机器人时钟拟合残差；
 - `images/frame_<FrameID>.png`：默认由 2 个独立后台线程以 PNG 压缩级别 1 保存的 Mono8 原图。
 
@@ -621,7 +621,7 @@ column -s, -t < data/scan/sync_scan_*/synchronization.csv | less -S
 awk -F, 'NR==1 || $20 != "VALID"' data/scan/sync_scan_*/synchronization.csv
 ```
 
-`actual_camera_device_fps` 由设备时间戳和 FrameID 跨度计算，`accepted_camera_callback_fps` 表示软件实际接受吞吐。`camera_raw.csv` 的 `frame_id_continuous=0`，或摘要中的 `camera_frame_id_skips/camera_queue_overflows/image_pool_exhaustions/image_queue_overflows` 非零，表示相机链路存在缺图。`robot_receive_sequence_gaps` 才表示SDK回调到SPSC消费链路确实缺少完整包；`robot_frame_counter_skips/robot_frame_counter_duplicates/robot_frame_counter_out_of_order` 仅为控制器内部计数诊断，不参与逐包去重。机器人同步有效性以 `robot_gap_max_ms` 和 `ROBOT_GAP_TOO_LARGE` 为准。加减速段仍保存，但默认标为 `SPEED_NOT_STABLE`，不计入有效建图帧。
+`actual_camera_device_fps` 由设备时间戳和 FrameID 跨度计算，`accepted_camera_callback_fps` 表示软件实际接受吞吐。`camera_raw.csv` 的 `frame_id_continuous=0`，或摘要中的 `camera_frame_id_skips/camera_queue_overflows/image_pool_exhaustions/image_queue_overflows` 非零，表示相机链路存在缺图。`robot_receive_sequence_gaps` 才表示SDK回调到SPSC消费链路确实缺少完整包；`robot_frame_counter_skips/robot_frame_counter_duplicates/robot_frame_counter_out_of_order` 仅为控制器内部计数诊断，不参与逐包去重。机器人同步有效性先检查 `ROBOT_PACKET_SEQUENCE_GAP`，再检查25 ms位姿跨度门槛。83.3 Hz与配置的12 ms预期相符时只打印正常诊断，不再按CNDE请求的100 Hz持续告警。加减速段仍保存，但默认标为 `SPEED_NOT_STABLE`，不计入有效建图帧。
 
 ### 15.4 固定时间偏差标定
 
@@ -654,4 +654,4 @@ cmake --build build --target HikSynchronizationCoreTest -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-仿真覆盖 100 Hz 机器人、60 fps 相机、控制器时间映射、滤波恒速识别、匀速插值、时间缺口、FrameID 跳变和多线程图片写盘，不连接相机或 FR5。
+仿真覆盖 100 Hz 机器人、60 fps 相机、控制器时间映射、滤波恒速识别、匀速插值、时间缺口、SDK逐包序号断档、FrameID 跳变和多线程图片写盘，不连接相机或 FR5。

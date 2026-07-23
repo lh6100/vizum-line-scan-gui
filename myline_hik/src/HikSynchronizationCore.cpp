@@ -396,6 +396,7 @@ const char* syncQualityName(SyncQuality quality) {
     case SyncQuality::VALID: return "VALID";
     case SyncQuality::ROBOT_DATA_NOT_READY: return "ROBOT_DATA_NOT_READY";
     case SyncQuality::ROBOT_BRACKET_NOT_FOUND: return "ROBOT_BRACKET_NOT_FOUND";
+    case SyncQuality::ROBOT_PACKET_SEQUENCE_GAP: return "ROBOT_PACKET_SEQUENCE_GAP";
     case SyncQuality::ROBOT_GAP_TOO_LARGE: return "ROBOT_GAP_TOO_LARGE";
     case SyncQuality::CAMERA_TIMESTAMP_INVALID: return "CAMERA_TIMESTAMP_INVALID";
     case SyncQuality::CAMERA_FRAME_DROPPED: return "CAMERA_FRAME_DROPPED";
@@ -451,7 +452,8 @@ bool SynchronizationConfig::validate(std::string* error) const {
         cameraQueueCapacity == 0U || cameraClockMappingWindow < 10U) {
         return fail("invalid camera synchronization configuration");
     }
-    if (!(robotPeriodMs > 0.0) || !(robotPoseBufferDurationS >= 5.0) ||
+    if (!(robotPeriodMs > 0.0) || !(robotExpectedFeedbackPeriodMs > 0.0) ||
+        !(robotPoseBufferDurationS >= 5.0) ||
         robotBracketWaitTimeoutMs < 1 ||
         robotNormalGapMinMs < 0.0 ||
         robotNormalGapMinMs > robotNormalGapMaxMs ||
@@ -459,10 +461,13 @@ bool SynchronizationConfig::validate(std::string* error) const {
         robotWarningGapMs > robotInvalidGapMs) {
         return fail("invalid robot synchronization configuration");
     }
+    const double capacityPeriodMs =
+        std::min(robotPeriodMs, robotExpectedFeedbackPeriodMs);
     const std::size_t minimumRobotQueueCapacity = static_cast<std::size_t>(
-        std::ceil(robotPoseBufferDurationS * 1000.0 / robotPeriodMs)) + 2U;
+        std::ceil(robotPoseBufferDurationS * 1000.0 / capacityPeriodMs)) + 2U;
     if (robotQueueCapacity < minimumRobotQueueCapacity) {
-        return fail("robot.queue_capacity cannot cover pose_buffer_duration_s at cn_de_period_ms");
+        return fail("robot.queue_capacity cannot cover pose_buffer_duration_s at the "
+                    "configured request/feedback period");
     }
     if (!(scanSpeedTolerancePercent >= 0.0) || !(scanAccelerationMmS2 > 0.0) ||
         !std::isfinite(scanAccelerationMmS2) || scanStableSampleCount < 1 ||
@@ -525,6 +530,9 @@ bool SynchronizationConfig::loadYaml(const std::string& path,
             else if (mode == "callback") parsed.cameraTimestampReference = CameraTimestampReference::Callback;
             else ok = false;
         } else if (full == "robot.cn_de_period_ms") ok = parseDouble(value, &parsed.robotPeriodMs);
+        else if (full == "robot.expected_feedback_period_ms") {
+            ok = parseDouble(value, &parsed.robotExpectedFeedbackPeriodMs);
+        }
         else if (full == "robot.pose_buffer_duration_s") ok = parseDouble(value, &parsed.robotPoseBufferDurationS);
         else if (full == "robot.queue_capacity") ok = parseSize(value, &parsed.robotQueueCapacity);
         else if (full == "robot.normal_gap_min_ms") ok = parseDouble(value, &parsed.robotNormalGapMinMs);
@@ -1062,7 +1070,7 @@ struct SynchronizationSession::Impl {
           cameraMapper(requestedConfig.cameraClockMappingWindow,
                        requestedConfig.cameraMappingMaxResidualUs * 1000.0),
           robotMapper(requestedConfig.robotTimeMode,
-                      requestedConfig.robotPeriodMs),
+                      requestedConfig.robotExpectedFeedbackPeriodMs),
           speedDetector(requestedConfig.scanSpeedMmS,
                         requestedConfig.scanSpeedTolerancePercent,
                         requestedConfig.scanStableSampleCount,
@@ -1125,6 +1133,8 @@ struct SynchronizationSession::Impl {
                 } else {
                     output.robotSequenceBefore = before.sequence;
                     output.robotSequenceAfter = after.sequence;
+                    output.robotSdkSequenceBefore = before.sdkReceiveSequence;
+                    output.robotSdkSequenceAfter = after.sdkReceiveSequence;
                     output.robotTimeBeforeNs = before.alignedTimestampNs;
                     output.robotTimeAfterNs = after.alignedTimestampNs;
                     output.robotGapMs = static_cast<double>(
@@ -1150,7 +1160,15 @@ struct SynchronizationSession::Impl {
                             output.interpolationAlpha * after.filteredLinearSpeedMmS;
                         output.motionPhase = before.motionPhase == after.motionPhase
                             ? before.motionPhase : MotionPhase::UNSTABLE;
-                        if (output.robotGapMs > config.robotInvalidGapMs) {
+                        const bool sdkSequenceKnown =
+                            output.robotSdkSequenceBefore > 0U &&
+                            output.robotSdkSequenceAfter > 0U;
+                        if (sdkSequenceKnown &&
+                            output.robotSdkSequenceAfter !=
+                                output.robotSdkSequenceBefore + 1U) {
+                            output.quality =
+                                SyncQuality::ROBOT_PACKET_SEQUENCE_GAP;
+                        } else if (output.robotGapMs > config.robotInvalidGapMs) {
                             output.quality = SyncQuality::ROBOT_GAP_TOO_LARGE;
                         } else if (!camera.frameIdContinuous ||
                                    !camera.imageWriteQueued) {
@@ -1209,6 +1227,18 @@ struct SynchronizationSession::Impl {
                 << "    \"camera_timestamp_reference\": \""
                 << cameraTimestampReferenceName(config.cameraTimestampReference) << "\",\n"
                 << "    \"robot_period_ms\": " << config.robotPeriodMs << ",\n"
+                << "    \"robot_cn_de_requested_period_ms\": "
+                << config.robotPeriodMs << ",\n"
+                << "    \"robot_expected_feedback_period_ms\": "
+                << config.robotExpectedFeedbackPeriodMs << ",\n"
+                << "    \"robot_normal_gap_min_ms\": "
+                << config.robotNormalGapMinMs << ",\n"
+                << "    \"robot_normal_gap_max_ms\": "
+                << config.robotNormalGapMaxMs << ",\n"
+                << "    \"robot_warning_gap_ms\": "
+                << config.robotWarningGapMs << ",\n"
+                << "    \"robot_invalid_gap_ms\": "
+                << config.robotInvalidGapMs << ",\n"
                 << "    \"robot_time_mode_requested\": \""
                 << robotTimeModeName(config.robotTimeMode) << "\",\n"
                 << "    \"robot_time_mode_active\": \""
@@ -1339,7 +1369,9 @@ struct SynchronizationSession::Impl {
                         << value.flangeOrientation.z() << ',' << value.flangeOrientation.w() << ','
                         << value.actualScanSpeedMmS << ',' << syncQualityName(value.quality) << ','
                         << value.imageFilename << ',' << value.filteredScanSpeedMmS << ','
-                        << motionPhaseName(value.motionPhase) << '\n';
+                        << motionPhaseName(value.motionPhase) << ','
+                        << value.robotSdkSequenceBefore << ','
+                        << value.robotSdkSequenceAfter << '\n';
             }
             if (++pendingFlush >= 128U) {
                 if (robotCsv) robotCsv.flush();
@@ -1473,7 +1505,8 @@ bool SynchronizationSession::start(const SynchronizationConfig& config,
             "aligned_timestamp_ns,robot_sequence_before,robot_sequence_after,robot_time_before_ns,"
             "robot_time_after_ns,interpolation_alpha,robot_gap_ms,flange_x_mm,flange_y_mm,"
             "flange_z_mm,flange_qx,flange_qy,flange_qz,flange_qw,actual_scan_speed_mm_s,"
-            "sync_quality,image_filename,filtered_scan_speed_mm_s,motion_phase\n";
+            "sync_quality,image_filename,filtered_scan_speed_mm_s,motion_phase,"
+            "robot_sdk_sequence_before,robot_sdk_sequence_after\n";
     }
     created->startUtc = isoUtcNow();
     created->accepting.store(true);
