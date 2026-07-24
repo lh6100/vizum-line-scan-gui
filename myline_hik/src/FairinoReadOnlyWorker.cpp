@@ -16,6 +16,16 @@
 #include <exception>
 #include <mutex>
 
+namespace {
+
+constexpr qint64 kStopConfirmationTimeoutMs = 5000;
+constexpr qint64 kRealtimeFreshnessLimitNs = 500000000LL;
+constexpr int kRequiredStationaryStopSamples = 3;
+constexpr double kStoppedLinearSpeedMmS = 0.10;
+constexpr double kStoppedAngularSpeedDegS = 0.10;
+
+}  // namespace
+
 #ifdef HAVE_FAIRINO_SDK
 class FairinoRealtimeReceiverState {
 public:
@@ -107,14 +117,115 @@ FairinoReadOnlyWorker::FairinoReadOnlyWorker(QObject* parent)
 FairinoReadOnlyWorker::~FairinoReadOnlyWorker() {
 #ifdef HAVE_FAIRINO_SDK
     stopRealtimeReceiving();
-    if (connected_ && robot_) {
+    if (connected_ && robot_ && !motionStopUnconfirmed_) {
         (void)robot_->CloseRPC();
     }
+    // If mechanical stop was not confirmed, deliberately leave the RPC
+    // object untouched until process death instead of calling CloseRPC
+    // before the safety condition has been observed.
     // Fairino 3.9.4 owns detached SDK threads and exposes no join operation.
     // Releasing this one object at process teardown avoids a shutdown-only
     // use-after-free; the operating system reclaims it immediately afterward.
     robot_ = nullptr;
 #endif
+}
+
+void FairinoReadOnlyWorker::beginStopConfirmation(
+        const QString& context) {
+    if (!motionActive_) return;
+    stopConfirmationPending_ = true;
+    stopConfirmationStartMs_ =
+        hik_sync::getMonotonicRawNs() / 1000000LL;
+    {
+        const std::lock_guard<std::mutex> lock(
+            realtimeStopSnapshotMutex_);
+        lastStopSampleReceiveNs_ = latestRealtimeHostReceiveNs_;
+    }
+    stationaryStopSamples_ = 0;
+    if (!motionPollTimer_->isActive()) motionPollTimer_->start();
+    emit log(QStringLiteral(
+        "%1；等待至少 %2 个新鲜 FR5 20004 状态包同时确认 "
+        "motion_done=1、TCP线速度≤%3 mm/s、角速度≤%4 deg/s。")
+        .arg(context)
+        .arg(kRequiredStationaryStopSamples)
+        .arg(kStoppedLinearSpeedMmS, 0, 'f', 2)
+        .arg(kStoppedAngularSpeedDegS, 0, 'f', 2));
+}
+
+bool FairinoReadOnlyWorker::confirmStoppedBlocking(int timeoutMs) {
+#ifndef HAVE_FAIRINO_SDK
+    (void)timeoutMs;
+    return false;
+#else
+    qint64 lastSampleReceiveNs = 0;
+    {
+        const std::lock_guard<std::mutex> lock(
+            realtimeStopSnapshotMutex_);
+        lastSampleReceiveNs = latestRealtimeHostReceiveNs_;
+    }
+    int consecutiveStationarySamples = 0;
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(1, timeoutMs));
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        qint64 sampleReceiveNs = 0;
+        int sampleMotionDone = 0;
+        double sampleLinearSpeed = 0.0;
+        double sampleAngularSpeed = 0.0;
+        {
+            const std::lock_guard<std::mutex> lock(
+                realtimeStopSnapshotMutex_);
+            sampleReceiveNs = latestRealtimeHostReceiveNs_;
+            sampleMotionDone = latestRealtimeMotionDone_;
+            sampleLinearSpeed = latestRealtimeLinearSpeedMmS_;
+            sampleAngularSpeed = latestRealtimeAngularSpeedDegS_;
+        }
+        if (sampleReceiveNs <= lastSampleReceiveNs) continue;
+        lastSampleReceiveNs = sampleReceiveNs;
+        const qint64 nowNs = hik_sync::getMonotonicRawNs();
+        const bool fresh =
+            sampleReceiveNs > 0 && nowNs >= sampleReceiveNs &&
+            nowNs - sampleReceiveNs <= kRealtimeFreshnessLimitNs;
+        const double linearSpeed = std::abs(sampleLinearSpeed);
+        const double angularSpeed = std::abs(sampleAngularSpeed);
+        if (fresh && sampleMotionDone != 0 &&
+            std::isfinite(linearSpeed) &&
+            std::isfinite(angularSpeed) &&
+            linearSpeed <= kStoppedLinearSpeedMmS &&
+            angularSpeed <= kStoppedAngularSpeedDegS) {
+            ++consecutiveStationarySamples;
+            if (consecutiveStationarySamples >=
+                kRequiredStationaryStopSamples) {
+                return true;
+            }
+        } else {
+            consecutiveStationarySamples = 0;
+        }
+    }
+    return false;
+#endif
+}
+
+void FairinoReadOnlyWorker::finishMotion(
+        bool targetReached,
+        bool motionStoppedConfirmed,
+        const QString& description) {
+    motionPollTimer_->stop();
+    const int request = motionRequestId_;
+    motionActive_ = false;
+    motionStopUnconfirmed_ = !motionStoppedConfirmed;
+    stopConfirmationPending_ = false;
+    motionRequestId_ = -1;
+    motionStartMs_ = 0;
+    motionTimeoutMs_ = 0;
+    stopConfirmationStartMs_ = 0;
+    lastStopSampleReceiveNs_ = 0;
+    stationaryStopSamples_ = 0;
+    if (request >= 0) {
+        emit motionFinished(request, targetReached,
+                            motionStoppedConfirmed, description);
+    }
 }
 
 void FairinoReadOnlyWorker::connectRobot(QString ipAddress) {
@@ -130,7 +241,7 @@ void FairinoReadOnlyWorker::connectRobot(QString ipAddress) {
     }
     if (attempted_ || terminal_ || !robot_) {
         emit error(-1, QStringLiteral(
-            "Fairino SDK 本进程已结束一次 RPC 会话，不能安全重连；请关闭并重新启动标定工具。"));
+            "Fairino SDK 本进程已结束一次 RPC 会话，不能安全重连；请关闭并重新启动当前程序。"));
         return;
     }
     attempted_ = true;
@@ -186,15 +297,49 @@ void FairinoReadOnlyWorker::connectRobot(QString ipAddress) {
 
 void FairinoReadOnlyWorker::disconnectRobot() {
 #ifdef HAVE_FAIRINO_SDK
-    stopRealtimeReceiving();
-    if (motionActive_ && robot_) {
-        (void)robot_->StopMotion();
-        motionPollTimer_->stop();
-        motionActive_ = false;
-        emit motionFinished(motionRequestId_, false,
-                            QStringLiteral("断开连接前已发送 StopMotion"));
-        motionRequestId_ = -1;
+    if ((motionActive_ || motionStopUnconfirmed_) && robot_) {
+        const errno_t stopResult = robot_->StopMotion();
+        const bool stoppedConfirmed =
+            stopResult == 0 &&
+            confirmStoppedBlocking(
+                static_cast<int>(kStopConfirmationTimeoutMs));
+        const QString stopDescription =
+            stopResult != 0
+                ? QStringLiteral(
+                      "退出前 StopMotion 失败，err=%1；"
+                      "未关闭 RPC，请使用物理急停")
+                      .arg(stopResult)
+                : stoppedConfirmed
+                    ? QStringLiteral(
+                          "退出前 StopMotion 已由新鲜 20004 状态"
+                          "连续确认机械停止")
+                    : QStringLiteral(
+                          "退出前 StopMotion 已提交，但 %1 ms 内未由"
+                          "新鲜 20004 状态确认机械停止；未关闭 RPC，"
+                          "请使用物理急停")
+                          .arg(kStopConfirmationTimeoutMs);
+        if (motionActive_) {
+            finishMotion(false, stoppedConfirmed,
+                         stopDescription);
+        } else {
+            motionStopUnconfirmed_ = !stoppedConfirmed;
+            emit log(stopDescription);
+        }
+        if (!stoppedConfirmed) {
+            motionPollTimer_->stop();
+            stopRealtimeReceiving();
+            connected_ = false;
+            terminal_ = true;
+            emit connectionChanged(
+                false,
+                QStringLiteral(
+                    "FR5 停止未确认；为避免失去软件停止通道，"
+                    "未调用 CloseRPC，进程将退出"));
+            emit error(-1, stopDescription);
+            return;
+        }
     }
+    stopRealtimeReceiving();
     if (connected_ && robot_) {
         emit busyChanged(true);
         const errno_t result = robot_->CloseRPC();
@@ -273,21 +418,29 @@ void FairinoReadOnlyWorker::moveLinearImpl(
         double speedValue, double accelerationValue,
         int timeoutMs, bool physicalMode) {
 #ifndef HAVE_FAIRINO_SDK
-    emit motionFinished(requestId, false, QStringLiteral("Fairino SDK 不可用。"));
+    emit motionFinished(requestId, false, true,
+                        QStringLiteral("Fairino SDK 不可用。"));
 #else
     if (!connected_ || !robot_) {
-        emit motionFinished(requestId, false, QStringLiteral("FR5 尚未连接。"));
+        emit motionFinished(requestId, false, false,
+                            QStringLiteral("FR5 尚未连接。"));
         return;
     }
-    if (motionActive_) {
-        emit motionFinished(requestId, false, QStringLiteral("已有 MoveL 正在执行。"));
+    if (motionActive_ || motionStopUnconfirmed_) {
+        emit motionFinished(requestId, false, false,
+                            motionActive_
+                                ? QStringLiteral("已有 MoveL 正在执行。")
+                                : QStringLiteral(
+                                      "上一运动尚未确认机械停止；"
+                                      "拒绝新的 MoveL，请使用物理急停并重启程序。"));
         return;
     }
     const double values[] = {xMm, yMm, zMm, rxDeg, ryDeg, rzDeg,
                              speedValue, accelerationValue};
     for (int index = 0; index < 8; ++index) {
         if (!std::isfinite(values[index])) {
-            emit motionFinished(requestId, false, QStringLiteral("MoveL 参数包含非有限数。"));
+            emit motionFinished(requestId, false, true,
+                                QStringLiteral("MoveL 参数包含非有限数。"));
             return;
         }
     }
@@ -298,7 +451,7 @@ void FairinoReadOnlyWorker::moveLinearImpl(
            accelerationValue > 0.0 && accelerationValue <= 50.0);
     if (!motionParametersValid ||
         timeoutMs < 1000 || timeoutMs > 300000) {
-        emit motionFinished(requestId, false, physicalMode
+        emit motionFinished(requestId, false, true, physicalMode
             ? QStringLiteral(
                 "连续扫描限制：物理速度必须在 [10,50] mm/s，加速度在 (0,1000] mm/s²，超时 1–300 s。")
             : QStringLiteral(
@@ -337,14 +490,19 @@ void FairinoReadOnlyWorker::moveLinearImpl(
         }
     }
     if (result != 0) {
-        emit motionFinished(requestId, false,
+        emit motionFinished(requestId, false, true,
                             QStringLiteral("FR5 MoveL/逆解失败，err=%1").arg(result));
         return;
     }
     motionActive_ = true;
+    motionStopUnconfirmed_ = true;
+    stopConfirmationPending_ = false;
     motionRequestId_ = requestId;
     motionStartMs_ = hik_sync::getMonotonicRawNs() / 1000000LL;
     motionTimeoutMs_ = timeoutMs;
+    stopConfirmationStartMs_ = 0;
+    lastStopSampleReceiveNs_ = 0;
+    stationaryStopSamples_ = 0;
     motionPollTimer_->start();
     emit motionStarted(requestId, physicalMode
         ? QStringLiteral(
@@ -358,21 +516,56 @@ void FairinoReadOnlyWorker::moveLinearImpl(
 
 void FairinoReadOnlyWorker::stopMotion(int requestId) {
 #ifndef HAVE_FAIRINO_SDK
-    emit motionFinished(requestId, false, QStringLiteral("Fairino SDK 不可用。"));
+    emit motionFinished(requestId, false, false,
+                        QStringLiteral("Fairino SDK 不可用，无法确认停止。"));
 #else
     if (!connected_ || !robot_) {
-        emit motionFinished(requestId, false, QStringLiteral("FR5 尚未连接，无法软件停止。"));
+        if (motionActive_) {
+            finishMotion(false, false,
+                         QStringLiteral(
+                             "FR5 尚未连接，无法发送 StopMotion 或确认机械停止。"));
+        } else {
+            emit motionFinished(
+                requestId, false, false,
+                QStringLiteral("FR5 尚未连接，无法软件停止。"));
+        }
+        return;
+    }
+    if (stopConfirmationPending_) {
+        emit log(QStringLiteral(
+            "StopMotion 已提交，正在等待机械停止确认；忽略重复停止请求。"));
         return;
     }
     const errno_t result = robot_->StopMotion();
     if (motionActive_) {
-        motionPollTimer_->stop();
-        const int activeRequest = motionRequestId_;
-        motionActive_ = false;
-        motionRequestId_ = -1;
-        emit motionFinished(activeRequest, false,
-                            result == 0 ? QStringLiteral("用户已发送 StopMotion")
-                                        : QStringLiteral("StopMotion 失败，err=%1；请使用物理急停").arg(result));
+        if (result != 0) {
+            finishMotion(
+                false, false,
+                QStringLiteral("StopMotion 失败，err=%1；请使用物理急停")
+                    .arg(result));
+        } else {
+            beginStopConfirmation(QStringLiteral(
+                "控制器已接受 StopMotion 请求"));
+        }
+    } else if (motionStopUnconfirmed_) {
+        const bool stoppedConfirmed =
+            result == 0 &&
+            confirmStoppedBlocking(
+                static_cast<int>(kStopConfirmationTimeoutMs));
+        motionStopUnconfirmed_ = !stoppedConfirmed;
+        emit motionFinished(
+            requestId, false, stoppedConfirmed,
+            result != 0
+                ? QStringLiteral(
+                      "StopMotion 重试失败，err=%1；请使用物理急停")
+                      .arg(result)
+                : stoppedConfirmed
+                    ? QStringLiteral(
+                          "StopMotion 重试后已由新鲜 20004 状态"
+                          "连续确认机械停止")
+                    : QStringLiteral(
+                          "StopMotion 重试后仍未确认机械停止；"
+                          "请使用物理急停"));
     } else {
         emit log(result == 0 ? QStringLiteral("StopMotion 已发送（当前无活动 MoveL）")
                              : QStringLiteral("StopMotion 失败，err=%1；请使用物理急停").arg(result));
@@ -386,34 +579,95 @@ void FairinoReadOnlyWorker::pollMotionDone() {
         motionPollTimer_->stop();
         return;
     }
+    const qint64 nowNs = hik_sync::getMonotonicRawNs();
+    const qint64 nowMs = nowNs / 1000000LL;
+    if (stopConfirmationPending_) {
+        qint64 sampleReceiveNs = 0;
+        int sampleMotionDone = 0;
+        double sampleLinearSpeed = 0.0;
+        double sampleAngularSpeed = 0.0;
+        {
+            const std::lock_guard<std::mutex> lock(
+                realtimeStopSnapshotMutex_);
+            sampleReceiveNs = latestRealtimeHostReceiveNs_;
+            sampleMotionDone = latestRealtimeMotionDone_;
+            sampleLinearSpeed = latestRealtimeLinearSpeedMmS_;
+            sampleAngularSpeed = latestRealtimeAngularSpeedDegS_;
+        }
+        if (sampleReceiveNs > lastStopSampleReceiveNs_) {
+            lastStopSampleReceiveNs_ = sampleReceiveNs;
+            const bool fresh =
+                sampleReceiveNs > 0 && nowNs >= sampleReceiveNs &&
+                nowNs - sampleReceiveNs <= kRealtimeFreshnessLimitNs;
+            const bool motionDone =
+                sampleMotionDone != 0;
+            const double linearSpeed = std::abs(sampleLinearSpeed);
+            const double angularSpeed = std::abs(sampleAngularSpeed);
+            if (fresh && motionDone &&
+                std::isfinite(linearSpeed) &&
+                std::isfinite(angularSpeed) &&
+                linearSpeed <= kStoppedLinearSpeedMmS &&
+                angularSpeed <= kStoppedAngularSpeedDegS) {
+                ++stationaryStopSamples_;
+            } else {
+                stationaryStopSamples_ = 0;
+            }
+            if (stationaryStopSamples_ >=
+                kRequiredStationaryStopSamples) {
+                finishMotion(
+                    false, true,
+                    QStringLiteral(
+                        "StopMotion 后已由新鲜 20004 状态连续确认机械停止"));
+                return;
+            }
+        }
+        if (nowMs - stopConfirmationStartMs_ >
+            kStopConfirmationTimeoutMs) {
+            finishMotion(
+                false, false,
+                QStringLiteral(
+                    "StopMotion 已提交，但 %1 ms 内未由新鲜 20004 状态"
+                    "确认机械停止；请使用物理急停")
+                    .arg(kStopConfirmationTimeoutMs));
+        }
+        return;
+    }
     uint8_t done = 0;
     const errno_t result = robot_->GetRobotMotionDone(&done);
     if (result != 0) {
-        (void)robot_->StopMotion();
-        motionPollTimer_->stop();
-        const int request = motionRequestId_;
-        motionActive_ = false;
-        motionRequestId_ = -1;
-        emit motionFinished(request, false,
-                            QStringLiteral("GetRobotMotionDone 失败，err=%1；已请求 StopMotion").arg(result));
+        const errno_t stopResult = robot_->StopMotion();
+        if (stopResult != 0) {
+            finishMotion(
+                false, false,
+                QStringLiteral(
+                    "GetRobotMotionDone 失败，err=%1；"
+                    "StopMotion 失败，err=%2；请使用物理急停")
+                    .arg(result)
+                    .arg(stopResult));
+        } else {
+            beginStopConfirmation(QStringLiteral(
+                "GetRobotMotionDone 失败，err=%1；StopMotion 已提交")
+                .arg(result));
+        }
         return;
     }
     if (done != 0U) {
-        motionPollTimer_->stop();
-        const int request = motionRequestId_;
-        motionActive_ = false;
-        motionRequestId_ = -1;
-        emit motionFinished(request, true, QStringLiteral("FR5 MoveL 已到位"));
+        finishMotion(true, true, QStringLiteral("FR5 MoveL 已到位"));
         return;
     }
-    if (hik_sync::getMonotonicRawNs() / 1000000LL - motionStartMs_ > motionTimeoutMs_) {
+    if (nowMs - motionStartMs_ > motionTimeoutMs_) {
         const errno_t stopResult = robot_->StopMotion();
-        motionPollTimer_->stop();
-        const int request = motionRequestId_;
-        motionActive_ = false;
-        motionRequestId_ = -1;
-        emit motionFinished(request, false,
-            QStringLiteral("MoveL 等待超时；StopMotion err=%1").arg(stopResult));
+        if (stopResult != 0) {
+            finishMotion(
+                false, false,
+                QStringLiteral(
+                    "MoveL 等待超时；StopMotion 失败，err=%1；"
+                    "请使用物理急停")
+                    .arg(stopResult));
+        } else {
+            beginStopConfirmation(QStringLiteral(
+                "MoveL 等待超时；StopMotion 已提交"));
+        }
     }
 #endif
 }
@@ -423,6 +677,14 @@ bool FairinoReadOnlyWorker::startRealtimeReceiving() {
     stopRealtimeReceiving();
     if (!connected_ || !robot_ || !realtimeReceiver_) return false;
     realtimeReceiver_->reset();
+    {
+        const std::lock_guard<std::mutex> lock(
+            realtimeStopSnapshotMutex_);
+        latestRealtimeHostReceiveNs_ = 0;
+        latestRealtimeMotionDone_ = 0;
+        latestRealtimeLinearSpeedMmS_ = 0.0;
+        latestRealtimeAngularSpeedDegS_ = 0.0;
+    }
     realtimeReceiving_.store(true, std::memory_order_release);
     const errno_t callbackResult = robot_->SetRobotRealtimeStateCallback(
         &fairinoRealtimeStateCallback, realtimeReceiver_.get());
@@ -459,6 +721,11 @@ void FairinoReadOnlyWorker::stopRealtimeReceiving() {
         realtimeThread_.get_id() != std::this_thread::get_id()) {
         realtimeThread_.join();
     }
+    {
+        const std::lock_guard<std::mutex> lock(
+            realtimeStopSnapshotMutex_);
+        latestRealtimeHostReceiveNs_ = 0;
+    }
     if (realtimeReceiver_) {
         const uint64_t dropped = realtimeReceiver_->droppedPackets.load(
             std::memory_order_relaxed);
@@ -485,6 +752,7 @@ void FairinoReadOnlyWorker::realtimeConsumerLoop() {
             continue;
         }
 
+        const ROBOT_STATE_PKG& state = packet.state;
         ROBOT_STATE_PKG getterSnapshot{};
         const int64_t getterStartNs = hik_sync::getMonotonicRawNs();
         const errno_t getterResult =
@@ -493,7 +761,6 @@ void FairinoReadOnlyWorker::realtimeConsumerLoop() {
         const int64_t getterDurationNs = std::max<int64_t>(
             0, getterEndNs - getterStartNs);
 
-        const ROBOT_STATE_PKG& state = packet.state;
         hik_sync::RobotSample sample;
         sample.sdkReceiveSequence = packet.receiveSequence;
         sample.rawFrameCount = state.frame_cnt;
@@ -527,8 +794,19 @@ void FairinoReadOnlyWorker::realtimeConsumerLoop() {
             state.flange_cur_pos[5]);
         sample.actualLinearSpeedMmS = state.actual_TCP_CmpSpeed[0];
         finite = finite && std::isfinite(sample.actualLinearSpeedMmS) &&
+                 std::isfinite(state.actual_TCP_CmpSpeed[1]) &&
                  sample.flangeOrientation.coeffs().allFinite();
         sample.valid = finite;
+        if (finite) {
+            const std::lock_guard<std::mutex> lock(
+                realtimeStopSnapshotMutex_);
+            latestRealtimeMotionDone_ = state.motion_done;
+            latestRealtimeLinearSpeedMmS_ =
+                state.actual_TCP_CmpSpeed[0];
+            latestRealtimeAngularSpeedDegS_ =
+                state.actual_TCP_CmpSpeed[1];
+            latestRealtimeHostReceiveNs_ = packet.hostReceiveNs;
+        }
         emit robotSampleReady(std::move(sample));
     }
 #endif

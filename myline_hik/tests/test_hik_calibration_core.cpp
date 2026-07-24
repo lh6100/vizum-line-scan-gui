@@ -131,6 +131,26 @@ void testDefaultBoardSpec() {
                "7 squares * 22 mm must produce a 154 mm board height");
 }
 
+void testNeutralMetadataDefaults() {
+    using namespace hik_calibration;
+
+    const IntrinsicsYamlMetadata intrinsics;
+    CHECK_TRUE(intrinsics.cameraModel.empty() &&
+                   intrinsics.cameraSerial.empty() &&
+                   intrinsics.frameId.empty(),
+               "intrinsics metadata must not default to either device profile");
+
+    const LaserPlaneYamlMetadata laserPlane;
+    CHECK_TRUE(laserPlane.cameraFrame.empty(),
+               "laser-plane metadata must require an explicit profile frame");
+
+    const HandEyeYamlMetadata handEye;
+    CHECK_TRUE(handEye.cameraModel.empty() &&
+                   handEye.cameraSerial.empty() &&
+                   handEye.cameraFrame.empty(),
+               "hand-eye metadata must not default to either device profile");
+}
+
 void testSyntheticCharucoDetection() {
     using namespace hik_calibration;
 
@@ -159,6 +179,69 @@ void testSyntheticCharucoDetection() {
                "synthetic board should expose all 24 ChArUco corners");
     CHECK_TRUE(detection.observation.quality.laplacianVariance >= 30.0,
                "synthetic board should pass the configured sharpness gate");
+}
+
+void testLaserOnUsesDedicatedSaturationLimit() {
+    using namespace hik_calibration;
+
+    const BoardSpec boardSpec;
+    const cv::Ptr<cv::aruco::Dictionary> dictionary =
+        cv::aruco::getPredefinedDictionary(boardSpec.dictionaryId);
+    const cv::Ptr<cv::aruco::CharucoBoard> board = cv::aruco::CharucoBoard::create(
+        boardSpec.squaresX, boardSpec.squaresY,
+        static_cast<float>(boardSpec.squareLengthMm),
+        static_cast<float>(boardSpec.markerLengthMm), dictionary);
+    cv::Mat rendered;
+    board->draw(cv::Size(900, 1260), rendered, 40, 1);
+    cv::Mat laserOff;
+    rendered.convertTo(laserOff, CV_8U, 0.5, 30.0);
+    cv::Mat laserOn = laserOff.clone();
+    for (int row = 623; row <= 637; ++row) {
+        laserOn.row(row).setTo(cv::Scalar(255));
+    }
+
+    const cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
+        1200.0, 0.0, 450.0,
+        0.0, 1200.0, 630.0,
+        0.0, 0.0, 1.0);
+    const cv::Mat distCoeffs = cv::Mat::zeros(1, 5, CV_64F);
+    DetectionOptions ordinaryDetection;
+    ordinaryDetection.minLaplacianVariance = 5.0;
+    CharucoDetectionResult offDetection;
+    CHECK_TRUE(detectCharuco(
+                   laserOff, "laser_saturation_off", boardSpec,
+                   ordinaryDetection, &offDetection, cameraMatrix, distCoeffs),
+               std::string("synthetic laser-off detection failed: ") +
+                   offDetection.error);
+    CharucoDetectionResult ordinaryOnDetection;
+    CHECK_TRUE(!detectCharuco(
+                   laserOn, "laser_saturation_on_ordinary", boardSpec,
+                   ordinaryDetection, &ordinaryOnDetection,
+                   cameraMatrix, distCoeffs),
+               "ordinary 1% board saturation gate must reject the laser-on frame");
+    CHECK_TRUE(ordinaryOnDetection.observation.quality.saturationRatio >
+                   ordinaryDetection.maxSaturationRatio,
+               "synthetic laser ridge must exceed the ordinary saturation limit");
+
+    LaserPairOptions pairOptions;
+    pairOptions.detection = ordinaryDetection;
+    LaserCalibrationPairResult pair;
+    CHECK_TRUE(processLaserCalibrationPair(
+                   laserOff, laserOn, "laser_saturation_pair", boardSpec,
+                   cameraMatrix, distCoeffs, pairOptions, &pair),
+               std::string("dedicated laser-on saturation limit should accept pair: ") +
+                   pair.error);
+    CHECK_TRUE(pair.ok && pair.laserOnDetection.observation.quality.saturationRatio >
+                              pairOptions.detection.maxSaturationRatio,
+               "accepted pair must prove that only the laser-on saturation exception was used");
+    CHECK_TRUE(pair.laserOnDetection.observation.quality.saturationRatio <=
+                   pairOptions.maxLaserOnSaturationRatio,
+               "laser-on saturation must remain below its dedicated 5% limit");
+    CHECK_TRUE(pair.stripe.size() >= 800 && pair.cameraPointsMm.size() >= 700,
+               "accepted saturated ridge must still pass stripe and 3-D point gates");
+    CHECK_TRUE(!pair.stripe.empty() &&
+                   std::fabs(pair.stripe.front().pixel.y - 630.0) < 0.2,
+               "wide saturated ridge centre must not be biased toward its falling edge");
 }
 
 std::vector<hik_calibration::LaserPlaneSample> makeSyntheticPlaneSamples(
@@ -744,6 +827,69 @@ void testConstantLaserScanCore() {
     CHECK_TRUE(std::fabs(profile.stripe.front().pixel.x - 70.0) < 0.2,
                "constant-laser ridge must retain its sub-pixel center");
 
+    cv::Mat validityMask;
+    std::string maskError;
+    CHECK_TRUE(buildLaserPlaneValidityMask(
+                   imageSize, intrinsics, laserPlane, 450.0, 550.0,
+                   cv::Rect(0, 0, imageSize.width, imageSize.height),
+                   &validityMask, &maskError),
+               std::string("valid-depth mask failed: ") + maskError);
+    CHECK_TRUE(cv::countNonZero(validityMask) ==
+                   imageSize.width * imageSize.height,
+               "a z=500 mm plane must make the full synthetic ROI valid");
+
+    SingleFrameProfileOptions shadowOptions = options;
+    shadowOptions.reconstruction.stripe.mode =
+        StripeExtractionMode::Shadow;
+    shadowOptions.reconstruction.stripe.quality.orientation =
+        hik_stripe::Orientation::Vertical;
+    shadowOptions.reconstruction.stripe.quality.roi =
+        cv::Rect(0, 0, imageSize.width, imageSize.height);
+    shadowOptions.reconstruction.stripeValidityMask = validityMask;
+    StaticProfileResult shadowProfile;
+    CHECK_TRUE(reconstructSingleFrameProfile(
+                   laserOn, "constant_laser_shadow", intrinsics,
+                   laserPlane, shadowOptions, &shadowProfile),
+               std::string("shadow profile failed: ") +
+                   shadowProfile.error);
+    CHECK_TRUE(shadowProfile.ok &&
+                   shadowProfile.legacyExtractionPassed &&
+                   shadowProfile.qualityExtractionPassed &&
+                   shadowProfile.points.size() == 100 &&
+                   shadowProfile.legacyPoints.size() == 100 &&
+                   shadowProfile.qualityPoints.size() >= 90,
+               "shadow mode must preserve legacy output and also retain a "
+               "quality-gated point set");
+    CHECK_TRUE(shadowProfile.shadowComparison.matchedPointCount >= 90 &&
+                   shadowProfile.shadowComparison.robustMatchedPointCount >=
+                       90 &&
+                   shadowProfile.shadowComparison.grossMismatchPointCount ==
+                       0U &&
+                   std::fabs(
+                       shadowProfile.shadowComparison
+                           .robustSignedMeanOffsetPx) < 0.25 &&
+                   shadowProfile.shadowComparison.absoluteP95OffsetPx < 0.25,
+               "shadow mode must report a small new/legacy offset on a clean ridge");
+    CHECK_TRUE(shadowProfile.centerlineAlgorithmVersion ==
+                   hik_stripe::algorithmVersion(),
+               "shadow result must record the quality extractor version");
+
+    SingleFrameProfileOptions qualityOptions = shadowOptions;
+    qualityOptions.reconstruction.stripe.mode =
+        StripeExtractionMode::Quality;
+    StaticProfileResult qualityProfile;
+    CHECK_TRUE(reconstructSingleFrameProfile(
+                   laserOn, "constant_laser_quality", intrinsics,
+                   laserPlane, qualityOptions, &qualityProfile),
+               std::string("quality-gated profile failed: ") +
+                   qualityProfile.error);
+    CHECK_TRUE(qualityProfile.ok &&
+                   qualityProfile.points.size() ==
+                       qualityProfile.qualityPoints.size() &&
+                   qualityProfile.stripe.size() ==
+                       qualityProfile.qualityStripe.size(),
+               "quality mode must make the gated stripe the official output");
+
     cv::Mat horizontalLaserOn(imageSize, CV_8UC1);
     for (int row = 0; row < horizontalLaserOn.rows; ++row) {
         for (int column = 0; column < horizontalLaserOn.cols; ++column) {
@@ -922,7 +1068,9 @@ void testSyntheticHandEyeCalibration() {
     TemporaryFiles files;
     const std::string yamlPath = files.add("handeye.yaml");
     HandEyeYamlMetadata metadata;
+    metadata.cameraModel = "synthetic-model";
     metadata.cameraSerial = "synthetic-camera";
+    metadata.cameraFrame = "synthetic_camera_optical_frame";
     metadata.intrinsicsSha256 = "abc123";
     metadata.datasetManifest = "handeye_manifest.csv";
     std::string error;
@@ -968,7 +1116,9 @@ void testSyntheticHandEyeCalibration() {
 
 int main() {
     testDefaultBoardSpec();
+    testNeutralMetadataDefaults();
     testSyntheticCharucoDetection();
+    testLaserOnUsesDedicatedSaturationLimit();
 
     hik_calibration::LaserPlaneFitResult planeFit;
     testSyntheticLaserPlane(&planeFit);

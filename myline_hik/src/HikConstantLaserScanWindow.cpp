@@ -1,6 +1,6 @@
 #include "HikConstantLaserScanWindow.h"
 
-#include "FairinoReadOnlyWorker.h"
+#include "FairinoRobotSession.h"
 #include "HandEyeCalibrationCore.h"
 #include "HikCameraWorker.h"
 #include "ImageView.h"
@@ -21,6 +21,8 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -39,17 +41,78 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
 
 #ifndef HIK_CALIBRATION_SOURCE_DIR
 #define HIK_CALIBRATION_SOURCE_DIR "."
 #endif
 
+class DirectCallbackGate final {
+public:
+    bool enter() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!accepting_) return false;
+        ++activeCallbacks_;
+        return true;
+    }
+
+    void leave() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (activeCallbacks_ > 0) --activeCallbacks_;
+        if (activeCallbacks_ == 0) condition_.notify_all();
+    }
+
+    void closeAndWait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        accepting_ = false;
+        condition_.wait(lock, [this] {
+            return activeCallbacks_ == 0;
+        });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool accepting_{true};
+    int activeCallbacks_{0};
+};
+
 namespace {
+
+class DirectCallbackUse final {
+public:
+    explicit DirectCallbackUse(
+            const std::shared_ptr<DirectCallbackGate>& gate)
+        : gate_(gate),
+          entered_(gate_ && gate_->enter()) {}
+
+    ~DirectCallbackUse() {
+        if (entered_) gate_->leave();
+    }
+
+    explicit operator bool() const { return entered_; }
+
+private:
+    std::shared_ptr<DirectCallbackGate> gate_;
+    bool entered_{false};
+};
 
 const double kStillTranslationMm = 0.10;
 const double kStillRotationDeg = 0.05;
+const qint64 kLaserStatusFreshnessLimitMs = 1250;
+const int kQualitySupportMinimumProfiles = 1;
+const int kQualitySupportMaximumProfileGap = 2;
+const double kQualitySupportRadiusFloorMm = 0.5;
+const double kQualitySupportStepFactor = 1.75;
+const double kQualitySupportVoxelFactor = 2.0;
+
+// Scan state-machine ownership stays process-wide.  The FAIRINO SDK client and
+// command lease are owned separately by FairinoRobotSession.
+HikConstantLaserScanWindow* gScanActivityOwner = nullptr;
 
 bool validIpv4(const QString& value) {
     const QStringList parts = value.trimmed().split(QLatin1Char('.'));
@@ -106,15 +169,161 @@ QByteArray csvQuoted(const QString& text) {
     return QStringLiteral("\"%1\"").arg(escaped).toUtf8();
 }
 
+bool saveCloudPlyAllowEmpty(
+        const QString& path,
+        const std::vector<hik_scan::CloudPoint>& cloud,
+        const QString& frameId,
+        QString* error) {
+    if (error) error->clear();
+    if (!cloud.empty()) {
+        const QByteArray encoded = QFile::encodeName(path);
+        std::string coreError;
+        if (!hik_scan::saveScanPly(
+                std::string(
+                    encoded.constData(),
+                    static_cast<std::size_t>(encoded.size())),
+                cloud, frameId.toStdString(), &coreError)) {
+            if (error) *error = QString::fromStdString(coreError);
+            return false;
+        }
+        return true;
+    }
+
+    // An empty rejected set is a valid quality result. HikScanCore deliberately
+    // rejects generic empty clouds, so write the same schema here with zero
+    // vertices instead of inventing a placeholder measurement.
+    QByteArray payload;
+    payload += "ply\nformat ascii 1.0\n";
+    payload += "comment frame_id " + frameId.toUtf8() + "\n";
+    payload += "comment units millimeter\n";
+    payload += "element vertex 0\n";
+    payload += "property double x\nproperty double y\nproperty double z\n";
+    payload += "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    payload += "property float confidence\nproperty float response\n";
+    payload += "property int profile_index\n";
+    payload += "property float pixel_u\nproperty float pixel_v\n";
+    payload += "property uint quality_flags\n";
+    payload += "property uint observation_count\n";
+    payload += "end_header\n";
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly) ||
+        file.write(payload) != payload.size() ||
+        !file.commit()) {
+        if (error) {
+            *error = QStringLiteral("无法写入空质量点云：%1").arg(path);
+        }
+        return false;
+    }
+    return true;
+}
+
+QString laserStateText(LineLaserState state) {
+    switch (state) {
+        case LineLaserState::Off:
+            return QStringLiteral("两路 LOW");
+        case LineLaserState::Laser450:
+            return QStringLiteral("450 nm TTL HIGH");
+        case LineLaserState::Laser650:
+            return QStringLiteral("650 nm TTL HIGH");
+        case LineLaserState::Unknown:
+            break;
+    }
+    return QStringLiteral("未知");
+}
+
+QString laserStateProtocolName(LineLaserState state) {
+    switch (state) {
+        case LineLaserState::Off:
+            return QStringLiteral("off");
+        case LineLaserState::Laser450:
+            return QStringLiteral("laser450");
+        case LineLaserState::Laser650:
+            return QStringLiteral("laser650");
+        case LineLaserState::Unknown:
+            break;
+    }
+    return QStringLiteral("unknown");
+}
+
+hik_stripe::Orientation stripeOrientation(
+        LineLaserStripeOrientation orientation) {
+    switch (orientation) {
+    case LineLaserStripeOrientation::Auto:
+        return hik_stripe::Orientation::Auto;
+    case LineLaserStripeOrientation::Horizontal:
+        return hik_stripe::Orientation::Horizontal;
+    case LineLaserStripeOrientation::Vertical:
+        return hik_stripe::Orientation::Vertical;
+    }
+    return hik_stripe::Orientation::Auto;
+}
+
+hik_calibration::StripeExtractionMode stripeMode(
+        LineLaserCenterlinePolicy policy) {
+    switch (policy) {
+    case LineLaserCenterlinePolicy::Legacy:
+        return hik_calibration::StripeExtractionMode::Legacy;
+    case LineLaserCenterlinePolicy::Shadow:
+        return hik_calibration::StripeExtractionMode::Shadow;
+    case LineLaserCenterlinePolicy::Quality:
+        return hik_calibration::StripeExtractionMode::Quality;
+    }
+    return hik_calibration::StripeExtractionMode::Legacy;
+}
+
+cv::Rect stripeRoi(const LineLaserDeviceProfile& profile,
+                   const cv::Size& imageSize) {
+    const int x = std::max(
+        0, std::min(
+            imageSize.width - 1,
+            static_cast<int>(std::floor(
+                profile.stripeRoiX * imageSize.width))));
+    const int y = std::max(
+        0, std::min(
+            imageSize.height - 1,
+            static_cast<int>(std::floor(
+                profile.stripeRoiY * imageSize.height))));
+    const int right = std::max(
+        x + 1, std::min(
+            imageSize.width,
+            static_cast<int>(std::ceil(
+                (profile.stripeRoiX + profile.stripeRoiWidth) *
+                imageSize.width))));
+    const int bottom = std::max(
+        y + 1, std::min(
+            imageSize.height,
+            static_cast<int>(std::ceil(
+                (profile.stripeRoiY + profile.stripeRoiHeight) *
+                imageSize.height))));
+    return cv::Rect(x, y, right - x, bottom - y);
+}
+
 }  // namespace
 
 HikConstantLaserScanWindow::HikConstantLaserScanWindow(
+        const LineLaserDeviceProfile& profile,
+        LineLaserController* laserController,
+        FairinoRobotSession* robotSession,
         QWidget* parent, double scanSpeedOverrideMmS)
     : QMainWindow(parent),
+      profile_(profile),
+      laserController_(laserController),
+      robotSession_(robotSession),
       sourceDir_(QDir::cleanPath(QString::fromUtf8(HIK_CALIBRATION_SOURCE_DIR))) {
-    configDir_ = QDir(sourceDir_).absoluteFilePath(QStringLiteral("config"));
-    synchronizationConfigPath_ = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("synchronization.yaml"));
+    QString profileError;
+    if (!profile_.isValid(&profileError)) {
+        throw std::invalid_argument(profileError.toStdString());
+    }
+    if (!laserController_) {
+        throw std::invalid_argument(
+            "LineLaserController must be shared with the scan window");
+    }
+    if (!robotSession_) {
+        throw std::invalid_argument(
+            "FairinoRobotSession must be shared with the scan window");
+    }
+    synchronizationConfigPath_ =
+        profile_.synchronizationConfigPath(sourceDir_);
     std::string synchronizationError;
     synchronizationConfigReady_ = hik_sync::SynchronizationConfig::loadYaml(
         localPath(synchronizationConfigPath_), &synchronizationConfig_,
@@ -127,10 +336,29 @@ HikConstantLaserScanWindow::HikConstantLaserScanWindow(
     profileOptions_.reconstruction.stripe.minimumDifference = 10;
     profileOptions_.reconstruction.stripe.thresholdStddevScale = 2.0;
     profileOptions_.reconstruction.stripe.minPointCount = 80;
+    profileOptions_.reconstruction.stripe.mode =
+        stripeMode(profile_.scanCenterlinePolicy);
+    profileOptions_.reconstruction.stripe.quality.orientation =
+        stripeOrientation(profile_.stripeOrientation);
     profileOptions_.reconstruction.minReconstructedPoints = 80;
     profileOptions_.reconstruction.maxLineRmsMm = 0.50;
     buildUi();
     setupWorkers();
+    appendLog(QStringLiteral(
+        "条纹策略：方向=%1，模式=%2，归一化ROI=[%3,%4,%5,%6]；"
+        "ROI还会与正式激光平面的有效深度走廊取交集。")
+        .arg(lineLaserStripeOrientationName(profile_.stripeOrientation),
+             lineLaserCenterlinePolicyName(profile_.scanCenterlinePolicy))
+        .arg(profile_.stripeRoiX, 0, 'f', 4)
+        .arg(profile_.stripeRoiY, 0, 'f', 4)
+        .arg(profile_.stripeRoiWidth, 0, 'f', 4)
+        .arg(profile_.stripeRoiHeight, 0, 'f', 4));
+    if (profile_.scanCenterlinePolicy ==
+        LineLaserCenterlinePolicy::Shadow) {
+        appendLog(QStringLiteral(
+            "shadow 模式只并行生成质量诊断点云；正式 scan_raw/scan_voxel "
+            "仍严格使用 legacy 中心，不会被质量中心替换。"));
+    }
     if (synchronizationConfigReady_) {
         appendLog(QStringLiteral(
             "同步配置已加载：%1；目标=%2 fps，曝光=%3 us，扫描速度=%4 mm/s，"
@@ -155,7 +383,13 @@ HikConstantLaserScanWindow::HikConstantLaserScanWindow(
         appendLog(QStringLiteral("正式标定未就绪: %1").arg(error));
     }
     appendLog(QStringLiteral(
-        "常亮模式使用单帧形态学背景抑制；原图始终保存，错误条纹必须通过预览人工复核。"));
+        "设备组=%1（%2，TTL 物理 Pin %3）；常亮模式使用单帧形态学背景抑制；"
+        "原图始终保存，错误条纹必须通过预览人工复核。")
+        .arg(profile_.id, profile_.displayName)
+        .arg(profile_.ttlPhysicalPin));
+    appendLog(QStringLiteral(
+        "本页只把“板端 ACK + GPIO 回读”为 HIGH 记为 TTL 就绪；"
+        "这不等同于对激光器实际光功率的测量。"));
     updateUi();
 }
 
@@ -164,21 +398,30 @@ HikConstantLaserScanWindow::~HikConstantLaserScanWindow() {
 }
 
 void HikConstantLaserScanWindow::buildUi() {
-    setWindowTitle(QStringLiteral("FR5 海康常亮线激光停稳扫描验证"));
+    setWindowTitle(QStringLiteral("FR5 线扫｜%1｜%2")
+                   .arg(profile_.displayName, profile_.id));
     resize(1620, 960);
     QWidget* central = new QWidget(this);
     QVBoxLayout* root = new QVBoxLayout(central);
 
     QLabel* warning = new QLabel(QStringLiteral(
-        "验证流程会真实发送 FR5 MoveL。默认 dry-run；真运动前必须确认控制器已使能/自动模式、路径无碰撞、速度足够低且人员守在物理急停旁。"
-        "本页软件停止不是控制柜物理急停。线激光保持常亮。"), central);
+        "当前设备组：%1（%2 nm，TTL 物理 Pin %3）。验证流程会真实发送 FR5 MoveL。"
+        "默认 dry-run；真运动前必须确认控制器已使能/自动模式、路径无碰撞、速度足够低且人员守在物理急停旁。"
+        "本页软件停止不是控制柜物理急停；两个设备页共享唯一 FR5 连接，"
+        "但同一时刻只允许一组持有运动/扫描命令租约。")
+        .arg(profile_.displayName)
+        .arg(profile_.wavelengthNm)
+        .arg(profile_.ttlPhysicalPin), central);
     warning->setWordWrap(true);
     warning->setStyleSheet(QStringLiteral("color:#b00020;font-weight:bold;"));
     root->addWidget(warning);
 
     QGroupBox* devices = new QGroupBox(QStringLiteral("设备连接"), central);
     QGridLayout* deviceLayout = new QGridLayout(devices);
-    cameraIpEdit_ = new QLineEdit(QStringLiteral("192.168.1.56"), devices);
+    cameraIpEdit_ = new QLineEdit(profile_.defaultCameraIp, devices);
+    if (profile_.defaultCameraIp.trimmed().isEmpty()) {
+        cameraIpEdit_->setPlaceholderText(QStringLiteral("请输入此设备组的相机 IPv4 地址"));
+    }
     exposureSpin_ = new QDoubleSpinBox(devices);
     exposureSpin_->setRange(1.0, 10000000.0);
     exposureSpin_->setDecimals(3);
@@ -192,17 +435,39 @@ void HikConstantLaserScanWindow::buildUi() {
     cameraTimeoutSpin_ = new QSpinBox(devices);
     cameraTimeoutSpin_->setRange(100, 10000);
     cameraTimeoutSpin_->setValue(3000);
-    connectCameraButton_ = new QPushButton(QStringLiteral("连接相机"), devices);
+    connectCameraButton_ = new QPushButton(QStringLiteral("连接本组相机"), devices);
     disconnectCameraButton_ = new QPushButton(QStringLiteral("断开相机"), devices);
-    cameraStatusLabel_ = new QLabel(QStringLiteral("相机未连接"), devices);
+    cameraStatusLabel_ = new QLabel(
+        QStringLiteral("%1：相机未连接").arg(profile_.id), devices);
 
     robotIpEdit_ = new QLineEdit(QStringLiteral("192.168.1.200"), devices);
-    connectRobotButton_ = new QPushButton(QStringLiteral("连接 FR5"), devices);
-    disconnectRobotButton_ = new QPushButton(QStringLiteral("断开 FR5"), devices);
+    connectRobotButton_ = new QPushButton(
+        QStringLiteral("连接共享 FR5"), devices);
+    disconnectRobotButton_ = new QPushButton(
+        QStringLiteral("断开共享 FR5"), devices);
     readPoseButton_ = new QPushButton(QStringLiteral("读取法兰"), devices);
     robotStatusLabel_ = new QLabel(QStringLiteral("FR5 未连接"), devices);
     currentPoseLabel_ = new QLabel(QStringLiteral("当前法兰: -"), devices);
     currentPoseLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    connectLaserButton_ = new QPushButton(
+        QStringLiteral("连接鲁班猫 TTL"), devices);
+    enableProfileLaserButton_ = new QPushButton(
+        QStringLiteral("开启本组 %1 nm TTL").arg(profile_.wavelengthNm),
+        devices);
+    disableAllLasersButton_ = new QPushButton(
+        QStringLiteral("关闭两路 TTL"), devices);
+    enableProfileLaserButton_->setStyleSheet(QStringLiteral(
+        "background:#f9a825;color:#111;font-weight:bold;"));
+    disableAllLasersButton_->setStyleSheet(QStringLiteral(
+        "background:#2e7d32;color:white;font-weight:bold;"));
+    enableProfileLaserButton_->setToolTip(QStringLiteral(
+        "请求鲁班猫将本组 TTL 持续置 HIGH；只有板端 ACK 和 GPIO 回读一致后状态才会变绿。"));
+    disableAllLasersButton_->setToolTip(QStringLiteral(
+        "无条件请求 Pin 11/GPIO15 与 Pin 7/GPIO16 同时置 LOW。"));
+    laserStatusLabel_ = new QLabel(
+        QStringLiteral("鲁班猫 TTL 未连接（192.168.1.12）"), devices);
+    laserStatusLabel_->setWordWrap(true);
 
     deviceLayout->addWidget(new QLabel(QStringLiteral("相机 IP"), devices), 0, 0);
     deviceLayout->addWidget(cameraIpEdit_, 0, 1);
@@ -222,10 +487,17 @@ void HikConstantLaserScanWindow::buildUi() {
     deviceLayout->addWidget(readPoseButton_, 1, 4);
     deviceLayout->addWidget(robotStatusLabel_, 1, 5, 1, 2);
     deviceLayout->addWidget(currentPoseLabel_, 1, 7, 1, 4);
+    deviceLayout->addWidget(new QLabel(
+        QStringLiteral("激光 TTL"), devices), 2, 0);
+    deviceLayout->addWidget(connectLaserButton_, 2, 1);
+    deviceLayout->addWidget(enableProfileLaserButton_, 2, 2, 1, 2);
+    deviceLayout->addWidget(disableAllLasersButton_, 2, 4, 1, 2);
+    deviceLayout->addWidget(laserStatusLabel_, 2, 6, 1, 5);
     deviceLayout->setColumnStretch(1, 1);
     root->addWidget(devices);
 
-    QGroupBox* calibration = new QGroupBox(QStringLiteral("正式标定"), central);
+    QGroupBox* calibration = new QGroupBox(
+        QStringLiteral("正式标定｜%1").arg(profile_.displayName), central);
     QHBoxLayout* calibrationLayout = new QHBoxLayout(calibration);
     reloadCalibrationButton_ = new QPushButton(QStringLiteral("重新加载 config"), calibration);
     calibrationStatusLabel_ = new QLabel(QStringLiteral("尚未加载"), calibration);
@@ -372,7 +644,8 @@ void HikConstantLaserScanWindow::buildUi() {
     QWidget* preview = new QWidget(splitter);
     QVBoxLayout* previewLayout = new QVBoxLayout(preview);
     imageView_ = new ImageView(preview);
-    imageView_->setEmptyText(QStringLiteral("暂无常亮激光图像"));
+    imageView_->setEmptyText(QStringLiteral("%1：暂无常亮激光图像")
+                             .arg(profile_.displayName));
     logView_ = new QPlainTextEdit(preview);
     logView_->setReadOnly(true);
     logView_->setMaximumBlockCount(4000);
@@ -389,6 +662,12 @@ void HikConstantLaserScanWindow::buildUi() {
 
     connect(connectCameraButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::connectCamera);
     connect(disconnectCameraButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::disconnectCamera);
+    connect(connectLaserButton_, &QPushButton::clicked,
+            this, &HikConstantLaserScanWindow::connectLaserController);
+    connect(enableProfileLaserButton_, &QPushButton::clicked,
+            this, &HikConstantLaserScanWindow::enableProfileLaser);
+    connect(disableAllLasersButton_, &QPushButton::clicked,
+            this, &HikConstantLaserScanWindow::disableAllLasers);
     connect(connectRobotButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::connectRobot);
     connect(disconnectRobotButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::disconnectRobot);
     connect(readPoseButton_, &QPushButton::clicked, this, &HikConstantLaserScanWindow::readCurrentPose);
@@ -413,11 +692,43 @@ void HikConstantLaserScanWindow::buildUi() {
             this, [this](bool) { updateUi(); });
     connect(targetCountLimitCheck_, &QCheckBox::toggled,
             this, [this](bool) { updateUi(); });
+    connect(laserController_, &LineLaserController::connectionStateChanged,
+            this,
+            &HikConstantLaserScanWindow::onLaserConnectionStateChanged);
+    connect(laserController_, &LineLaserController::statusChanged,
+            this, &HikConstantLaserScanWindow::onLaserStatusChanged);
+    connect(laserController_, &LineLaserController::commandFinished,
+            this, &HikConstantLaserScanWindow::onLaserCommandFinished);
+    connect(laserController_, &LineLaserController::faultOccurred,
+            this, &HikConstantLaserScanWindow::onLaserFault);
+    connect(laserController_, &LineLaserController::logMessage,
+            this, [this](const QString& message) {
+                appendLog(QStringLiteral("TTL控制：%1").arg(message));
+            });
+    laserFreshnessTimer_ = new QTimer(this);
+    laserFreshnessTimer_->setInterval(250);
+    connect(laserFreshnessTimer_, &QTimer::timeout, this, [this]() {
+        if (terminalBarrierActive_) {
+            tryCompleteTerminalBarrier();
+        } else if (scanActivityHeld_ && !laserStatusFresh()) {
+            abortForLaserSafety(QStringLiteral(
+                "超过 %1 ms 未收到新鲜的板端 TTL 状态，"
+                "按失光处理并请求停止 FR5。")
+                .arg(kLaserStatusFreshnessLimitMs));
+        }
+    });
+    laserFreshnessTimer_->start();
 }
 
 void HikConstantLaserScanWindow::setupWorkers() {
     qRegisterMetaType<hik_sync::CameraFrame>("hik_sync::CameraFrame");
     qRegisterMetaType<hik_sync::RobotSample>("hik_sync::RobotSample");
+    directCallbackGate_ = std::make_shared<DirectCallbackGate>();
+    robotClientId_ = robotSession_->registerClient(profile_.id);
+    if (robotClientId_ <= 0 || !robotSession_->isRunning()) {
+        throw std::runtime_error(
+            "unable to register with the shared FairinoRobotSession");
+    }
     cameraWorker_ = new HikCameraWorker;
     cameraWorker_->moveToThread(&cameraThread_);
     connect(&cameraThread_, &QThread::finished, cameraWorker_, &QObject::deleteLater);
@@ -452,61 +763,92 @@ void HikConstantLaserScanWindow::setupWorkers() {
     connect(cameraWorker_, &HikCameraWorker::continuousFrameRejected,
             this, &HikConstantLaserScanWindow::onContinuousFrameRejected,
             Qt::QueuedConnection);
-    connect(cameraWorker_, &HikCameraWorker::continuousFrameReady,
-            this, [this](hik_sync::CameraFrame frame) {
+    continuousFrameConnection_ = connect(
+            cameraWorker_, &HikCameraWorker::continuousFrameReady,
+            this,
+            [this, gate = directCallbackGate_](
+                    hik_sync::CameraFrame frame) {
+                DirectCallbackUse callback(gate);
+                if (!callback) return;
                 (void)synchronizationSession_.pushCamera(std::move(frame));
             }, Qt::DirectConnection);
-    connect(cameraWorker_, &HikCameraWorker::imagePoolExhausted,
-            this, [this]() {
+    imagePoolConnection_ = connect(
+            cameraWorker_, &HikCameraWorker::imagePoolExhausted,
+            this, [this, gate = directCallbackGate_]() {
+                DirectCallbackUse callback(gate);
+                if (!callback) return;
                 synchronizationSession_.noteImagePoolExhaustion();
             }, Qt::DirectConnection);
     cameraThread_.start();
 
-    robotWorker_ = new FairinoReadOnlyWorker;
-    robotWorker_->moveToThread(&robotThread_);
-    connect(&robotThread_, &QThread::finished, robotWorker_, &QObject::deleteLater);
     connect(this, &HikConstantLaserScanWindow::requestConnectRobot,
-            robotWorker_, &FairinoReadOnlyWorker::connectRobot, Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::connectRobot);
     connect(this, &HikConstantLaserScanWindow::requestDisconnectRobot,
-            robotWorker_, &FairinoReadOnlyWorker::disconnectRobot, Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::disconnectRobot);
     connect(this, &HikConstantLaserScanWindow::requestReadFlangePose,
-            robotWorker_, &FairinoReadOnlyWorker::readFlangePose, Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::readFlangePose);
     connect(this, &HikConstantLaserScanWindow::requestMoveLinear,
-            robotWorker_, &FairinoReadOnlyWorker::moveLinear, Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::moveLinear);
     connect(this, &HikConstantLaserScanWindow::requestMoveLinearPhysical,
-            robotWorker_, &FairinoReadOnlyWorker::moveLinearPhysical,
-            Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::moveLinearPhysical);
     connect(this, &HikConstantLaserScanWindow::requestStopMotion,
-            robotWorker_, &FairinoReadOnlyWorker::stopMotion, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::connectionChanged,
+            robotSession_, &FairinoRobotSession::stopMotion);
+    connect(robotSession_, &FairinoRobotSession::connectionChanged,
             this, &HikConstantLaserScanWindow::onRobotConnectionChanged, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::busyChanged,
+    connect(robotSession_, &FairinoRobotSession::busyChanged,
             this, &HikConstantLaserScanWindow::onRobotBusyChanged, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::flangePoseReady,
+    connect(robotSession_, &FairinoRobotSession::flangePoseReady,
             this, &HikConstantLaserScanWindow::onRobotFlangePoseReady, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::motionStarted,
+    connect(robotSession_, &FairinoRobotSession::motionStarted,
             this, &HikConstantLaserScanWindow::onRobotMotionStarted, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::motionFinished,
+    connect(robotSession_, &FairinoRobotSession::motionFinished,
             this, &HikConstantLaserScanWindow::onRobotMotionFinished, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::log,
+    connect(robotSession_, &FairinoRobotSession::log,
             this, &HikConstantLaserScanWindow::onRobotLog, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::error,
+    connect(robotSession_, &FairinoRobotSession::error,
             this, &HikConstantLaserScanWindow::onRobotError, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::robotSampleReady,
-            this, [this](hik_sync::RobotSample sample) {
+    connect(robotSession_, &FairinoRobotSession::clientError,
+            this, &HikConstantLaserScanWindow::onRobotClientError,
+            Qt::QueuedConnection);
+    robotSampleConnection_ = connect(
+            robotSession_, &FairinoRobotSession::robotSampleReady,
+            this,
+            [this, gate = directCallbackGate_](
+                    int clientId,
+                    quint64 leaseEpoch,
+                    hik_sync::RobotSample sample) {
+                DirectCallbackUse callback(gate);
+                if (!callback) return;
+                if (clientId != robotClientId_ ||
+                    leaseEpoch != robotLeaseEpoch_.load(
+                        std::memory_order_acquire)) {
+                    return;
+                }
                 (void)synchronizationSession_.pushRobot(std::move(sample));
             }, Qt::DirectConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::realtimePeriodConfigured,
+    connect(robotSession_, &FairinoRobotSession::realtimePeriodConfigured,
             this, [this](int periodMs) {
                 appendLog(QStringLiteral("FR5 20004 实时反馈周期确认：%1 ms。")
                           .arg(periodMs));
             }, Qt::QueuedConnection);
-    robotThread_.start();
+    connect(robotSession_, &FairinoRobotSession::exclusiveOwnerChanged,
+            this, [this](int, const QString&) {
+                updateUi();
+            }, Qt::QueuedConnection);
+    robotConnected_ = robotSession_->isConnected();
+    robotBusy_ = robotSession_->isBusy();
 }
 
 void HikConstantLaserScanWindow::shutdownWorkers() {
     if (shuttingDown_) return;
     shuttingDown_ = true;
+    if (directCallbackGate_) {
+        directCallbackGate_->closeAndWait();
+    }
+    QObject::disconnect(continuousFrameConnection_);
+    QObject::disconnect(imagePoolConnection_);
+    QObject::disconnect(robotSampleConnection_);
+    requestLaserOff();
     if (cameraWorker_ && cameraThread_.isRunning() &&
         continuousState_ != ContinuousState::Idle) {
         QMetaObject::invokeMethod(cameraWorker_, "stopContinuous",
@@ -520,18 +862,23 @@ void HikConstantLaserScanWindow::shutdownWorkers() {
             &ignoredStatistics, &ignoredError);
     }
     continuousState_ = ContinuousState::Idle;
-    if (robotWorker_ && robotThread_.isRunning()) {
-        QMetaObject::invokeMethod(robotWorker_, "disconnectRobot", Qt::BlockingQueuedConnection);
-        robotThread_.quit();
-        robotThread_.wait();
-    }
-    robotWorker_ = nullptr;
     if (cameraWorker_ && cameraThread_.isRunning()) {
         QMetaObject::invokeMethod(cameraWorker_, "disconnectCamera", Qt::BlockingQueuedConnection);
         cameraThread_.quit();
         cameraThread_.wait();
     }
     cameraWorker_ = nullptr;
+    robotLeaseEpoch_.store(0, std::memory_order_release);
+    if (scanActivityHeld_) {
+        // Process teardown must not hand an unresolved motion/terminal lease
+        // to another page.  FairinoRobotSession keeps it until its sole worker
+        // has sent StopMotion and confirmed fresh 20004 stationary samples.
+        scanActivityHeld_ = false;
+        if (gScanActivityOwner == this) gScanActivityOwner = nullptr;
+        emit scanActivityChanged(false);
+    } else if (robotSession_ && robotClientId_ > 0) {
+        robotSession_->releaseExclusive(robotClientId_);
+    }
 }
 
 void HikConstantLaserScanWindow::closeEvent(QCloseEvent* event) {
@@ -540,8 +887,9 @@ void HikConstantLaserScanWindow::closeEvent(QCloseEvent* event) {
 }
 
 void HikConstantLaserScanWindow::appendLog(const QString& message) {
-    logView_->appendPlainText(QStringLiteral("[%1] %2")
-        .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")), message));
+    logView_->appendPlainText(QStringLiteral("[%1][%2] %3")
+        .arg(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")),
+             profile_.id, message));
 }
 
 void HikConstantLaserScanWindow::showError(const QString& title, const QString& message) {
@@ -549,34 +897,149 @@ void HikConstantLaserScanWindow::showError(const QString& title, const QString& 
     if (!shuttingDown_) QMessageBox::warning(this, title, message);
 }
 
+void HikConstantLaserScanWindow::setProfileTabActive(bool active) {
+    if (profileTabActive_ == active) return;
+    profileTabActive_ = active;
+    if (!active && scanActivityHeld_) {
+        appendLog(QStringLiteral(
+            "本设备组仍在执行扫描安全收尾，继续持有共享 FR5 命令租约。"));
+    } else if (active &&
+               !robotSession_->commandAvailableTo(robotClientId_)) {
+        appendLog(QStringLiteral(
+            "另一设备组当前持有共享 FR5 命令租约；连接状态仍然共享，"
+            "但租约释放前本页不能发送机器人命令。"));
+        if (scanState_ == ScanState::Idle &&
+            continuousState_ == ContinuousState::Idle) {
+            scanStatusLabel_->setText(QStringLiteral(
+                "共享 FR5 正由另一设备组执行扫描/安全收尾。"));
+        }
+    }
+    updateUi();
+}
+
+bool HikConstantLaserScanWindow::acquireScanActivity(QString* error) {
+    if (scanActivityHeld_) return true;
+    if (!profileTabActive_) {
+        if (error) *error = QStringLiteral("当前设备组标签页未激活。");
+        return false;
+    }
+    if (gScanActivityOwner && gScanActivityOwner != this) {
+        if (error) {
+            *error = QStringLiteral("设备组 %1 正在执行真实采集或运动。")
+                .arg(gScanActivityOwner->deviceProfile().displayName);
+        }
+        return false;
+    }
+    QString leaseError;
+    if (!robotSession_->acquireExclusive(
+            robotClientId_,
+            QStringLiteral("%1 扫描/安全收尾").arg(profile_.id),
+            &leaseError)) {
+        if (error) *error = leaseError;
+        return false;
+    }
+    const quint64 leaseEpoch =
+        robotSession_->exclusiveLeaseEpochFor(robotClientId_);
+    if (leaseEpoch == 0) {
+        robotSession_->releaseExclusive(robotClientId_);
+        if (error) {
+            *error = QStringLiteral(
+                "共享 FR5 已授予租约，但未生成有效代次。");
+        }
+        return false;
+    }
+    robotLeaseEpoch_.store(leaseEpoch, std::memory_order_release);
+    gScanActivityOwner = this;
+    scanActivityHeld_ = true;
+    laserSafetyAbortIssued_ = false;
+    terminalBarrierActive_ = false;
+    terminalCompleted_ = false;
+    terminalMotionFault_ = false;
+    terminalCameraFault_ = false;
+    terminalReason_.clear();
+    terminalMode_.clear();
+    terminalSessionDirectory_.clear();
+    terminalEndedUtc_.clear();
+    terminalMotionFaultDetail_.clear();
+    terminalCameraFaultDetail_.clear();
+    terminalStatistics_ = QJsonObject();
+    ++scanGeneration_;
+    emit scanActivityChanged(true);
+    return true;
+}
+
+void HikConstantLaserScanWindow::releaseScanActivity() {
+    if (!scanActivityHeld_) return;
+    scanActivityHeld_ = false;
+    if (gScanActivityOwner == this) gScanActivityOwner = nullptr;
+    robotLeaseEpoch_.store(0, std::memory_order_release);
+    robotSession_->releaseExclusive(robotClientId_);
+    emit scanActivityChanged(false);
+}
+
 void HikConstantLaserScanWindow::updateUi() {
-    const bool idle = !shuttingDown_ && scanState_ == ScanState::Idle &&
-                      continuousState_ == ContinuousState::Idle &&
-                      pendingRobotRequestId_ < 0 && pendingCameraRequestId_ < 0;
+    const bool stateIdle = !shuttingDown_ && scanState_ == ScanState::Idle &&
+                           continuousState_ == ContinuousState::Idle &&
+                           !terminalBarrierActive_ &&
+                           pendingMotionRequestId_ < 0 &&
+                           pendingRobotRequestId_ < 0 &&
+                           pendingCameraRequestId_ < 0 &&
+                           !robotBusy_ && !cameraBusy_;
+    const bool idle = profileTabActive_ && stateIdle;
+    const bool robotAvailable =
+        robotSession_->commandAvailableTo(robotClientId_);
+    const bool laserTransportReady =
+        laserConnectionState_ == LineLaserConnectionState::Ready;
+    const bool profileLaserReady = laserReadyForProfile();
     connectCameraButton_->setEnabled(idle && !cameraConnected_ && !cameraBusy_);
     disconnectCameraButton_->setEnabled(idle && cameraConnected_ && !cameraBusy_);
     cameraIpEdit_->setEnabled(idle && !cameraConnected_);
     exposureSpin_->setEnabled(idle && !cameraBusy_);
     gainSpin_->setEnabled(idle && !cameraBusy_);
     cameraTimeoutSpin_->setEnabled(idle && !cameraBusy_);
-    connectRobotButton_->setEnabled(idle && !robotConnected_ && !robotBusy_);
-    disconnectRobotButton_->setEnabled(idle && robotConnected_ && !robotBusy_);
-    robotIpEdit_->setEnabled(idle && !robotConnected_);
-    readPoseButton_->setEnabled(idle && robotConnected_ && !robotBusy_);
-    teachStartButton_->setEnabled(idle && robotConnected_ && !robotBusy_);
-    teachEndButton_->setEnabled(idle && robotConnected_ && !robotBusy_);
+    connectLaserButton_->setEnabled(
+        profileTabActive_ &&
+        (laserConnectionState_ == LineLaserConnectionState::Disconnected ||
+         laserConnectionState_ == LineLaserConnectionState::Fault));
+    enableProfileLaserButton_->setEnabled(
+        idle && laserTransportReady && !profileLaserReady);
+    disableAllLasersButton_->setEnabled(
+        profileTabActive_ && laserTransportReady &&
+        laserStatus_.state != LineLaserState::Off);
+    connectRobotButton_->setEnabled(
+        idle && robotAvailable && !robotConnected_ && !robotBusy_ &&
+        !robotSession_->connectionAttempted());
+    disconnectRobotButton_->setEnabled(
+        idle && robotAvailable && robotConnected_ && !robotBusy_);
+    robotIpEdit_->setEnabled(
+        idle && !robotConnected_ && !robotSession_->connectionAttempted());
+    readPoseButton_->setEnabled(
+        idle && robotAvailable && robotConnected_ && !robotBusy_);
+    teachStartButton_->setEnabled(
+        idle && robotAvailable && robotConnected_ && !robotBusy_);
+    teachEndButton_->setEnabled(
+        idle && robotAvailable && robotConnected_ && !robotBusy_);
     editStartButton_->setEnabled(idle && startTaught_);
     editEndButton_->setEnabled(idle && endTaught_);
     reloadCalibrationButton_->setEnabled(idle);
     dryRunButton_->setEnabled(idle && startTaught_ && endTaught_);
-    captureCurrentButton_->setEnabled(idle && cameraConnected_ && robotConnected_ && calibrationReady_);
-    startScanButton_->setEnabled(idle && startTaught_ && endTaught_ &&
+    captureCurrentButton_->setEnabled(
+        idle && robotAvailable && cameraConnected_ && robotConnected_ &&
+        calibrationReady_ && profileLaserReady);
+    startScanButton_->setEnabled(idle && robotAvailable &&
+                                 startTaught_ && endTaught_ &&
                                  (dryRunCheck_->isChecked() ||
-                                  (cameraConnected_ && robotConnected_ && calibrationReady_)));
+                                  (cameraConnected_ && robotConnected_ &&
+                                   calibrationReady_ && profileLaserReady)));
     startContinuousButton_->setEnabled(
-        idle && synchronizationConfigReady_ && startTaught_ && endTaught_ &&
-        cameraConnected_ && robotConnected_ && calibrationReady_);
-    stopButton_->setEnabled(!idle && robotConnected_);
+        idle && robotAvailable && synchronizationConfigReady_ &&
+        startTaught_ && endTaught_ && cameraConnected_ && robotConnected_ &&
+        calibrationReady_ && profileLaserReady);
+    const bool scanStateMachineActive =
+        scanState_ != ScanState::Idle ||
+        continuousState_ != ContinuousState::Idle;
+    stopButton_->setEnabled(
+        profileTabActive_ && scanStateMachineActive && robotConnected_);
     safetyConfirmCheck_->setEnabled(idle && !dryRunCheck_->isChecked());
     stepSpin_->setEnabled(idle);
     velocitySpin_->setEnabled(idle);
@@ -593,21 +1056,503 @@ void HikConstantLaserScanWindow::updateUi() {
     targetCountLimitSpin_->setEnabled(idle && targetCountLimitCheck_->isChecked());
 }
 
+bool HikConstantLaserScanWindow::laserReadyForProfile(QString* error) const {
+    if (error) error->clear();
+    if (laserConnectionState_ != LineLaserConnectionState::Ready ||
+        !laserStatus_.reachable || !laserStatus_.leaseActive) {
+        if (error) {
+            *error = QStringLiteral(
+                "鲁班猫 TTL 控制尚未就绪或控制租约无效。");
+        }
+        return false;
+    }
+    if (!laserStatusFresh()) {
+        if (error) {
+            *error = QStringLiteral(
+                "板端 TTL 状态已超过 %1 ms 未刷新。")
+                         .arg(kLaserStatusFreshnessLimitMs);
+        }
+        return false;
+    }
+    if (!laserStatus_.fault.trimmed().isEmpty()) {
+        if (error) {
+            *error = QStringLiteral("板端 GPIO 故障：%1")
+                         .arg(laserStatus_.fault);
+        }
+        return false;
+    }
+    const bool expected450 = profile_.wavelengthNm == 450;
+    const bool expected650 = profile_.wavelengthNm == 650;
+    const LineLaserState expectedState = expected450
+        ? LineLaserState::Laser450
+        : expected650 ? LineLaserState::Laser650
+                      : LineLaserState::Unknown;
+    if (expectedState == LineLaserState::Unknown ||
+        laserStatus_.state != expectedState ||
+        laserStatus_.ttl450High != expected450 ||
+        laserStatus_.ttl650High != expected650) {
+        if (error) {
+            *error = QStringLiteral(
+                "本组 %1 nm TTL 尚未由板端确认 HIGH，或另一路未确认 LOW。")
+                         .arg(profile_.wavelengthNm);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool HikConstantLaserScanWindow::laserStatusFresh() const {
+    if (laserStatusReceivedMonotonicMs_ <= 0) return false;
+    const qint64 nowMs = hik_sync::getMonotonicRawNs() / 1000000LL;
+    const qint64 ageMs = nowMs - laserStatusReceivedMonotonicMs_;
+    return ageMs >= 0 && ageMs <= kLaserStatusFreshnessLimitMs;
+}
+
+void HikConstantLaserScanWindow::connectLaserController() {
+    appendLog(QStringLiteral(
+        "请求连接鲁班猫 192.168.1.12；使用受限密钥，不允许密码交互。"));
+    laserController_->connectController();
+}
+
+void HikConstantLaserScanWindow::enableProfileLaser() {
+    if (!profileTabActive_) {
+        showError(QStringLiteral("TTL 控制"),
+                  QStringLiteral("请先切换到本设备组。"));
+        return;
+    }
+    if (gScanActivityOwner) {
+        showError(QStringLiteral("TTL 控制"),
+                  QStringLiteral(
+                      "真实采集、运动或安全收尾期间禁止开启任何激光；"
+                      "只能请求关闭两路 TTL。"));
+        return;
+    }
+    if (scanState_ != ScanState::Idle ||
+        continuousState_ != ContinuousState::Idle ||
+        terminalBarrierActive_) {
+        showError(QStringLiteral("TTL 控制"),
+                  QStringLiteral("扫描期间不能切换激光通道。"));
+        return;
+    }
+    appendLog(QStringLiteral(
+        "请求开启 %1 nm：TTL 将持续 HIGH，直到关光、租约失效或连接断开；"
+        "另一通道会保持 LOW。")
+        .arg(profile_.wavelengthNm));
+    if (profile_.wavelengthNm == 450) {
+        laserController_->set450();
+    } else if (profile_.wavelengthNm == 650) {
+        laserController_->set650();
+    } else {
+        showError(QStringLiteral("TTL 控制"),
+                  QStringLiteral("不支持的激光波长：%1 nm")
+                      .arg(profile_.wavelengthNm));
+    }
+}
+
+void HikConstantLaserScanWindow::disableAllLasers() {
+    if (continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(
+            QStringLiteral("用户关闭两路 TTL，连续扫描同步终止。"),
+            pendingMotionRequestId_ >= 0);
+        return;
+    }
+    if (scanState_ != ScanState::Idle) {
+        abortScan(
+            QStringLiteral("用户关闭两路 TTL，停稳扫描同步终止。"),
+            pendingMotionRequestId_ >= 0);
+        return;
+    }
+    appendLog(QStringLiteral("请求关闭两路 TTL。"));
+    requestLaserOff();
+}
+
+quint64 HikConstantLaserScanWindow::requestLaserOff() {
+    return laserController_
+        ? laserController_->requestOffTracked()
+        : 0;
+}
+
+void HikConstantLaserScanWindow::beginTerminalBarrier(
+        bool completed,
+        const QString& reason,
+        const QString& mode,
+        const QString& sessionDirectory,
+        const QJsonObject& statistics) {
+    terminalBarrierActive_ = true;
+    terminalCompleted_ = completed;
+    terminalReason_ = reason;
+    terminalMode_ = mode;
+    terminalSessionDirectory_ = sessionDirectory;
+    terminalEndedUtc_ = QDateTime::currentDateTimeUtc().toString(
+        Qt::ISODateWithMs);
+    terminalStatistics_ = statistics;
+    terminalLaserOffRequestedNs_ = hik_sync::getMonotonicRawNs();
+    terminalLaserOffCommandToken_ = requestLaserOff();
+    QString resultError;
+    if (!writeSessionResult(&resultError)) {
+        appendLog(QStringLiteral("警告：无法写入会话最终状态：%1")
+                      .arg(resultError));
+    }
+    scanStatusLabel_->setText(QStringLiteral(
+        "%1；正在等待板端确认两路 LOW%2。")
+        .arg(reason,
+             pendingMotionRequestId_ >= 0
+                ? QStringLiteral("并等待 FR5 运动终止")
+                : QString()));
+    tryCompleteTerminalBarrier();
+    updateUi();
+}
+
+void HikConstantLaserScanWindow::tryCompleteTerminalBarrier() {
+    if (!terminalBarrierActive_) return;
+    const bool laserOffConfirmed =
+        laserConnectionState_ == LineLaserConnectionState::Ready &&
+        laserStatusFresh() && laserStatus_.reachable &&
+        terminalLaserOffRequestedNs_ > 0 &&
+        laserStatus_.sourceMonotonicNs >= terminalLaserOffRequestedNs_ &&
+        terminalLaserOffCommandToken_ > 0 &&
+        laserAcknowledgedOffCommandToken_ >=
+            terminalLaserOffCommandToken_ &&
+        laserStatus_.leaseActive &&
+        laserStatus_.state == LineLaserState::Off &&
+        !laserStatus_.ttl450High && !laserStatus_.ttl650High &&
+        laserStatus_.fault.trimmed().isEmpty();
+    const bool motionConfirmed =
+        pendingMotionRequestId_ < 0 && !robotBusy_ &&
+        !terminalMotionFault_;
+    const bool cameraIdleConfirmed =
+        !cameraBusy_ && pendingCameraRequestId_ < 0 &&
+        !terminalCameraFault_;
+
+    if (terminalMotionFault_) {
+        scanStatusLabel_->setText(QStringLiteral(
+            "%1；FR5 停止确认失败，保持设备组锁止。"
+            "请使用物理急停并重启程序：%2")
+            .arg(terminalReason_, terminalMotionFaultDetail_));
+        scanStatusLabel_->setStyleSheet(QStringLiteral(
+            "color:#b00020;font-weight:bold;"));
+        return;
+    }
+    if (terminalCameraFault_) {
+        scanStatusLabel_->setText(QStringLiteral(
+            "%1；相机停流未确认，保持设备组锁止。"
+            "请关闭相机电源/网络并重启程序：%2")
+            .arg(terminalReason_, terminalCameraFaultDetail_));
+        scanStatusLabel_->setStyleSheet(QStringLiteral(
+            "color:#b00020;font-weight:bold;"));
+        return;
+    }
+    if (!laserOffConfirmed || !motionConfirmed ||
+        !cameraIdleConfirmed) {
+        scanStatusLabel_->setText(QStringLiteral(
+            "%1；安全收尾等待：TTL LOW=%2，FR5停止=%3，相机空闲=%4。")
+            .arg(terminalReason_,
+                 laserOffConfirmed ? QStringLiteral("已确认")
+                                   : QStringLiteral("等待"),
+                 motionConfirmed ? QStringLiteral("已确认")
+                                 : QStringLiteral("等待"),
+                 cameraIdleConfirmed ? QStringLiteral("已确认")
+                                     : QStringLiteral("等待")));
+        return;
+    }
+
+    terminalBarrierActive_ = false;
+    scanStatusLabel_->setStyleSheet(QString());
+    scanStatusLabel_->setText(QStringLiteral(
+        "%1；板端已确认两路 TTL LOW，FR5 已确认停止，相机已空闲。")
+        .arg(terminalReason_));
+    QString resultError;
+    if (!writeSessionResult(&resultError)) {
+        appendLog(QStringLiteral("警告：无法更新会话最终状态：%1")
+                      .arg(resultError));
+    }
+    releaseScanActivity();
+    updateUi();
+}
+
+bool HikConstantLaserScanWindow::writeSessionResult(
+        QString* error) const {
+    if (error) error->clear();
+    if (terminalSessionDirectory_.trimmed().isEmpty()) return true;
+    if (!QDir().mkpath(terminalSessionDirectory_)) {
+        if (error) {
+            *error = QStringLiteral("无法创建会话结果目录：%1")
+                         .arg(terminalSessionDirectory_);
+        }
+        return false;
+    }
+    const bool laserOffConfirmed =
+        laserConnectionState_ == LineLaserConnectionState::Ready &&
+        laserStatusFresh() && laserStatus_.reachable &&
+        terminalLaserOffRequestedNs_ > 0 &&
+        laserStatus_.sourceMonotonicNs >= terminalLaserOffRequestedNs_ &&
+        terminalLaserOffCommandToken_ > 0 &&
+        laserAcknowledgedOffCommandToken_ >=
+            terminalLaserOffCommandToken_ &&
+        laserStatus_.leaseActive &&
+        laserStatus_.state == LineLaserState::Off &&
+        !laserStatus_.ttl450High && !laserStatus_.ttl650High &&
+        laserStatus_.fault.trimmed().isEmpty();
+    const bool motionConfirmed =
+        pendingMotionRequestId_ < 0 && !robotBusy_ &&
+        !terminalMotionFault_;
+    const bool cameraIdleConfirmed =
+        !cameraBusy_ && pendingCameraRequestId_ < 0 &&
+        !terminalCameraFault_;
+    const qint64 nowMonotonicMs =
+        hik_sync::getMonotonicRawNs() / 1000000LL;
+    const qint64 laserStatusAgeMs =
+        laserStatusReceivedMonotonicMs_ > 0
+            ? nowMonotonicMs - laserStatusReceivedMonotonicMs_
+            : -1;
+
+    QJsonObject root;
+    root.insert(QStringLiteral("schema_version"), 1);
+    root.insert(QStringLiteral("profile_id"), profile_.id);
+    root.insert(QStringLiteral("wavelength_nm"), profile_.wavelengthNm);
+    root.insert(QStringLiteral("ttl_physical_pin"),
+                profile_.ttlPhysicalPin);
+    root.insert(QStringLiteral("mode"), terminalMode_);
+    root.insert(QStringLiteral("completed"), terminalCompleted_);
+    root.insert(QStringLiteral("reason"), terminalReason_);
+    root.insert(QStringLiteral("ended_utc"), terminalEndedUtc_);
+    root.insert(QStringLiteral("laser_off_confirmed"),
+                laserOffConfirmed);
+    root.insert(QStringLiteral("laser_status_fresh"),
+                laserStatusFresh());
+    root.insert(QStringLiteral("laser_status_age_ms"),
+                static_cast<double>(laserStatusAgeMs));
+    root.insert(QStringLiteral("laser_status_source_monotonic_ns"),
+                static_cast<double>(laserStatus_.sourceMonotonicNs));
+    root.insert(QStringLiteral("laser_status_event_sequence"),
+                static_cast<double>(laserStatus_.eventSequence));
+    root.insert(QStringLiteral("laser_transport_generation"),
+                static_cast<double>(laserStatus_.transportGeneration));
+    root.insert(QStringLiteral("terminal_laser_off_requested_ns"),
+                static_cast<double>(terminalLaserOffRequestedNs_));
+    root.insert(QStringLiteral("terminal_laser_off_command_token"),
+                static_cast<double>(terminalLaserOffCommandToken_));
+    root.insert(QStringLiteral("laser_acknowledged_off_command_token"),
+                static_cast<double>(
+                    laserAcknowledgedOffCommandToken_));
+    root.insert(QStringLiteral(
+                    "laser_current_status_off_command_token"),
+                static_cast<double>(
+                    laserStatus_.acknowledgedOffCommandToken));
+    root.insert(QStringLiteral("laser_state"),
+                laserStateText(laserStatus_.state));
+    root.insert(QStringLiteral("ttl_450_high"),
+                laserStatus_.ttl450High);
+    root.insert(QStringLiteral("ttl_650_high"),
+                laserStatus_.ttl650High);
+    root.insert(QStringLiteral("laser_lease_active"),
+                laserStatus_.leaseActive);
+    root.insert(QStringLiteral("laser_fault"), laserStatus_.fault);
+    root.insert(QStringLiteral("robot_motion_confirmed"),
+                motionConfirmed);
+    root.insert(QStringLiteral("robot_busy"), robotBusy_);
+    root.insert(QStringLiteral("camera_idle_confirmed"),
+                cameraIdleConfirmed);
+    root.insert(QStringLiteral("camera_busy"), cameraBusy_);
+    root.insert(QStringLiteral("camera_stop_fault"),
+                terminalCameraFault_);
+    root.insert(QStringLiteral("camera_stop_fault_detail"),
+                terminalCameraFaultDetail_);
+    root.insert(QStringLiteral("interlock_complete"),
+                laserOffConfirmed && motionConfirmed &&
+                cameraIdleConfirmed);
+    root.insert(QStringLiteral("motion_stop_fault"),
+                terminalMotionFault_);
+    root.insert(QStringLiteral("motion_stop_fault_detail"),
+                terminalMotionFaultDetail_);
+    root.insert(QStringLiteral("laser_daemon_generation"),
+                laserStatus_.daemonGeneration);
+    root.insert(QStringLiteral("terminal_barrier_active"),
+                terminalBarrierActive_);
+    root.insert(QStringLiteral("statistics"), terminalStatistics_);
+
+    const QByteArray payload =
+        QJsonDocument(root).toJson(QJsonDocument::Indented);
+    const QString path = QDir(terminalSessionDirectory_).absoluteFilePath(
+        QStringLiteral("session_result.json"));
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly) ||
+        file.write(payload) != payload.size() ||
+        !file.commit()) {
+        if (error) {
+            *error = QStringLiteral("无法原子写入 %1").arg(path);
+        }
+        return false;
+    }
+    return true;
+}
+
+void HikConstantLaserScanWindow::onLaserConnectionStateChanged(
+        LineLaserConnectionState state, QString detail) {
+    laserConnectionState_ = state;
+    if (state == LineLaserConnectionState::Disconnected) {
+        connectLaserButton_->setText(QStringLiteral("连接鲁班猫 TTL"));
+    } else if (state == LineLaserConnectionState::Fault) {
+        connectLaserButton_->setText(QStringLiteral("重连鲁班猫 TTL"));
+    } else {
+        connectLaserButton_->setText(QStringLiteral("TTL 通道已连接"));
+    }
+    appendLog(QStringLiteral("TTL连接状态：%1").arg(detail));
+    if (scanActivityHeld_ &&
+        !terminalBarrierActive_ &&
+        state != LineLaserConnectionState::Ready &&
+        state != LineLaserConnectionState::CommandPending) {
+        abortForLaserSafety(QStringLiteral("TTL 控制连接失效：%1").arg(detail));
+    }
+    if (terminalBarrierActive_) {
+        const bool currentOffAcknowledged =
+            terminalLaserOffCommandToken_ > 0 &&
+            laserAcknowledgedOffCommandToken_ >=
+                terminalLaserOffCommandToken_;
+        if (state == LineLaserConnectionState::Ready &&
+            !currentOffAcknowledged) {
+            terminalLaserOffRequestedNs_ =
+                hik_sync::getMonotonicRawNs();
+            terminalLaserOffCommandToken_ = requestLaserOff();
+        }
+        tryCompleteTerminalBarrier();
+    }
+    updateUi();
+}
+
+void HikConstantLaserScanWindow::onLaserStatusChanged(
+        LineLaserStatus status) {
+    if (status.sourceMonotonicNs <= 0 || status.eventSequence == 0) {
+        appendLog(QStringLiteral(
+            "忽略缺少源单调时间或事件序号的 TTL 状态。"));
+        return;
+    }
+    if (status.transportGeneration < laserTransportGeneration_ ||
+        status.eventSequence <= laserStatusEventSequence_) {
+        appendLog(QStringLiteral(
+            "忽略过期 TTL 状态：transport=%1, sequence=%2；"
+            "当前 transport=%3, sequence=%4。")
+            .arg(status.transportGeneration)
+            .arg(status.eventSequence)
+            .arg(laserTransportGeneration_)
+            .arg(laserStatusEventSequence_));
+        return;
+    }
+    if (status.transportGeneration > laserTransportGeneration_) {
+        // An ACK is meaningful only within the SSH transport that carried its
+        // request/reply pair.  Reconnect starts a fresh causal domain.
+        laserAcknowledgedOffCommandToken_ = 0;
+    }
+    laserTransportGeneration_ = status.transportGeneration;
+    laserStatusEventSequence_ = status.eventSequence;
+    laserAcknowledgedOffCommandToken_ = std::max(
+        laserAcknowledgedOffCommandToken_,
+        status.acknowledgedOffCommandToken);
+    laserStatus_ = status;
+    laserStatusReceivedMonotonicMs_ =
+        status.sourceMonotonicNs / 1000000LL;
+    if (!status.reachable) {
+        laserStatusLabel_->setText(QStringLiteral(
+            "鲁班猫 TTL 状态未知；断线租约会强制两路 LOW"));
+        laserStatusLabel_->setStyleSheet(QStringLiteral(
+            "color:#b00020;font-weight:bold;"));
+    } else {
+        const bool ready = laserReadyForProfile();
+        laserStatusLabel_->setText(QStringLiteral(
+            "%1｜本组 Pin %2｜租约 %3 ms｜daemon=%4")
+            .arg(laserStateText(status.state))
+            .arg(profile_.ttlPhysicalPin)
+            .arg(status.leaseRemainingMs)
+            .arg(status.daemonGeneration.left(12)));
+        laserStatusLabel_->setStyleSheet(ready
+            ? QStringLiteral("color:#1b5e20;font-weight:bold;")
+            : status.state == LineLaserState::Off
+                ? QStringLiteral("color:#455a64;font-weight:bold;")
+                : QStringLiteral("color:#e65100;font-weight:bold;"));
+    }
+    const bool laserHighRequired =
+        scanState_ != ScanState::Idle ||
+        continuousState_ == ContinuousState::MovingToStart ||
+        continuousState_ == ContinuousState::StartingCamera ||
+        continuousState_ == ContinuousState::Scanning;
+    if (scanActivityHeld_ && !terminalBarrierActive_ &&
+        laserHighRequired && !laserReadyForProfile()) {
+        abortForLaserSafety(QStringLiteral(
+            "板端不再确认本组 TTL HIGH 且另一路 LOW。"));
+    }
+    if (terminalBarrierActive_) tryCompleteTerminalBarrier();
+    updateUi();
+}
+
+void HikConstantLaserScanWindow::onLaserCommandFinished(
+        QString command, bool success, QString detail) {
+    appendLog(QStringLiteral("TTL命令 %1：%2；%3")
+        .arg(command, success ? QStringLiteral("成功")
+                              : QStringLiteral("失败"),
+             detail));
+    updateUi();
+}
+
+void HikConstantLaserScanWindow::onLaserFault(QString detail) {
+    appendLog(QStringLiteral("TTL控制故障：%1").arg(detail));
+    if (scanActivityHeld_ && !terminalBarrierActive_) {
+        abortForLaserSafety(QStringLiteral("TTL 控制故障：%1").arg(detail));
+    }
+}
+
+void HikConstantLaserScanWindow::abortForLaserSafety(
+        const QString& reason) {
+    if (laserSafetyAbortIssued_) return;
+    laserSafetyAbortIssued_ = true;
+    requestLaserOff();
+    if (continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(reason, pendingMotionRequestId_ >= 0);
+    } else if (scanState_ != ScanState::Idle) {
+        abortScan(reason, pendingMotionRequestId_ >= 0);
+    }
+}
+
 void HikConstantLaserScanWindow::connectCamera() {
+    if (!profileTabActive_) {
+        showError(QStringLiteral("相机连接"),
+                  QStringLiteral("请先切换到设备组 %1。").arg(profile_.displayName));
+        return;
+    }
     const QString ip = cameraIpEdit_->text().trimmed();
-    if (!validIpv4(ip)) { showError(QStringLiteral("相机连接"), QStringLiteral("相机 IP 无效。")); return; }
+    if (!validIpv4(ip)) {
+        showError(QStringLiteral("相机连接"),
+                  QStringLiteral("设备组 %1 的相机 IP 无效。")
+                      .arg(profile_.displayName));
+        return;
+    }
     emit requestConnectCamera(ip);
 }
 
 void HikConstantLaserScanWindow::disconnectCamera() { emit requestDisconnectCamera(); }
 
 void HikConstantLaserScanWindow::connectRobot() {
+    if (!profileTabActive_) {
+        showError(QStringLiteral("FR5 连接"),
+                  QStringLiteral("请先切换到设备组 %1。").arg(profile_.displayName));
+        return;
+    }
     const QString ip = robotIpEdit_->text().trimmed();
     if (!validIpv4(ip)) { showError(QStringLiteral("FR5 连接"), QStringLiteral("机器人 IP 无效。")); return; }
-    emit requestConnectRobot(ip);
+    if (!robotSession_ || !robotSession_->isRunning()) {
+        showError(QStringLiteral("FR5 连接"),
+                  QStringLiteral("共享 FR5 会话不可用。"));
+        return;
+    }
+    robotBusy_ = true;
+    robotStatusLabel_->setText(
+        QStringLiteral("正在建立共享连接 %1 …").arg(ip));
+    emit requestConnectRobot(robotClientId_, ip);
+    updateUi();
 }
 
-void HikConstantLaserScanWindow::disconnectRobot() { emit requestDisconnectRobot(); }
+void HikConstantLaserScanWindow::disconnectRobot() {
+    emit requestDisconnectRobot(robotClientId_);
+}
 
 void HikConstantLaserScanWindow::readCurrentPose() { issueRobotRead(ReadRole::Manual); }
 void HikConstantLaserScanWindow::teachStart() { issueRobotRead(ReadRole::TeachStart); }
@@ -682,9 +1627,26 @@ void HikConstantLaserScanWindow::reloadCalibration() {
 bool HikConstantLaserScanWindow::loadFormalCalibration(QString* error) {
     if (error) error->clear();
     calibrationReady_ = false;
-    intrinsicsPath_ = QDir(configDir_).absoluteFilePath(QStringLiteral("hik_intrinsics.yaml"));
-    laserPlanePath_ = QDir(configDir_).absoluteFilePath(QStringLiteral("hik_laser_plane.yaml"));
-    handEyePath_ = QDir(configDir_).absoluteFilePath(QStringLiteral("hik_handeye.yaml"));
+    intrinsicsPath_ = profile_.intrinsicsConfigPath(sourceDir_);
+    laserPlanePath_ = profile_.laserPlaneConfigPath(sourceDir_);
+    handEyePath_ = profile_.handEyeConfigPath(sourceDir_);
+    QStringList missingFiles;
+    const QStringList formalFiles = {
+        intrinsicsPath_, laserPlanePath_, handEyePath_
+    };
+    for (const QString& path : formalFiles) {
+        if (!QFileInfo(path).isFile()) missingFiles.push_back(path);
+    }
+    if (!missingFiles.isEmpty()) {
+        const QString message = QStringLiteral(
+            "设备组 %1 的三维标定未就绪，缺少独立正式文件：%2。"
+            "本组仍可连接相机确认身份和连接状态，但单点、停稳和连续建图均已禁用。")
+            .arg(profile_.displayName, missingFiles.join(QStringLiteral("；")));
+        calibrationStatusLabel_->setText(message);
+        calibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
+        if (error) *error = message;
+        return false;
+    }
     std::string coreError;
     if (!hik_calibration::loadIntrinsicsYaml(localPath(intrinsicsPath_), &intrinsics_,
                                               &intrinsicsMetadata_, &coreError)) {
@@ -729,22 +1691,74 @@ bool HikConstantLaserScanWindow::loadFormalCalibration(QString* error) {
             .arg(intrinsicFrame, laserFrame, handEyeParent, handEyeChild);
         return false;
     }
+    if (intrinsicFrame != profile_.cameraFrame.trimmed()) {
+        if (error) {
+            *error = QStringLiteral(
+                "正式标定 frame=%1，不属于当前 profile 要求的 frame=%2。")
+                .arg(intrinsicFrame, profile_.cameraFrame);
+        }
+        return false;
+    }
     if (intrinsicSerial.isEmpty() || handEyeSerial != intrinsicSerial) {
         if (error) *error = QStringLiteral("内参与手眼相机序列号不一致：%1 / %2。")
             .arg(intrinsicSerial, handEyeSerial);
         return false;
     }
+    if (!profile_.expectedCameraSerial.trimmed().isEmpty() &&
+        intrinsicSerial != profile_.expectedCameraSerial.trimmed()) {
+        if (error) {
+            *error = QStringLiteral(
+                "设备 profile 期望相机 SN=%1，但正式内参/手眼属于 SN=%2。")
+                .arg(profile_.expectedCameraSerial, intrinsicSerial);
+        }
+        return false;
+    }
+    const QString intrinsicModel =
+        QString::fromStdString(intrinsicsMetadata_.cameraModel).trimmed();
+    if (!profile_.expectedCameraModel.trimmed().isEmpty() &&
+        intrinsicModel != profile_.expectedCameraModel.trimmed()) {
+        if (error) {
+            *error = QStringLiteral(
+                "设备 profile 期望相机型号=%1，但正式内参属于型号=%2。")
+                .arg(profile_.expectedCameraModel, intrinsicModel);
+        }
+        return false;
+    }
     profileOptions_.reconstruction.minimumDepthMm = laserMetadata_.validCameraZMinMm;
     profileOptions_.reconstruction.maximumDepthMm = laserMetadata_.validCameraZMaxMm;
+    profileOptions_.reconstruction.stripe.quality.roi =
+        stripeRoi(profile_, intrinsics_.imageSize);
+    profileOptions_.reconstruction.stripeValidityMask.release();
+    if (profileOptions_.reconstruction.stripe.mode !=
+            hik_calibration::StripeExtractionMode::Legacy &&
+        !hik_calibration::buildLaserPlaneValidityMask(
+            intrinsics_.imageSize, intrinsics_, laserPlane_,
+            profileOptions_.reconstruction.minimumDepthMm,
+            profileOptions_.reconstruction.maximumDepthMm,
+            profileOptions_.reconstruction.stripe.quality.roi,
+            &profileOptions_.reconstruction.stripeValidityMask,
+            &coreError)) {
+        if (error) {
+            *error = QStringLiteral("无法建立条纹有效深度走廊: %1")
+                .arg(QString::fromStdString(coreError));
+        }
+        return false;
+    }
     calibrationReady_ = true;
     calibrationStatusLabel_->setText(QStringLiteral(
-        "已校验：相机 SN=%1，图像=%2×%3，Z=%4–%5 mm，输出 base_link；常亮背景核=%6×%7。")
+        "%1 已校验：相机 SN=%2，图像=%3×%4，Z=%5–%6 mm，输出 base_link；"
+        "常亮背景核=%7×%8；质量走廊=%9 px。")
+        .arg(profile_.id)
         .arg(QString::fromStdString(intrinsicsMetadata_.cameraSerial))
         .arg(intrinsics_.imageSize.width).arg(intrinsics_.imageSize.height)
         .arg(profileOptions_.reconstruction.minimumDepthMm, 0, 'f', 2)
         .arg(profileOptions_.reconstruction.maximumDepthMm, 0, 'f', 2)
         .arg(profileOptions_.backgroundKernelWidth)
-        .arg(profileOptions_.backgroundKernelHeight));
+        .arg(profileOptions_.backgroundKernelHeight)
+        .arg(profileOptions_.reconstruction.stripeValidityMask.empty()
+             ? 0
+             : cv::countNonZero(
+                   profileOptions_.reconstruction.stripeValidityMask)));
     calibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#087f23;"));
     return true;
 }
@@ -774,6 +1788,20 @@ bool HikConstantLaserScanWindow::calibrationIdentityMatches(QString* error) cons
     if (cameraSerial_.isEmpty() || cameraSerial_ != intrinsicSerial || cameraSerial_ != handEyeSerial) {
         if (error) *error = QStringLiteral("当前相机 SN=%1，内参 SN=%2，手眼 SN=%3。")
             .arg(cameraSerial_, intrinsicSerial, handEyeSerial);
+        return false;
+    }
+    const QString expectedSerial = profile_.expectedCameraSerial.trimmed();
+    const QString expectedModel = profile_.expectedCameraModel.trimmed();
+    if ((!expectedSerial.isEmpty() && cameraSerial_ != expectedSerial) ||
+        (!expectedModel.isEmpty() && cameraModel_ != expectedModel)) {
+        if (error) {
+            *error = QStringLiteral(
+                "当前设备与 profile 不匹配：model=%1（期望 %2），SN=%3（期望 %4）。")
+                .arg(cameraModel_,
+                     expectedModel.isEmpty() ? QStringLiteral("未限定") : expectedModel,
+                     cameraSerial_,
+                     expectedSerial.isEmpty() ? QStringLiteral("未限定") : expectedSerial);
+        }
         return false;
     }
     return true;
@@ -848,6 +1876,10 @@ void HikConstantLaserScanWindow::startScan() {
         showError(QStringLiteral("无法开始"), QStringLiteral("请连接相机、FR5并加载正式标定。"));
         return;
     }
+    if (!laserReadyForProfile(&error)) {
+        showError(QStringLiteral("激光 TTL 未就绪"), error);
+        return;
+    }
     if (!formalCalibrationFilesUnchanged(&error)) {
         showError(QStringLiteral("标定文件已变化"), error);
         return;
@@ -870,8 +1902,41 @@ void HikConstantLaserScanWindow::startScan() {
             .arg(lengthProtection).arg(velocitySpin_->value(), 0, 'f', 1)
             .arg(stepSpin_->value(), 0, 'f', 2),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
-    if (!createScanSession(&error)) { showError(QStringLiteral("创建扫描会话失败"), error); return; }
+    if (!cameraConnected_ || !robotConnected_) {
+        showError(QStringLiteral("设备状态已变化"),
+                  QStringLiteral("确认期间相机或 FR5 已断开。"));
+        return;
+    }
+    if (!laserReadyForProfile(&error)) {
+        showError(QStringLiteral("设备状态已变化"), error);
+        return;
+    }
+    if (!formalCalibrationFilesUnchanged(&error) ||
+        !calibrationIdentityMatches(&error)) {
+        showError(QStringLiteral("标定状态已变化"), error);
+        return;
+    }
+    if (!acquireScanActivity(&error)) {
+        showError(QStringLiteral("设备组互斥"), error);
+        return;
+    }
+    scanSessionDir_.clear();
+    if (!createScanSession(&error)) {
+        scanState_ = ScanState::Idle;
+        safetyConfirmCheck_->setChecked(false);
+        beginTerminalBarrier(
+            false,
+            QStringLiteral("创建停稳扫描会话失败：%1").arg(error),
+            QStringLiteral("stop_and_shoot_setup"),
+            scanSessionDir_);
+        showError(QStringLiteral("创建扫描会话失败"), error);
+        return;
+    }
     cloud_.clear();
+    qualityCloud_.clear();
+    qualitySupportResult_ =
+        hik_scan::AdjacentProfileSupportResult();
+    qualityVoxelPointCount_ = 0U;
     profileRows_.clear();
     refreshTable();
     currentTargetIndex_ = 0;
@@ -903,6 +1968,10 @@ void HikConstantLaserScanWindow::startContinuousScan() {
         !startTaught_ || !endTaught_) {
         showError(QStringLiteral("无法开始连续同步"),
                   QStringLiteral("请连接相机/FR5、加载正式标定并示教起点和终点。"));
+        return;
+    }
+    if (!laserReadyForProfile(&error)) {
+        showError(QStringLiteral("激光 TTL 未就绪"), error);
         return;
     }
     if (!safetyConfirmCheck_->isChecked()) {
@@ -952,10 +2021,29 @@ void HikConstantLaserScanWindow::startContinuousScan() {
                              QMessageBox::No) != QMessageBox::Yes) {
         return;
     }
+    if (!cameraConnected_ || !robotConnected_) {
+        showError(QStringLiteral("设备状态已变化"),
+                  QStringLiteral("确认期间相机或 FR5 已断开。"));
+        return;
+    }
+    if (!laserReadyForProfile(&error)) {
+        showError(QStringLiteral("设备状态已变化"), error);
+        return;
+    }
+    if (!formalCalibrationFilesUnchanged(&error) ||
+        !calibrationIdentityMatches(&error)) {
+        showError(QStringLiteral("标定状态已变化"), error);
+        return;
+    }
+    if (!acquireScanActivity(&error)) {
+        showError(QStringLiteral("设备组互斥"), error);
+        return;
+    }
     continuousAbortRequested_ = false;
     synchronizationSessionDir_.clear();
     continuousState_ = ContinuousState::MovingToStart;
-    pendingMotionRequestId_ = ++nextRobotRequestId_;
+    pendingMotionRequestId_ =
+        robotSession_->allocateRequestId(robotClientId_);
     scanStatusLabel_->setText(QStringLiteral("正在移动到连续扫描起点：%1")
                               .arg(poseText(startPose_)));
     appendLog(scanStatusLabel_->text());
@@ -973,6 +2061,7 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
     if (QDir::isRelativePath(outputRoot)) {
         outputRoot = QDir(sourceDir_).absoluteFilePath(outputRoot);
     }
+    outputRoot = QDir(outputRoot).absoluteFilePath(profile_.id);
     synchronizationSessionDir_ = uniqueSession(outputRoot, QStringLiteral("sync_scan"));
     if (synchronizationSessionDir_.isEmpty()) {
         if (error) *error = QStringLiteral("无法生成唯一同步会话目录。根目录=%1").arg(outputRoot);
@@ -991,6 +2080,10 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
         if (error) *error = QString::fromStdString(coreError);
         return false;
     }
+    if (!writeSessionMetadata(synchronizationSessionDir_, error)) {
+        synchronizationSession_.stop();
+        return false;
+    }
     hik_scan::ContinuousReconstructionOptions reconstructionOptions;
     reconstructionOptions.queueCapacity =
         synchronizationConfig_.reconstructionQueueCapacity;
@@ -1005,6 +2098,25 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
         localPath(laserPlaneSha256_);
     reconstructionOptions.handEyeSha256 =
         localPath(handEyeSha256_);
+    const bool qualityCenterlineEnabled =
+        profileOptions_.reconstruction.stripe.mode !=
+        hik_calibration::StripeExtractionMode::Legacy;
+    const double nominalProfileSpacingMm =
+        synchronizationConfig_.scanSpeedMmS /
+        synchronizationConfig_.cameraTargetFps;
+    reconstructionOptions.saveQualityCloud =
+        qualityCenterlineEnabled;
+    reconstructionOptions.enableAdjacentProfileSupport =
+        qualityCenterlineEnabled;
+    reconstructionOptions.adjacentSupportRadiusMm = std::max(
+        kQualitySupportRadiusFloorMm,
+        std::max(
+            kQualitySupportStepFactor * nominalProfileSpacingMm,
+            kQualitySupportVoxelFactor * voxelSpin_->value()));
+    reconstructionOptions.adjacentMinimumSupportingProfiles =
+        kQualitySupportMinimumProfiles;
+    reconstructionOptions.adjacentMaximumProfileGap =
+        kQualitySupportMaximumProfileGap;
     if (!continuousReconstruction_.start(
             reconstructionOptions, intrinsics_, laserPlane_,
             profileOptions_, &coreError)) {
@@ -1041,6 +2153,15 @@ bool HikConstantLaserScanWindow::createSynchronizationSession(QString* error) {
         .arg(synchronizationConfig_.imageWriterThreads)
         .arg(synchronizationConfig_.reconstructionThreads)
         .arg(synchronizationConfig_.reconstructionQueueCapacity));
+    if (qualityCenterlineEnabled) {
+        appendLog(QStringLiteral(
+            "连续质量点云并行开启：二维硬门控后保存 optical，"
+            "再以 radius=%1 mm、min_profiles=%2、max_gap=%3 做相邻 "
+            "profile 支持；不会覆盖正式 continuous_raw/voxel。")
+            .arg(reconstructionOptions.adjacentSupportRadiusMm, 0, 'f', 3)
+            .arg(reconstructionOptions.adjacentMinimumSupportingProfiles)
+            .arg(reconstructionOptions.adjacentMaximumProfileGap));
+    }
     return true;
 }
 
@@ -1055,11 +2176,14 @@ void HikConstantLaserScanWindow::onContinuousCameraStarted(
         "连续相机已就绪：actual exposure=%1 us, actual fps=%2, timestamp=%3, frequency=%4 Hz。")
         .arg(actualExposureUs, 0, 'f', 3).arg(actualFps, 0, 'f', 3)
         .arg(timestampDescription).arg(timestampFrequencyHz));
-    QTimer::singleShot(100, this, [this]() {
-        if (continuousState_ != ContinuousState::StartingCamera ||
+    const quint64 generation = scanGeneration_;
+    QTimer::singleShot(100, this, [this, generation]() {
+        if (generation != scanGeneration_ ||
+            continuousState_ != ContinuousState::StartingCamera ||
             continuousAbortRequested_) return;
         continuousState_ = ContinuousState::Scanning;
-        pendingMotionRequestId_ = ++nextRobotRequestId_;
+        pendingMotionRequestId_ =
+            robotSession_->allocateRequestId(robotClientId_);
         scanStatusLabel_->setText(QStringLiteral(
             "60fps 连续同步采集中：MoveL 到终点；加减速帧会保留并标记。"));
         appendLog(scanStatusLabel_->text());
@@ -1074,10 +2198,23 @@ void HikConstantLaserScanWindow::onContinuousCameraStarted(
     });
 }
 
-void HikConstantLaserScanWindow::onContinuousCameraStopped() {
+void HikConstantLaserScanWindow::onContinuousCameraStopped(
+        bool confirmed, QString description) {
     if (continuousState_ != ContinuousState::Stopping) return;
-    QTimer::singleShot(60, this, [this]() {
-        if (continuousState_ != ContinuousState::Stopping) return;
+    if (!confirmed) {
+        terminalCameraFault_ = true;
+        terminalCameraFaultDetail_ = description;
+        continuousAbortRequested_ = true;
+        finalizeContinuousScan(
+            false,
+            QStringLiteral("相机连续停流未确认：%1")
+                .arg(description));
+        return;
+    }
+    const quint64 generation = scanGeneration_;
+    QTimer::singleShot(60, this, [this, generation]() {
+        if (generation != scanGeneration_ ||
+            continuousState_ != ContinuousState::Stopping) return;
         finalizeContinuousScan(!continuousAbortRequested_,
             continuousAbortRequested_ ? QStringLiteral("扫描中止，已保存已采数据")
                                       : QStringLiteral("连续扫描完成"));
@@ -1092,11 +2229,22 @@ void HikConstantLaserScanWindow::onContinuousFrameRejected(
 void HikConstantLaserScanWindow::abortContinuousScan(
         const QString& reason, bool requestStop) {
     if (continuousState_ == ContinuousState::Idle) return;
+    requestLaserOff();
     appendLog(QStringLiteral("连续同步扫描终止请求：%1").arg(reason));
     continuousAbortRequested_ = true;
     const ContinuousState previous = continuousState_;
-    if (requestStop && robotConnected_ && pendingMotionRequestId_ >= 0) {
-        emit requestStopMotion(++nextRobotRequestId_);
+    const bool motionWasPending = pendingMotionRequestId_ >= 0;
+    if (motionWasPending) {
+        if (requestStop && robotConnected_) {
+            emit requestStopMotion(
+                robotSession_->allocateRequestId(robotClientId_));
+        } else {
+            terminalMotionFault_ = true;
+            terminalMotionFaultDetail_ = QStringLiteral(
+                "连续扫描运动仍在活动，但当前无法确认 StopMotion：%1")
+                .arg(reason);
+            pendingMotionRequestId_ = -1;
+        }
     }
     if (previous == ContinuousState::StartingCamera ||
         previous == ContinuousState::Scanning ||
@@ -1104,8 +2252,7 @@ void HikConstantLaserScanWindow::abortContinuousScan(
         continuousState_ = ContinuousState::Stopping;
         emit requestStopContinuous();
     } else if (previous == ContinuousState::MovingToStart &&
-               (!requestStop || pendingMotionRequestId_ < 0)) {
-        pendingMotionRequestId_ = -1;
+               pendingMotionRequestId_ < 0) {
         finalizeContinuousScan(false, reason);
     }
     scanStatusLabel_->setText(QStringLiteral("正在安全停止连续同步扫描：%1").arg(reason));
@@ -1114,6 +2261,7 @@ void HikConstantLaserScanWindow::abortContinuousScan(
 
 void HikConstantLaserScanWindow::finalizeContinuousScan(
         bool completed, const QString& reason) {
+    requestLaserOff();
     const bool sessionStarted = synchronizationSession_.running();
     if (sessionStarted) synchronizationSession_.stop();
     const hik_sync::PipelineStatistics stats = sessionStarted
@@ -1123,8 +2271,9 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
         : QStringLiteral("同步会话未启动");
     hik_scan::ContinuousReconstructionStatistics reconstructionStats;
     std::string reconstructionError;
+    const bool reconstructionWasRunning = continuousReconstruction_.running();
     bool cloudSaved = false;
-    if (continuousReconstruction_.running()) {
+    if (reconstructionWasRunning) {
         scanStatusLabel_->setText(QStringLiteral(
             "同步数据已清空，正在等待后台条纹重建完成并保存连续点云……"));
         appendLog(scanStatusLabel_->text());
@@ -1132,7 +2281,6 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
             &reconstructionStats, &reconstructionError);
     }
     continuousState_ = ContinuousState::Idle;
-    pendingMotionRequestId_ = -1;
     safetyConfirmCheck_->setChecked(false);
     scanStatusLabel_->setText(QStringLiteral(
         "%1：frames=%2, frame_id_skip=%3, frame_cnt_skip=%4(仅诊断), valid=%5, invalid=%6, stable=%7；"
@@ -1169,6 +2317,33 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
             .arg(reconstructionStats.voxelPointCount)
             .arg(QString::fromStdString(reconstructionStats.rawPlyPath))
             .arg(QString::fromStdString(reconstructionStats.voxelPlyPath)));
+        if (reconstructionStats.qualityFramesPassed > 0U ||
+            reconstructionStats.qualityFramesRejected > 0U) {
+            appendLog(QStringLiteral(
+                "连续质量结果：frames passed/rejected=%1/%2，"
+                "optical/filtered/rejected/voxel 点=%3/%4/%5/%6；"
+                "optical=%7；filtered=%8；rejected=%9；voxel=%10。")
+                .arg(reconstructionStats.qualityFramesPassed)
+                .arg(reconstructionStats.qualityFramesRejected)
+                .arg(reconstructionStats.qualityOpticalPointCount)
+                .arg(reconstructionStats.qualityFilteredPointCount)
+                .arg(reconstructionStats.qualityRejectedPointCount)
+                .arg(reconstructionStats.qualityVoxelPointCount)
+                .arg(QString::fromStdString(
+                    reconstructionStats.qualityOpticalPlyPath))
+                .arg(QString::fromStdString(
+                    reconstructionStats.qualityPlyPath))
+                .arg(QString::fromStdString(
+                    reconstructionStats.qualityRejectedPlyPath))
+                .arg(QString::fromStdString(
+                    reconstructionStats.qualityVoxelPlyPath)));
+            if (profile_.scanCenterlinePolicy ==
+                LineLaserCenterlinePolicy::Shadow) {
+                appendLog(QStringLiteral(
+                    "650/shadow 保护：连续质量文件仅供并行比较；"
+                    "正式建图仍使用 continuous_raw/continuous_voxel。"));
+            }
+        }
         if (!cloudSaved) {
             appendLog(QStringLiteral("警告：连续点云保存未完整成功：%1；详情=%2")
                 .arg(QString::fromStdString(reconstructionError),
@@ -1238,8 +2413,44 @@ void HikConstantLaserScanWindow::finalizeContinuousScan(
             .arg(expectedRobotHz, 0, 'f', 3)
             .arg(synchronizationConfig_.robotPeriodMs, 0, 'f', 3));
     }
+    QJsonObject terminalStats;
+    terminalStats.insert(QStringLiteral("total_camera_frames"),
+                         static_cast<double>(stats.totalCameraFrames));
+    terminalStats.insert(QStringLiteral("camera_frames_dropped"),
+                         static_cast<double>(stats.cameraFramesDropped));
+    terminalStats.insert(QStringLiteral("successful_sync_frames"),
+                         static_cast<double>(stats.successfulSyncFrames));
+    terminalStats.insert(QStringLiteral("invalid_sync_frames"),
+                         static_cast<double>(stats.invalidSyncFrames));
+    terminalStats.insert(QStringLiteral("stable_speed_frames"),
+                         static_cast<double>(stats.stableSpeedFrames));
+    terminalStats.insert(QStringLiteral("image_frames_written"),
+                         static_cast<double>(stats.imageFramesWritten));
+    terminalStats.insert(QStringLiteral("image_write_failures"),
+                         static_cast<double>(stats.imageWriteFailures));
+    terminalStats.insert(QStringLiteral("reconstructed_frames"),
+                         static_cast<double>(
+                             reconstructionStats.reconstructedFrames));
+    terminalStats.insert(QStringLiteral("raw_point_count"),
+                         static_cast<double>(
+                             reconstructionStats.rawPointCount));
+    terminalStats.insert(QStringLiteral("voxel_point_count"),
+                         static_cast<double>(
+                             reconstructionStats.voxelPointCount));
+    terminalStats.insert(QStringLiteral("cloud_saved"),
+                         !reconstructionWasRunning || cloudSaved);
+
+    const bool finalCompleted =
+        completed && (!reconstructionWasRunning || cloudSaved);
+    QString finalReason = reason;
+    if (completed && reconstructionWasRunning && !cloudSaved) {
+        finalReason += QStringLiteral("；连续点云保存失败：%1")
+            .arg(QString::fromStdString(reconstructionError));
+    }
     continuousAbortRequested_ = false;
-    updateUi();
+    beginTerminalBarrier(
+        finalCompleted, finalReason, QStringLiteral("continuous"),
+        synchronizationSessionDir_, terminalStats);
 }
 
 void HikConstantLaserScanWindow::captureCurrentProfile() {
@@ -1249,13 +2460,36 @@ void HikConstantLaserScanWindow::captureCurrentProfile() {
         showError(QStringLiteral("无法单点采集"), QStringLiteral("请连接相机、FR5并加载正式标定。"));
         return;
     }
+    if (!laserReadyForProfile(&error)) {
+        showError(QStringLiteral("激光 TTL 未就绪"), error);
+        return;
+    }
     if (!formalCalibrationFilesUnchanged(&error)) {
         showError(QStringLiteral("标定文件已变化"), error);
         return;
     }
     if (!calibrationIdentityMatches(&error)) { showError(QStringLiteral("相机身份不匹配"), error); return; }
-    if (!createScanSession(&error)) { showError(QStringLiteral("创建扫描会话失败"), error); return; }
+    if (!acquireScanActivity(&error)) {
+        showError(QStringLiteral("设备组互斥"), error);
+        return;
+    }
+    scanSessionDir_.clear();
+    if (!createScanSession(&error)) {
+        scanState_ = ScanState::Idle;
+        safetyConfirmCheck_->setChecked(false);
+        beginTerminalBarrier(
+            false,
+            QStringLiteral("创建单点扫描会话失败：%1").arg(error),
+            QStringLiteral("single_point_setup"),
+            scanSessionDir_);
+        showError(QStringLiteral("创建扫描会话失败"), error);
+        return;
+    }
     cloud_.clear();
+    qualityCloud_.clear();
+    qualitySupportResult_ =
+        hik_scan::AdjacentProfileSupportResult();
+    qualityVoxelPointCount_ = 0U;
     profileRows_.clear();
     refreshTable();
     targets_.clear();
@@ -1284,7 +2518,8 @@ void HikConstantLaserScanWindow::stopScan() {
 void HikConstantLaserScanWindow::issueRobotRead(ReadRole role) {
     if (!robotConnected_ || pendingRobotRequestId_ >= 0) return;
     readRole_ = role;
-    pendingRobotRequestId_ = ++nextRobotRequestId_;
+    pendingRobotRequestId_ =
+        robotSession_->allocateRequestId(robotClientId_);
     emit requestReadFlangePose(pendingRobotRequestId_);
     updateUi();
 }
@@ -1296,7 +2531,8 @@ void HikConstantLaserScanWindow::issueMoveForCurrentTarget() {
     }
     const hik_scan::Pose6D& target = targets_[static_cast<std::size_t>(currentTargetIndex_)];
     scanState_ = ScanState::Moving;
-    pendingMotionRequestId_ = ++nextRobotRequestId_;
+    pendingMotionRequestId_ =
+        robotSession_->allocateRequestId(robotClientId_);
     scanStatusLabel_->setText(QStringLiteral("移动到 %1/%2：%3")
         .arg(currentTargetIndex_ + 1).arg(static_cast<int>(targets_.size())).arg(poseText(target)));
     appendLog(scanStatusLabel_->text());
@@ -1308,17 +2544,14 @@ void HikConstantLaserScanWindow::issueMoveForCurrentTarget() {
 }
 
 void HikConstantLaserScanWindow::beginSettledCapture() {
-    if (scanState_ != ScanState::Settling || stopRequested_) {
-        if (stopRequested_) abortScan(QStringLiteral("扫描已由用户停止。"), false);
-        return;
-    }
+    if (scanState_ != ScanState::Settling || stopRequested_) return;
     scanState_ = ScanState::ReadingBefore;
     issueRobotRead(ReadRole::ScanBefore);
 }
 
 void HikConstantLaserScanWindow::onCameraConnectionChanged(bool connected, QString description) {
     cameraConnected_ = connected;
-    cameraStatusLabel_->setText(description);
+    cameraStatusLabel_->setText(QStringLiteral("%1：%2").arg(profile_.id, description));
     cameraStatusLabel_->setStyleSheet(connected ? QStringLiteral("color:#087f23;") : QStringLiteral("color:#b00020;"));
     if (!connected && continuousState_ != ContinuousState::Idle) {
         abortContinuousScan(QStringLiteral("连续同步扫描中相机断开。"), true);
@@ -1330,25 +2563,69 @@ void HikConstantLaserScanWindow::onCameraConnectionChanged(bool connected, QStri
 
 void HikConstantLaserScanWindow::onCameraIdentityChanged(QString model, QString serial, QString ipAddress) {
     cameraModel_ = model; cameraSerial_ = serial; cameraIp_ = ipAddress;
-    appendLog(QStringLiteral("相机身份：model=%1, SN=%2, IP=%3").arg(model, serial, ipAddress));
+    appendLog(QStringLiteral("相机身份：model=%1, SN=%2, IP=%3；profile=%4")
+              .arg(model, serial, ipAddress, profile_.id));
+    const QString expectedModel = profile_.expectedCameraModel.trimmed();
+    const QString expectedSerial = profile_.expectedCameraSerial.trimmed();
+    if ((!expectedModel.isEmpty() && model != expectedModel) ||
+        (!expectedSerial.isEmpty() && serial != expectedSerial)) {
+        appendLog(QStringLiteral(
+            "警告：相机身份不属于当前设备 profile；三维扫描会被硬性禁止。"));
+    }
 }
 
-void HikConstantLaserScanWindow::onCameraBusyChanged(bool busy) { cameraBusy_ = busy; updateUi(); }
+void HikConstantLaserScanWindow::onCameraBusyChanged(bool busy) {
+    cameraBusy_ = busy;
+    if (terminalBarrierActive_) tryCompleteTerminalBarrier();
+    updateUi();
+}
 void HikConstantLaserScanWindow::onCameraLog(QString message) { appendLog(QStringLiteral("相机: %1").arg(message)); }
 
 void HikConstantLaserScanWindow::onCameraError(int requestId, QString message) {
-    if (requestId == pendingCameraRequestId_) pendingCameraRequestId_ = -1;
+    const bool pendingSingleCapture =
+        requestId == pendingCameraRequestId_;
+    if (pendingSingleCapture) pendingCameraRequestId_ = -1;
+    if (pendingSingleCapture && terminalBarrierActive_ &&
+        scanState_ == ScanState::Idle &&
+        continuousState_ == ContinuousState::Idle) {
+        appendLog(QStringLiteral(
+            "终止后的单帧请求已返回错误 ACK：%1").arg(message));
+        tryCompleteTerminalBarrier();
+        updateUi();
+        return;
+    }
     if (continuousState_ != ContinuousState::Idle) {
         abortContinuousScan(QStringLiteral("相机错误: %1").arg(message), true);
-    } else if (scanState_ != ScanState::Idle) abortScan(QStringLiteral("相机错误: %1").arg(message), false);
+    } else if (scanState_ != ScanState::Idle) {
+        abortScan(QStringLiteral("相机错误: %1").arg(message),
+                  pendingMotionRequestId_ >= 0);
+    }
     else showError(QStringLiteral("相机错误"), message);
     updateUi();
 }
 
 void HikConstantLaserScanWindow::onRobotConnectionChanged(bool connected, QString description) {
     robotConnected_ = connected;
-    robotStatusLabel_->setText(description);
+    robotStatusLabel_->setText(QStringLiteral("%1：%2").arg(profile_.id, description));
     robotStatusLabel_->setStyleSheet(connected ? QStringLiteral("color:#087f23;") : QStringLiteral("color:#b00020;"));
+    if (!connected && robotSession_->connectionAttempted()) {
+        appendLog(QStringLiteral(
+            "共享 FAIRINO RPC 会话已结束；受 SDK 3.9.4 生命周期限制，"
+            "本进程不再创建第二个 FRRobot，重新连接需重启程序。"));
+    }
+    if (!connected && terminalBarrierActive_ &&
+        pendingMotionRequestId_ >= 0) {
+        terminalMotionFault_ = true;
+        terminalMotionFaultDetail_ = QStringLiteral(
+            "等待运动停止确认时 FR5 连接断开：%1").arg(description);
+        pendingMotionRequestId_ = -1;
+        QString resultError;
+        if (!writeSessionResult(&resultError) && !resultError.isEmpty()) {
+            appendLog(QStringLiteral("警告：无法记录 FR5 断连故障：%1")
+                          .arg(resultError));
+        }
+        tryCompleteTerminalBarrier();
+    }
     if (!connected && continuousState_ != ContinuousState::Idle) {
         abortContinuousScan(QStringLiteral("连续同步扫描中 FR5 断开。"), false);
     } else if (!connected && scanState_ != ScanState::Idle) {
@@ -1357,21 +2634,55 @@ void HikConstantLaserScanWindow::onRobotConnectionChanged(bool connected, QStrin
     updateUi();
 }
 
-void HikConstantLaserScanWindow::onRobotBusyChanged(bool busy) { robotBusy_ = busy; updateUi(); }
+void HikConstantLaserScanWindow::onRobotBusyChanged(bool busy) {
+    robotBusy_ = busy;
+    if (terminalBarrierActive_) tryCompleteTerminalBarrier();
+    updateUi();
+}
 void HikConstantLaserScanWindow::onRobotLog(QString message) { appendLog(QStringLiteral("FR5: %1").arg(message)); }
 
 void HikConstantLaserScanWindow::onRobotError(int requestId, QString message) {
+    if (requestId >= 0 &&
+        !robotSession_->requestBelongsToClient(
+            requestId, robotClientId_)) {
+        return;
+    }
+    if (requestId < 0 && !profileTabActive_) {
+        appendLog(QStringLiteral("共享 FR5 错误：%1").arg(message));
+        return;
+    }
     if (requestId == pendingRobotRequestId_) { pendingRobotRequestId_ = -1; readRole_ = ReadRole::None; }
     if (continuousState_ != ContinuousState::Idle) {
         abortContinuousScan(QStringLiteral("FR5 错误: %1").arg(message), true);
     } else if (scanState_ != ScanState::Idle) abortScan(QStringLiteral("FR5 错误: %1").arg(message), true);
-    else showError(QStringLiteral("FR5 错误"), message);
+    else {
+        showError(QStringLiteral("FR5 错误"), message);
+    }
+    updateUi();
+}
+
+void HikConstantLaserScanWindow::onRobotClientError(
+        int clientId, QString message) {
+    if (clientId != robotClientId_) return;
+    robotBusy_ = false;
+    if (continuousState_ != ContinuousState::Idle) {
+        abortContinuousScan(
+            QStringLiteral("共享 FR5 错误: %1").arg(message), true);
+    } else if (scanState_ != ScanState::Idle) {
+        abortScan(QStringLiteral("共享 FR5 错误: %1").arg(message), true);
+    } else {
+        showError(QStringLiteral("共享 FR5 错误"), message);
+    }
     updateUi();
 }
 
 void HikConstantLaserScanWindow::onRobotFlangePoseReady(
         int requestId, double xMm, double yMm, double zMm,
         double rxDeg, double ryDeg, double rzDeg, qint64 hostTimestampMs) {
+    if (!robotSession_->requestBelongsToClient(
+            requestId, robotClientId_)) {
+        return;
+    }
     if (requestId != pendingRobotRequestId_) return;
     pendingRobotRequestId_ = -1;
     PoseReading reading;
@@ -1406,34 +2717,85 @@ void HikConstantLaserScanWindow::onRobotFlangePoseReady(
 }
 
 void HikConstantLaserScanWindow::onRobotMotionStarted(int requestId, QString description) {
+    if (!robotSession_->requestBelongsToClient(
+            requestId, robotClientId_)) {
+        return;
+    }
     if (requestId == pendingMotionRequestId_) appendLog(QStringLiteral("FR5: %1").arg(description));
 }
 
-void HikConstantLaserScanWindow::onRobotMotionFinished(int requestId, bool success, QString description) {
+void HikConstantLaserScanWindow::onRobotMotionFinished(
+        int requestId,
+        bool targetReached,
+        bool motionStoppedConfirmed,
+        QString description) {
+    if (!robotSession_->requestBelongsToClient(
+            requestId, robotClientId_)) {
+        return;
+    }
     if (requestId != pendingMotionRequestId_) {
-        if (stopRequested_ && !success) abortScan(description, false);
+        appendLog(QStringLiteral(
+            "忽略非当前运动请求的完成信号：request=%1，current=%2，%3")
+            .arg(requestId).arg(pendingMotionRequestId_).arg(description));
         return;
     }
     pendingMotionRequestId_ = -1;
     appendLog(QStringLiteral("FR5: %1").arg(description));
+    if (!motionStoppedConfirmed) {
+        terminalMotionFault_ = true;
+        terminalMotionFaultDetail_ = description;
+        QString resultError;
+        if (!writeSessionResult(&resultError) && !resultError.isEmpty()) {
+            appendLog(QStringLiteral("警告：无法更新运动停止故障：%1")
+                          .arg(resultError));
+        }
+    }
+    if (terminalBarrierActive_) {
+        tryCompleteTerminalBarrier();
+        updateUi();
+        return;
+    }
     if (continuousState_ == ContinuousState::MovingToStart) {
-        if (!success || continuousAbortRequested_) {
+        if (!targetReached || continuousAbortRequested_) {
             finalizeContinuousScan(false, description);
+            return;
+        }
+        QString readinessError;
+        if (!laserReadyForProfile(&readinessError) ||
+            !formalCalibrationFilesUnchanged(&readinessError) ||
+            !calibrationIdentityMatches(&readinessError)) {
+            continuousState_ = ContinuousState::Idle;
+            safetyConfirmCheck_->setChecked(false);
+            beginTerminalBarrier(
+                false,
+                QStringLiteral("到达连续扫描起点后安全复查失败：%1")
+                    .arg(readinessError),
+                QStringLiteral("continuous_setup"),
+                synchronizationSessionDir_);
+            showError(QStringLiteral("到达起点后安全复查失败"),
+                      readinessError);
             return;
         }
         QString sessionError;
         if (!createSynchronizationSession(&sessionError)) {
             continuousState_ = ContinuousState::Idle;
             safetyConfirmCheck_->setChecked(false);
+            beginTerminalBarrier(
+                false,
+                QStringLiteral("创建连续同步会话失败：%1")
+                    .arg(sessionError),
+                QStringLiteral("continuous_setup"),
+                synchronizationSessionDir_);
             showError(QStringLiteral("创建同步会话失败"), sessionError);
-            updateUi();
             return;
         }
         continuousState_ = ContinuousState::StartingCamera;
         scanStatusLabel_->setText(QStringLiteral(
             "已到连续扫描起点；预采机器人状态后启动相机。"));
-        QTimer::singleShot(100, this, [this]() {
-            if (continuousState_ != ContinuousState::StartingCamera) return;
+        const quint64 generation = scanGeneration_;
+        QTimer::singleShot(100, this, [this, generation]() {
+            if (generation != scanGeneration_ ||
+                continuousState_ != ContinuousState::StartingCamera) return;
             emit requestStartContinuous(
                 synchronizationConfig_.cameraExposureUs,
                 gainSpin_->value(),
@@ -1444,10 +2806,12 @@ void HikConstantLaserScanWindow::onRobotMotionFinished(int requestId, bool succe
         return;
     }
     if (continuousState_ == ContinuousState::Scanning) {
+        requestLaserOff();
         continuousState_ = ContinuousState::Stopping;
-        continuousAbortRequested_ = !success || continuousAbortRequested_;
+        continuousAbortRequested_ =
+            !targetReached || continuousAbortRequested_;
         emit requestStopContinuous();
-        scanStatusLabel_->setText(success
+        scanStatusLabel_->setText(targetReached
             ? QStringLiteral("连续 MoveL 已完成，正在停止相机并清空同步/写入队列。")
             : QStringLiteral("连续 MoveL 失败，正在停止相机并保存已采数据。"));
         updateUi();
@@ -1458,14 +2822,19 @@ void HikConstantLaserScanWindow::onRobotMotionFinished(int requestId, bool succe
         // Camera shutdown owns final queue draining in this state.
         return;
     }
-    if (!success || stopRequested_) {
+    if (!targetReached || stopRequested_) {
         abortScan(description, false);
         return;
     }
     scanState_ = ScanState::Settling;
     scanStatusLabel_->setText(QStringLiteral("已到位，等待结构停稳 %1 ms。")
                               .arg(settleSpin_->value()));
-    QTimer::singleShot(settleSpin_->value(), this, &HikConstantLaserScanWindow::beginSettledCapture);
+    const quint64 generation = scanGeneration_;
+    QTimer::singleShot(settleSpin_->value(), this,
+        [this, generation]() {
+            if (generation != scanGeneration_) return;
+            beginSettledCapture();
+        });
     updateUi();
 }
 
@@ -1473,8 +2842,30 @@ void HikConstantLaserScanWindow::onCameraFrameReady(
         int requestId, QImage image, quint64 frameNo, quint64 deviceTimestamp,
         qint64 hostTimestamp, double actualExposure, double actualGain,
         QString description) {
-    if (requestId != pendingCameraRequestId_ || scanState_ != ScanState::Capturing) return;
+    if (requestId != pendingCameraRequestId_) return;
     pendingCameraRequestId_ = -1;
+    if (scanState_ != ScanState::Capturing) {
+        appendLog(QStringLiteral(
+            "终止后的单帧请求已返回 frame ACK，图像不进入点云。"));
+        if (terminalBarrierActive_) tryCompleteTerminalBarrier();
+        updateUi();
+        return;
+    }
+    QString laserError;
+    if (!laserReadyForProfile(&laserError)) {
+        abortScan(QStringLiteral(
+            "相机帧回调时 TTL 状态不再满足本组曝光条件：%1")
+            .arg(laserError), false);
+        return;
+    }
+    pendingLaserStatus_ = laserStatus_;
+    const qint64 frameCallbackMonotonicMs =
+        hik_sync::getMonotonicRawNs() / 1000000LL;
+    pendingLaserStatusAgeMs_ =
+        laserStatusReceivedMonotonicMs_ > 0
+            ? frameCallbackMonotonicMs -
+                  laserStatusReceivedMonotonicMs_
+            : -1;
     const int profileIndex = static_cast<int>(profileRows_.size());
     const QString imagePath = QDir(imageDir_).absoluteFilePath(
         QStringLiteral("profile_%1_%2.png")
@@ -1539,6 +2930,123 @@ void HikConstantLaserScanWindow::onCameraFrameReady(
         .arg(profile.minimumDepthMm, 0, 'f', 3).arg(profile.maximumDepthMm, 0, 'f', 3)
         .arg(profile.lineDistanceMm.rms, 0, 'f', 4)
         .arg(100.0 * pendingStripeSaturatedRatio_, 0, 'f', 1).arg(description));
+    if (profileOptions_.reconstruction.stripe.mode !=
+        hik_calibration::StripeExtractionMode::Legacy) {
+        const hik_stripe::Diagnostics& diagnostics =
+            profile.qualityDiagnostics;
+        const std::size_t uniqueRejected =
+            diagnostics.totalCandidateCount >=
+                    diagnostics.acceptedCandidateCount
+                ? diagnostics.totalCandidateCount -
+                      diagnostics.acceptedCandidateCount
+                : 0U;
+        const QString centerOffset =
+            profile.shadowComparison.matchedPointCount > 0U
+                ? QStringLiteral(
+                      "匹配/robust/gross=%1/%2/%3，"
+                      "signed mean/median/robust mean=%4/%5/%6 px，"
+                      "robust gate=%7 px，"
+                      "|Δ| median/P95/max=%8/%9/%10 px")
+                      .arg(static_cast<qulonglong>(
+                          profile.shadowComparison.matchedPointCount))
+                      .arg(static_cast<qulonglong>(
+                          profile.shadowComparison
+                              .robustMatchedPointCount))
+                      .arg(static_cast<qulonglong>(
+                          profile.shadowComparison
+                              .grossMismatchPointCount))
+                      .arg(
+                          profile.shadowComparison.signedMeanOffsetPx,
+                          0, 'f', 4)
+                      .arg(
+                          profile.shadowComparison.signedMedianOffsetPx,
+                          0, 'f', 4)
+                      .arg(
+                          profile.shadowComparison.robustSignedMeanOffsetPx,
+                          0, 'f', 4)
+                      .arg(
+                          profile.shadowComparison.robustGatePx,
+                          0, 'f', 4)
+                      .arg(
+                          profile.shadowComparison.absoluteMedianOffsetPx,
+                          0, 'f', 4)
+                      .arg(
+                          profile.shadowComparison.absoluteP95OffsetPx,
+                          0, 'f', 4)
+                      .arg(
+                          profile.shadowComparison.absoluteMaximumOffsetPx,
+                          0, 'f', 4)
+                : QStringLiteral("无可匹配 legacy/quality 中心");
+        appendLog(QStringLiteral(
+            "质量中心线：passed=%1，legacy/quality 3D点=%2/%3，"
+            "候选 accepted/total/rejected=%4/%5/%6；"
+            "拒绝 low/width/saturation/multipeak/asymmetry/fit/quality/mask="
+            "%7/%8/%9/%10/%11/%12/%13/%14；新旧中心：%15；算法=%16%17")
+            .arg(profile.qualityExtractionPassed
+                     ? QStringLiteral("yes")
+                     : QStringLiteral("no"))
+            .arg(static_cast<qulonglong>(
+                profile.legacyPoints.size()))
+            .arg(static_cast<qulonglong>(
+                profile.qualityPoints.size()))
+            .arg(static_cast<qulonglong>(
+                diagnostics.acceptedCandidateCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.totalCandidateCount))
+            .arg(static_cast<qulonglong>(uniqueRejected))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedLowProminenceCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedWidthCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedSaturationCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedMultiPeakCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedAsymmetryCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedFitCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedQualityCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.rejectedMaskCount))
+            .arg(centerOffset)
+            .arg(QString::fromStdString(
+                profile.centerlineAlgorithmVersion))
+            .arg(profile.qualityExtractionError.empty()
+                     ? QString()
+                     : QStringLiteral("；错误=") +
+                           QString::fromStdString(
+                               profile.qualityExtractionError)));
+        appendLog(QStringLiteral(
+            "质量指标：selected/gap=%1/%2，mean SNR/FWHM=%3/%4 px，"
+            "selected saturation=%5%，multipeak scanlines=%6，"
+            "mean asymmetry/fit/second-peak=%7/%8/%9，"
+            "path margin/point=%10。")
+            .arg(static_cast<qulonglong>(
+                diagnostics.selectedPointCount))
+            .arg(static_cast<qulonglong>(
+                diagnostics.selectedGapCount))
+            .arg(diagnostics.meanSelectedSnr, 0, 'f', 3)
+            .arg(diagnostics.meanSelectedFwhmPx, 0, 'f', 3)
+            .arg(
+                100.0 * diagnostics.selectedSaturatedRatio,
+                0, 'f', 2)
+            .arg(static_cast<qulonglong>(
+                diagnostics.multiPeakScanlineCount))
+            .arg(
+                diagnostics.meanSelectedGradientAsymmetry,
+                0, 'f', 4)
+            .arg(
+                diagnostics.meanSelectedFitResidual,
+                0, 'f', 4)
+            .arg(
+                diagnostics.meanSelectedSecondPeakRatio,
+                0, 'f', 4)
+            .arg(
+                diagnostics.pathCostMarginPerPoint,
+                0, 'f', 6));
+    }
     scanState_ = ScanState::ReadingAfter;
     issueRobotRead(ReadRole::ScanAfter);
     updateUi();
@@ -1557,6 +3065,7 @@ void HikConstantLaserScanWindow::finishProfile(const PoseReading& after) {
     const cv::Matx44d baseFromFlange = hik_calibration::interpolateRigidHalf(
         beforePose_.baseFromFlange, after.baseFromFlange);
     const std::size_t oldCloudSize = cloud_.size();
+    const std::size_t oldQualityCloudSize = qualityCloud_.size();
     std::string coreError;
     const int profileIndex = static_cast<int>(profileRows_.size());
     if (!hik_scan::appendProfileInBase(pendingProfile_, baseFromFlange,
@@ -1564,6 +3073,22 @@ void HikConstantLaserScanWindow::finishProfile(const PoseReading& after) {
                                        &cloud_, &coreError)) {
         abortScan(QString::fromStdString(coreError), false);
         return;
+    }
+    QString qualityAppendError;
+    if (pendingProfile_.qualityExtractionPassed &&
+        !pendingProfile_.qualityPoints.empty()) {
+        const cv::Matx44d baseFromCamera =
+            baseFromFlange * handEye_.flangeFromCamera;
+        if (!hik_scan::appendProfilePointsUsingBaseFromCamera(
+                pendingProfile_.qualityPoints, baseFromCamera,
+                profileIndex, &qualityCloud_, &coreError)) {
+            qualityAppendError = QString::fromStdString(coreError);
+            appendLog(QStringLiteral(
+                "警告：轮廓 %1 的质量点并行累计失败；"
+                "现有正式/legacy 点云不受影响：%2")
+                .arg(profileIndex)
+                .arg(qualityAppendError));
+        }
     }
     ProfileRow row;
     row.index = profileIndex;
@@ -1579,23 +3104,119 @@ void HikConstantLaserScanWindow::finishProfile(const PoseReading& after) {
     row.stripeSaturatedRatio = pendingStripeSaturatedRatio_;
     row.translationDeltaMm = translationDelta;
     row.rotationDeltaDeg = rotationDelta;
+    row.qualityExtractionPassed =
+        pendingProfile_.qualityExtractionPassed &&
+        qualityAppendError.isEmpty();
+    row.legacyPointCount =
+        static_cast<int>(pendingProfile_.legacyPoints.size());
+    row.qualityPointCount =
+        static_cast<int>(pendingProfile_.qualityPoints.size());
+    const hik_stripe::Diagnostics& qualityDiagnostics =
+        pendingProfile_.qualityDiagnostics;
+    row.qualityCandidateCount =
+        static_cast<int>(qualityDiagnostics.totalCandidateCount);
+    row.qualityAcceptedCandidateCount =
+        static_cast<int>(qualityDiagnostics.acceptedCandidateCount);
+    row.qualityRejectedCandidateCount =
+        std::max(0, row.qualityCandidateCount -
+                       row.qualityAcceptedCandidateCount);
+    row.qualitySelectedPointCount =
+        static_cast<int>(qualityDiagnostics.selectedPointCount);
+    row.qualitySelectedGapCount =
+        static_cast<int>(qualityDiagnostics.selectedGapCount);
+    row.qualityMultiPeakScanlineCount =
+        static_cast<int>(qualityDiagnostics.multiPeakScanlineCount);
+    row.qualityAmbiguousPathPointCount =
+        static_cast<int>(qualityDiagnostics.ambiguousPathPointCount);
+    row.qualityRejectedLowProminenceCount =
+        static_cast<int>(
+            qualityDiagnostics.rejectedLowProminenceCount);
+    row.qualityRejectedWidthCount =
+        static_cast<int>(qualityDiagnostics.rejectedWidthCount);
+    row.qualityRejectedSaturationCount =
+        static_cast<int>(
+            qualityDiagnostics.rejectedSaturationCount);
+    row.qualityRejectedMultiPeakCount =
+        static_cast<int>(
+            qualityDiagnostics.rejectedMultiPeakCount);
+    row.qualityRejectedAsymmetryCount =
+        static_cast<int>(
+            qualityDiagnostics.rejectedAsymmetryCount);
+    row.qualityRejectedFitCount =
+        static_cast<int>(qualityDiagnostics.rejectedFitCount);
+    row.qualityRejectedQualityCount =
+        static_cast<int>(
+            qualityDiagnostics.rejectedQualityCount);
+    row.qualityRejectedMaskCount =
+        static_cast<int>(qualityDiagnostics.rejectedMaskCount);
+    row.qualityMeanSelectedQuality =
+        qualityDiagnostics.meanSelectedQuality;
+    row.qualityMeanSelectedFwhmPx =
+        qualityDiagnostics.meanSelectedFwhmPx;
+    row.qualityMeanSelectedSnr =
+        qualityDiagnostics.meanSelectedSnr;
+    row.qualitySelectedSaturatedRatio =
+        qualityDiagnostics.selectedSaturatedRatio;
+    row.qualityMeanSelectedGradientAsymmetry =
+        qualityDiagnostics.meanSelectedGradientAsymmetry;
+    row.qualityMeanSelectedFitResidual =
+        qualityDiagnostics.meanSelectedFitResidual;
+    row.qualityMeanSelectedSecondPeakRatio =
+        qualityDiagnostics.meanSelectedSecondPeakRatio;
+    row.qualityPathCostMarginPerPoint =
+        qualityDiagnostics.pathCostMarginPerPoint;
+    row.centerMatchedPointCount =
+        static_cast<int>(
+            pendingProfile_.shadowComparison.matchedPointCount);
+    row.centerRobustMatchedPointCount =
+        static_cast<int>(
+            pendingProfile_.shadowComparison.robustMatchedPointCount);
+    row.centerGrossMismatchPointCount =
+        static_cast<int>(
+            pendingProfile_.shadowComparison.grossMismatchPointCount);
+    row.centerSignedMeanOffsetPx =
+        pendingProfile_.shadowComparison.signedMeanOffsetPx;
+    row.centerSignedMedianOffsetPx =
+        pendingProfile_.shadowComparison.signedMedianOffsetPx;
+    row.centerRobustSignedMeanOffsetPx =
+        pendingProfile_.shadowComparison.robustSignedMeanOffsetPx;
+    row.centerRobustGatePx =
+        pendingProfile_.shadowComparison.robustGatePx;
+    row.centerAbsoluteMedianOffsetPx =
+        pendingProfile_.shadowComparison.absoluteMedianOffsetPx;
+    row.centerAbsoluteP95OffsetPx =
+        pendingProfile_.shadowComparison.absoluteP95OffsetPx;
+    row.centerAbsoluteMaximumOffsetPx =
+        pendingProfile_.shadowComparison.absoluteMaximumOffsetPx;
+    row.centerlineAlgorithmVersion =
+        QString::fromStdString(
+            pendingProfile_.centerlineAlgorithmVersion);
+    row.qualityExtractionError = qualityAppendError.isEmpty()
+        ? QString::fromStdString(
+              pendingProfile_.qualityExtractionError)
+        : qualityAppendError;
     QString error;
     if (!appendManifest(row, pendingFrameNo_, pendingDeviceTimestamp_,
                         pendingCameraHostTimestamp_, pendingExposureUs_,
                         pendingGainDb_, &error)) {
         cloud_.resize(oldCloudSize);
+        qualityCloud_.resize(oldQualityCloudSize);
         abortScan(error, false);
         return;
     }
     profileRows_.push_back(row);
     refreshTable();
-    scanStatusLabel_->setText(QStringLiteral("轮廓 %1 已累计，总点数=%2。")
-        .arg(profileIndex).arg(static_cast<qulonglong>(cloud_.size())));
+    scanStatusLabel_->setText(QStringLiteral(
+        "轮廓 %1 已累计，正式/legacy 点=%2，质量并行点=%3。")
+        .arg(profileIndex)
+        .arg(static_cast<qulonglong>(cloud_.size()))
+        .arg(static_cast<qulonglong>(qualityCloud_.size())));
     continueOrFinish();
 }
 
 void HikConstantLaserScanWindow::continueOrFinish() {
     if (singlePointMode_ || currentTargetIndex_ + 1 >= static_cast<int>(targets_.size())) {
+        requestLaserOff();
         QString error;
         if (!saveCloudOutputs(&error)) {
             abortScan(error, false);
@@ -1603,11 +3224,57 @@ void HikConstantLaserScanWindow::continueOrFinish() {
         }
         scanState_ = ScanState::Idle;
         safetyConfirmCheck_->setChecked(false);
-        scanStatusLabel_->setText(QStringLiteral("扫描完成：%1 条轮廓，%2 点。raw=%3，voxel=%4")
+        scanStatusLabel_->setText(QStringLiteral(
+            "扫描完成：%1 条轮廓，正式点=%2；"
+            "质量 kept/rejected/voxel=%3/%4/%5。"
+            "raw=%6，voxel=%7")
             .arg(static_cast<int>(profileRows_.size()))
-            .arg(static_cast<qulonglong>(cloud_.size())).arg(rawPlyPath_, voxelPlyPath_));
+            .arg(static_cast<qulonglong>(cloud_.size()))
+            .arg(static_cast<qulonglong>(
+                qualitySupportResult_.kept.size()))
+            .arg(static_cast<qulonglong>(
+                qualitySupportResult_.rejected.size()))
+            .arg(static_cast<qulonglong>(
+                qualityVoxelPointCount_))
+            .arg(rawPlyPath_, voxelPlyPath_));
         appendLog(scanStatusLabel_->text());
-        updateUi();
+        QJsonObject terminalStats;
+        terminalStats.insert(QStringLiteral("profile_count"),
+                             static_cast<int>(profileRows_.size()));
+        terminalStats.insert(QStringLiteral("raw_point_count"),
+                             static_cast<double>(cloud_.size()));
+        terminalStats.insert(
+            QStringLiteral("quality_input_point_count"),
+            static_cast<double>(
+                qualitySupportResult_.statistics.inputPointCount));
+        terminalStats.insert(
+            QStringLiteral("quality_support_filter_applied"),
+            qualitySupportResult_.applied);
+        terminalStats.insert(
+            QStringLiteral("quality_filtered_point_count"),
+            static_cast<double>(
+                qualitySupportResult_.statistics.keptPointCount));
+        terminalStats.insert(
+            QStringLiteral("quality_rejected_point_count"),
+            static_cast<double>(
+                qualitySupportResult_.statistics.rejectedPointCount));
+        terminalStats.insert(
+            QStringLiteral("quality_invalid_point_count"),
+            static_cast<double>(
+                qualitySupportResult_.statistics.invalidPointCount));
+        terminalStats.insert(
+            QStringLiteral("quality_insufficient_support_point_count"),
+            static_cast<double>(
+                qualitySupportResult_.statistics
+                    .insufficientSupportPointCount));
+        terminalStats.insert(
+            QStringLiteral("quality_voxel_point_count"),
+            static_cast<double>(qualityVoxelPointCount_));
+        beginTerminalBarrier(
+            true, scanStatusLabel_->text(),
+            singlePointMode_ ? QStringLiteral("single_point")
+                             : QStringLiteral("stop_and_shoot"),
+            scanSessionDir_, terminalStats);
         return;
     }
     ++currentTargetIndex_;
@@ -1615,26 +3282,75 @@ void HikConstantLaserScanWindow::continueOrFinish() {
 }
 
 void HikConstantLaserScanWindow::abortScan(const QString& reason, bool requestStop) {
+    requestLaserOff();
     appendLog(QStringLiteral("扫描终止: %1").arg(reason));
     stopRequested_ = true;
-    if (requestStop && robotConnected_ && pendingMotionRequestId_ >= 0) {
-        emit requestStopMotion(++nextRobotRequestId_);
+    const bool motionWasPending = pendingMotionRequestId_ >= 0;
+    if (motionWasPending) {
+        if (requestStop && robotConnected_) {
+            emit requestStopMotion(
+                robotSession_->allocateRequestId(robotClientId_));
+        } else {
+            terminalMotionFault_ = true;
+            terminalMotionFaultDetail_ = QStringLiteral(
+                "FR5 运动仍在活动，但当前无法确认 StopMotion：%1")
+                .arg(reason);
+            pendingMotionRequestId_ = -1;
+        }
     }
     QString saveError;
     if (!cloud_.empty()) saveCloudOutputs(&saveError);
     scanState_ = ScanState::Idle;
-    pendingCameraRequestId_ = -1;
     pendingRobotRequestId_ = -1;
-    pendingMotionRequestId_ = -1;
     readRole_ = ReadRole::None;
     safetyConfirmCheck_->setChecked(false);
-    scanStatusLabel_->setText(QStringLiteral("扫描已终止：%1%2")
-        .arg(reason, saveError.isEmpty() ? QString() : QStringLiteral("；部分 PLY 保存失败：") + saveError));
-    updateUi();
+    const QString finalReason = QStringLiteral("扫描已终止：%1%2")
+        .arg(reason,
+             saveError.isEmpty()
+                 ? QString()
+                 : QStringLiteral("；部分 PLY 保存失败：") + saveError);
+    scanStatusLabel_->setText(finalReason);
+    QJsonObject terminalStats;
+    terminalStats.insert(QStringLiteral("profile_count"),
+                         static_cast<int>(profileRows_.size()));
+    terminalStats.insert(QStringLiteral("raw_point_count"),
+                         static_cast<double>(cloud_.size()));
+    terminalStats.insert(
+        QStringLiteral("quality_input_point_count"),
+        static_cast<double>(
+            qualitySupportResult_.statistics.inputPointCount));
+    terminalStats.insert(
+        QStringLiteral("quality_support_filter_applied"),
+        qualitySupportResult_.applied);
+    terminalStats.insert(
+        QStringLiteral("quality_filtered_point_count"),
+        static_cast<double>(
+            qualitySupportResult_.statistics.keptPointCount));
+    terminalStats.insert(
+        QStringLiteral("quality_rejected_point_count"),
+        static_cast<double>(
+            qualitySupportResult_.statistics.rejectedPointCount));
+    terminalStats.insert(
+        QStringLiteral("quality_invalid_point_count"),
+        static_cast<double>(
+            qualitySupportResult_.statistics.invalidPointCount));
+    terminalStats.insert(
+        QStringLiteral("quality_insufficient_support_point_count"),
+        static_cast<double>(
+            qualitySupportResult_.statistics
+                .insufficientSupportPointCount));
+    terminalStats.insert(
+        QStringLiteral("quality_voxel_point_count"),
+        static_cast<double>(qualityVoxelPointCount_));
+    beginTerminalBarrier(
+        false, finalReason,
+        singlePointMode_ ? QStringLiteral("single_point")
+                         : QStringLiteral("stop_and_shoot"),
+        scanSessionDir_, terminalStats);
 }
 
 bool HikConstantLaserScanWindow::createScanSession(QString* error) {
-    const QString root = QDir(sourceDir_).absoluteFilePath(QStringLiteral("data/scans"));
+    const QString root = profile_.scanSessionRoot(sourceDir_);
     if (!QDir().mkpath(root)) { if (error) *error = QStringLiteral("无法创建 %1").arg(root); return false; }
     scanSessionDir_ = uniqueSession(root);
     imageDir_ = QDir(scanSessionDir_).absoluteFilePath(QStringLiteral("images"));
@@ -1645,14 +3361,49 @@ bool HikConstantLaserScanWindow::createScanSession(QString* error) {
     manifestPath_ = QDir(scanSessionDir_).absoluteFilePath(QStringLiteral("scan_manifest.csv"));
     rawPlyPath_ = QDir(scanSessionDir_).absoluteFilePath(QStringLiteral("scan_raw.ply"));
     voxelPlyPath_ = QDir(scanSessionDir_).absoluteFilePath(QStringLiteral("scan_voxel.ply"));
+    qualityOpticalPlyPath_ = QDir(scanSessionDir_).absoluteFilePath(
+        QStringLiteral("scan_quality_optical.ply"));
+    qualityFilteredPlyPath_ = QDir(scanSessionDir_).absoluteFilePath(
+        QStringLiteral("scan_quality_filtered.ply"));
+    qualityRejectedPlyPath_ = QDir(scanSessionDir_).absoluteFilePath(
+        QStringLiteral("scan_quality_rejected.ply"));
+    qualityVoxelPlyPath_ = QDir(scanSessionDir_).absoluteFilePath(
+        QStringLiteral("scan_quality_voxel.ply"));
+    if (!writeSessionMetadata(scanSessionDir_, error)) return false;
     QSaveFile file(manifestPath_);
     const QByteArray header =
+        "device_profile,wavelength_nm,ttl_physical_pin,laser_daemon_generation,"
+        "laser_state,laser_status_age_ms,ttl450_high,ttl650_high,"
+        "laser_lease_active,laser_fault,camera_model,camera_serial,camera_ip,"
         "profile_index,image_path,frame_no,device_timestamp,camera_host_timestamp_raw,"
         "exposure_us,gain_db,before_host_ms,after_host_ms,"
         "before_x_mm,before_y_mm,before_z_mm,before_rx_deg,before_ry_deg,before_rz_deg,"
         "after_x_mm,after_y_mm,after_z_mm,after_rx_deg,after_ry_deg,after_rz_deg,"
         "translation_delta_mm,rotation_delta_deg,point_count,z_min_mm,z_max_mm,line_rms_mm,"
         "line_rms_limit_mm,flat_target_gate,stripe_saturated_ratio,"
+        "quality_extraction_passed,legacy_point_count,quality_point_count,"
+        "quality_candidate_count,quality_accepted_candidate_count,"
+        "quality_rejected_candidate_count,"
+        "quality_selected_point_count,quality_selected_gap_count,"
+        "quality_multipeak_scanline_count,"
+        "quality_ambiguous_path_point_count,"
+        "quality_reject_low_prominence_count,quality_reject_width_count,"
+        "quality_reject_saturation_count,quality_reject_multipeak_count,"
+        "quality_reject_asymmetry_count,quality_reject_fit_count,"
+        "quality_reject_quality_count,quality_reject_mask_count,"
+        "quality_mean_selected_quality,quality_mean_selected_fwhm_px,"
+        "quality_mean_selected_snr,quality_selected_saturated_ratio,"
+        "quality_mean_selected_gradient_asymmetry,"
+        "quality_mean_selected_fit_residual,"
+        "quality_mean_selected_second_peak_ratio,"
+        "quality_path_cost_margin_per_point,"
+        "center_matched_point_count,center_robust_matched_point_count,"
+        "center_gross_mismatch_point_count,center_signed_mean_offset_px,"
+        "center_signed_median_offset_px,"
+        "center_robust_signed_mean_offset_px,center_robust_gate_px,"
+        "center_absolute_median_offset_px,center_absolute_p95_offset_px,"
+        "center_absolute_maximum_offset_px,centerline_algorithm_version,"
+        "quality_extraction_error,"
         "intrinsics_sha256,laser_plane_sha256,handeye_sha256\n";
     if (!file.open(QIODevice::WriteOnly) || file.write(header) != header.size() || !file.commit()) {
         if (error) *error = QStringLiteral("无法创建 %1").arg(manifestPath_);
@@ -1671,7 +3422,21 @@ bool HikConstantLaserScanWindow::appendManifest(
         return false;
     }
     QByteArray line;
-    line += QByteArray::number(row.index);
+    line += csvQuoted(profile_.id);
+    line += ','; line += QByteArray::number(profile_.wavelengthNm);
+    line += ','; line += QByteArray::number(profile_.ttlPhysicalPin);
+    line += ','; line += csvQuoted(pendingLaserStatus_.daemonGeneration);
+    line += ','; line += csvQuoted(
+        laserStateProtocolName(pendingLaserStatus_.state));
+    line += ','; line += QByteArray::number(pendingLaserStatusAgeMs_);
+    line += ','; line += pendingLaserStatus_.ttl450High ? "1" : "0";
+    line += ','; line += pendingLaserStatus_.ttl650High ? "1" : "0";
+    line += ','; line += pendingLaserStatus_.leaseActive ? "1" : "0";
+    line += ','; line += csvQuoted(pendingLaserStatus_.fault);
+    line += ','; line += csvQuoted(cameraModel_);
+    line += ','; line += csvQuoted(cameraSerial_);
+    line += ','; line += csvQuoted(cameraIp_);
+    line += ','; line += QByteArray::number(row.index);
     line += ','; line += csvQuoted(row.imagePath);
     line += ','; line += QByteArray::number(frameNo);
     line += ','; line += QByteArray::number(deviceTimestamp);
@@ -1682,19 +3447,77 @@ bool HikConstantLaserScanWindow::appendManifest(
     line += ','; line += QByteArray::number(row.after.hostTimestampMs);
     const hik_scan::Pose6D& before = row.before.pose;
     const hik_scan::Pose6D& after = row.after.pose;
-    const double values[] = {before.x, before.y, before.z,
-                             before.rx, before.ry, before.rz,
-                             after.x, after.y, after.z,
-                             after.rx, after.ry, after.rz,
-                             row.translationDeltaMm, row.rotationDeltaDeg,
-                             static_cast<double>(row.cameraPointCount), row.minimumDepthMm,
-                             row.maximumDepthMm, row.lineRmsMm};
-    for (int index = 0; index < 18; ++index) {
-        line += ','; line += QByteArray::number(values[index], 'f', 9);
+    const double poseAndMotionValues[] = {
+        before.x, before.y, before.z,
+        before.rx, before.ry, before.rz,
+        after.x, after.y, after.z,
+        after.rx, after.ry, after.rz,
+        row.translationDeltaMm, row.rotationDeltaDeg};
+    for (double value : poseAndMotionValues) {
+        line += ','; line += QByteArray::number(value, 'f', 9);
+    }
+    line += ','; line += QByteArray::number(row.cameraPointCount);
+    const double reconstructionValues[] = {
+        row.minimumDepthMm, row.maximumDepthMm, row.lineRmsMm};
+    for (double value : reconstructionValues) {
+        line += ','; line += QByteArray::number(value, 'f', 9);
     }
     line += ','; line += QByteArray::number(row.lineRmsLimitMm, 'f', 9);
     line += ','; line += (row.flatTargetGate ? "1" : "0");
     line += ','; line += QByteArray::number(row.stripeSaturatedRatio, 'f', 9);
+    line += ',';
+    line += (row.qualityExtractionPassed ? "1" : "0");
+    const int qualityCounts[] = {
+        row.legacyPointCount,
+        row.qualityPointCount,
+        row.qualityCandidateCount,
+        row.qualityAcceptedCandidateCount,
+        row.qualityRejectedCandidateCount,
+        row.qualitySelectedPointCount,
+        row.qualitySelectedGapCount,
+        row.qualityMultiPeakScanlineCount,
+        row.qualityAmbiguousPathPointCount,
+        row.qualityRejectedLowProminenceCount,
+        row.qualityRejectedWidthCount,
+        row.qualityRejectedSaturationCount,
+        row.qualityRejectedMultiPeakCount,
+        row.qualityRejectedAsymmetryCount,
+        row.qualityRejectedFitCount,
+        row.qualityRejectedQualityCount,
+        row.qualityRejectedMaskCount};
+    for (int value : qualityCounts) {
+        line += ','; line += QByteArray::number(value);
+    }
+    const double qualityMetrics[] = {
+        row.qualityMeanSelectedQuality,
+        row.qualityMeanSelectedFwhmPx,
+        row.qualityMeanSelectedSnr,
+        row.qualitySelectedSaturatedRatio,
+        row.qualityMeanSelectedGradientAsymmetry,
+        row.qualityMeanSelectedFitResidual,
+        row.qualityMeanSelectedSecondPeakRatio,
+        row.qualityPathCostMarginPerPoint};
+    for (double value : qualityMetrics) {
+        line += ','; line += QByteArray::number(value, 'f', 12);
+    }
+    line += ','; line += QByteArray::number(row.centerMatchedPointCount);
+    line += ','; line += QByteArray::number(
+        row.centerRobustMatchedPointCount);
+    line += ','; line += QByteArray::number(
+        row.centerGrossMismatchPointCount);
+    const double centerOffsets[] = {
+        row.centerSignedMeanOffsetPx,
+        row.centerSignedMedianOffsetPx,
+        row.centerRobustSignedMeanOffsetPx,
+        row.centerRobustGatePx,
+        row.centerAbsoluteMedianOffsetPx,
+        row.centerAbsoluteP95OffsetPx,
+        row.centerAbsoluteMaximumOffsetPx};
+    for (double value : centerOffsets) {
+        line += ','; line += QByteArray::number(value, 'f', 9);
+    }
+    line += ','; line += csvQuoted(row.centerlineAlgorithmVersion);
+    line += ','; line += csvQuoted(row.qualityExtractionError);
     line += ','; line += csvQuoted(intrinsicsSha256_);
     line += ','; line += csvQuoted(laserPlaneSha256_);
     line += ','; line += csvQuoted(handEyeSha256_);
@@ -1706,7 +3529,98 @@ bool HikConstantLaserScanWindow::appendManifest(
     return true;
 }
 
+bool HikConstantLaserScanWindow::writeSessionMetadata(
+        const QString& directory, QString* error) const {
+    if (error) error->clear();
+    if (!QDir().mkpath(directory)) {
+        if (error) {
+            *error = QStringLiteral("无法创建会话目录：%1").arg(directory);
+        }
+        return false;
+    }
+    QJsonObject profileObject;
+    profileObject.insert(QStringLiteral("id"), profile_.id);
+    profileObject.insert(QStringLiteral("display_name"), profile_.displayName);
+    profileObject.insert(QStringLiteral("wavelength_nm"),
+                         profile_.wavelengthNm);
+    profileObject.insert(QStringLiteral("ttl_physical_pin"),
+                         profile_.ttlPhysicalPin);
+    profileObject.insert(QStringLiteral("camera_frame"),
+                         profile_.cameraFrame);
+    profileObject.insert(QStringLiteral("camera_ip"), cameraIp_);
+    profileObject.insert(QStringLiteral("camera_model"), cameraModel_);
+    profileObject.insert(QStringLiteral("camera_serial"), cameraSerial_);
+    profileObject.insert(
+        QStringLiteral("stripe_orientation"),
+        lineLaserStripeOrientationName(profile_.stripeOrientation));
+    profileObject.insert(
+        QStringLiteral("centerline_policy"),
+        lineLaserCenterlinePolicyName(profile_.scanCenterlinePolicy));
+    QJsonObject stripeRoi;
+    stripeRoi.insert(QStringLiteral("x"), profile_.stripeRoiX);
+    stripeRoi.insert(QStringLiteral("y"), profile_.stripeRoiY);
+    stripeRoi.insert(QStringLiteral("width"), profile_.stripeRoiWidth);
+    stripeRoi.insert(QStringLiteral("height"), profile_.stripeRoiHeight);
+    profileObject.insert(QStringLiteral("stripe_roi_normalized"), stripeRoi);
+
+    QJsonObject laserObject;
+    laserObject.insert(QStringLiteral("state"),
+                       laserStateProtocolName(laserStatus_.state));
+    laserObject.insert(QStringLiteral("ttl450_high"),
+                       laserStatus_.ttl450High);
+    laserObject.insert(QStringLiteral("ttl650_high"),
+                       laserStatus_.ttl650High);
+    laserObject.insert(QStringLiteral("lease_active"),
+                       laserStatus_.leaseActive);
+    laserObject.insert(QStringLiteral("daemon_generation"),
+                       laserStatus_.daemonGeneration);
+    laserObject.insert(QStringLiteral("board_model"),
+                       laserStatus_.boardModel);
+    laserObject.insert(QStringLiteral("meaning"),
+        QStringLiteral("TTL GPIO readback only; not an optical-power measurement"));
+
+    QJsonObject calibrationObject;
+    calibrationObject.insert(QStringLiteral("intrinsics_path"),
+                             intrinsicsPath_);
+    calibrationObject.insert(QStringLiteral("laser_plane_path"),
+                             laserPlanePath_);
+    calibrationObject.insert(QStringLiteral("handeye_path"),
+                             handEyePath_);
+    calibrationObject.insert(QStringLiteral("intrinsics_sha256"),
+                             intrinsicsSha256_);
+    calibrationObject.insert(QStringLiteral("laser_plane_sha256"),
+                             laserPlaneSha256_);
+    calibrationObject.insert(QStringLiteral("handeye_sha256"),
+                             handEyeSha256_);
+
+    QJsonObject root;
+    root.insert(QStringLiteral("schema_version"), 1);
+    root.insert(QStringLiteral("created_utc"),
+                QDateTime::currentDateTimeUtc().toString(
+                    Qt::ISODateWithMs));
+    root.insert(QStringLiteral("device_profile"), profileObject);
+    root.insert(QStringLiteral("laser_control"), laserObject);
+    root.insert(QStringLiteral("calibration"), calibrationObject);
+
+    const QString path = QDir(directory).absoluteFilePath(
+        QStringLiteral("session_metadata.json"));
+    const QByteArray payload =
+        QJsonDocument(root).toJson(QJsonDocument::Indented);
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly) ||
+        file.write(payload) != payload.size() ||
+        !file.commit()) {
+        if (error) {
+            *error = QStringLiteral("无法写入会话元数据：%1")
+                         .arg(path);
+        }
+        return false;
+    }
+    return true;
+}
+
 bool HikConstantLaserScanWindow::saveCloudOutputs(QString* error) {
+    if (error) error->clear();
     std::string coreError;
     if (!hik_scan::saveScanPly(localPath(rawPlyPath_), cloud_, "base_link", &coreError)) {
         if (error) *error = QString::fromStdString(coreError);
@@ -1717,6 +3631,98 @@ bool HikConstantLaserScanWindow::saveCloudOutputs(QString* error) {
     if (!hik_scan::saveScanPly(localPath(voxelPlyPath_), voxel, "base_link", &coreError)) {
         if (error) *error = QString::fromStdString(coreError);
         return false;
+    }
+
+    hik_scan::AdjacentProfileSupportOptions supportOptions;
+    // A single-point validation has no neighboring profile by definition.
+    // Preserve all quality points in that mode, but still emit the same three
+    // quality files so downstream tooling has a stable contract.
+    supportOptions.enabled =
+        profileRows_.size() > 1U && !qualityCloud_.empty();
+    supportOptions.minimumSupportingProfiles =
+        kQualitySupportMinimumProfiles;
+    supportOptions.maximumProfileGap =
+        kQualitySupportMaximumProfileGap;
+    supportOptions.radiusMm = std::max(
+        kQualitySupportRadiusFloorMm,
+        std::max(
+            kQualitySupportStepFactor * stepSpin_->value(),
+            kQualitySupportVoxelFactor * voxelSpin_->value()));
+
+    qualitySupportResult_ =
+        hik_scan::AdjacentProfileSupportResult();
+    if (!hik_scan::filterByAdjacentProfileSupport(
+            qualityCloud_, supportOptions, &qualitySupportResult_,
+            &coreError)) {
+        if (error) {
+            *error = QStringLiteral("质量点相邻 profile 支持过滤失败：%1")
+                .arg(QString::fromStdString(coreError));
+        }
+        return false;
+    }
+
+    hik_scan::VoxelDownsampleOptions qualityVoxelOptions;
+    qualityVoxelOptions.voxelSizeMm = voxelSpin_->value();
+    qualityVoxelOptions.confidenceWeighted = true;
+    hik_scan::VoxelDownsampleStatistics qualityVoxelStatistics;
+    const std::vector<hik_scan::CloudPoint> qualityVoxel =
+        hik_scan::voxelDownsample(
+            qualitySupportResult_.kept, qualityVoxelOptions,
+            &qualityVoxelStatistics);
+    qualityVoxelPointCount_ = qualityVoxel.size();
+
+    QString qualitySaveError;
+    if (!saveCloudPlyAllowEmpty(
+            qualityOpticalPlyPath_, qualityCloud_,
+            QStringLiteral("base_link"), &qualitySaveError) ||
+        !saveCloudPlyAllowEmpty(
+            qualityFilteredPlyPath_, qualitySupportResult_.kept,
+            QStringLiteral("base_link"), &qualitySaveError) ||
+        !saveCloudPlyAllowEmpty(
+            qualityRejectedPlyPath_, qualitySupportResult_.rejected,
+            QStringLiteral("base_link"), &qualitySaveError) ||
+        !saveCloudPlyAllowEmpty(
+            qualityVoxelPlyPath_, qualityVoxel,
+            QStringLiteral("base_link"), &qualitySaveError)) {
+        if (error) {
+            *error = QStringLiteral("质量点云保存失败：%1")
+                .arg(qualitySaveError);
+        }
+        return false;
+    }
+
+    const hik_scan::AdjacentProfileSupportStatistics& qualityStatistics =
+        qualitySupportResult_.statistics;
+    appendLog(QStringLiteral(
+        "质量点云：input=%1，support_filter=%2（radius=%3 mm，"
+        "min_profiles=%4，max_gap=%5），kept/rejected=%6/%7，"
+        "invalid/insufficient=%8/%9，confidence-weighted voxel=%10；"
+        "optical=%11，filtered=%12，rejected=%13，voxel=%14。")
+        .arg(static_cast<qulonglong>(
+            qualityStatistics.inputPointCount))
+        .arg(qualitySupportResult_.applied
+                 ? QStringLiteral("on")
+                 : QStringLiteral("off"))
+        .arg(supportOptions.radiusMm, 0, 'f', 3)
+        .arg(supportOptions.minimumSupportingProfiles)
+        .arg(supportOptions.maximumProfileGap)
+        .arg(static_cast<qulonglong>(
+            qualityStatistics.keptPointCount))
+        .arg(static_cast<qulonglong>(
+            qualityStatistics.rejectedPointCount))
+        .arg(static_cast<qulonglong>(
+            qualityStatistics.invalidPointCount))
+        .arg(static_cast<qulonglong>(
+            qualityStatistics.insufficientSupportPointCount))
+        .arg(static_cast<qulonglong>(
+            qualityVoxelStatistics.outputPointCount))
+        .arg(qualityOpticalPlyPath_, qualityFilteredPlyPath_,
+             qualityRejectedPlyPath_, qualityVoxelPlyPath_));
+    if (profile_.scanCenterlinePolicy ==
+        LineLaserCenterlinePolicy::Shadow) {
+        appendLog(QStringLiteral(
+            "650/shadow 保护：上述质量文件仅供比较；正式输出仍为 %1 和 %2。")
+            .arg(rawPlyPath_, voxelPlyPath_));
     }
     return true;
 }
@@ -1746,13 +3752,40 @@ QImage HikConstantLaserScanWindow::drawStripeOverlay(
         const cv::Mat& gray, const hik_calibration::StaticProfileResult& profile) const {
     cv::Mat overlay;
     cv::cvtColor(gray, overlay, cv::COLOR_GRAY2BGR);
-    for (std::size_t index = 0; index < profile.stripe.size(); ++index) {
-        cv::circle(overlay, cv::Point(static_cast<int>(std::lround(profile.stripe[index].pixel.x)),
-                                     static_cast<int>(std::lround(profile.stripe[index].pixel.y))),
+    const std::vector<hik_calibration::StripePoint>& legacy =
+        profile.legacyStripe.empty() &&
+                profile.qualityStripe.empty()
+            ? profile.stripe
+            : profile.legacyStripe;
+    for (const hik_calibration::StripePoint& point : legacy) {
+        cv::circle(overlay, cv::Point(
+                       static_cast<int>(std::lround(point.pixel.x)),
+                       static_cast<int>(std::lround(point.pixel.y))),
                    1, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
     }
+    for (const hik_calibration::StripePoint& point :
+         profile.qualityStripe) {
+        cv::circle(overlay, cv::Point(
+                       static_cast<int>(std::lround(point.pixel.x)),
+                       static_cast<int>(std::lround(point.pixel.y))),
+                   1, cv::Scalar(0, 220, 255), -1, cv::LINE_AA);
+    }
+    if (!profile.qualityStripe.empty() &&
+        profile.qualityDiagnostics.appliedRoi.width > 0 &&
+        profile.qualityDiagnostics.appliedRoi.height > 0) {
+        cv::rectangle(
+            overlay, profile.qualityDiagnostics.appliedRoi,
+            cv::Scalar(255, 120, 0), 1, cv::LINE_AA);
+        cv::putText(
+            overlay, "legacy=green quality=yellow ROI=blue",
+            cv::Point(20, 66), cv::FONT_HERSHEY_SIMPLEX,
+            0.55, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    }
     std::ostringstream caption;
-    caption << "single-frame: " << profile.points.size() << " pts, Z="
+    caption << "official=" << profile.points.size()
+            << " legacy=" << profile.legacyPoints.size()
+            << " quality=" << profile.qualityPoints.size()
+            << ", Z="
             << std::fixed << std::setprecision(1) << profile.minimumDepthMm << ".."
             << profile.maximumDepthMm << " mm";
     cv::putText(overlay, caption.str(), cv::Point(20, 36), cv::FONT_HERSHEY_SIMPLEX,

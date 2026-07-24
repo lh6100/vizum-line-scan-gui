@@ -31,6 +31,25 @@ std::string readText(const std::filesystem::path& path) {
     return output.str();
 }
 
+std::size_t csvColumnCount(const std::string& line) {
+    if (line.empty()) return 0U;
+    std::size_t columns = 1U;
+    bool quoted = false;
+    for (std::size_t index = 0U; index < line.size(); ++index) {
+        if (line[index] == '"') {
+            if (quoted && index + 1U < line.size() &&
+                line[index + 1U] == '"') {
+                ++index;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (line[index] == ',' && !quoted) {
+            ++columns;
+        }
+    }
+    return columns;
+}
+
 std::shared_ptr<hik_sync::ImageBuffer> syntheticLaserImage() {
     const cv::Size imageSize(120, 100);
     cv::Mat image(imageSize, CV_8UC1);
@@ -83,6 +102,10 @@ void testContinuousReconstructionPipeline() {
     profileOptions.reconstruction.maximumDepthMm = 550.0;
     profileOptions.reconstruction.stripe.minPointCount = 80;
     profileOptions.reconstruction.minReconstructedPoints = 80;
+    profileOptions.reconstruction.stripe.mode =
+        hik_calibration::StripeExtractionMode::Shadow;
+    profileOptions.reconstruction.stripe.quality.orientation =
+        hik_stripe::Orientation::Vertical;
     profileOptions.minimumRawIntensity = 60;
 
     const std::filesystem::path output =
@@ -97,6 +120,11 @@ void testContinuousReconstructionPipeline() {
     options.intrinsicsSha256 = "intrinsics-test";
     options.laserPlaneSha256 = "laser-test";
     options.handEyeSha256 = "handeye-test";
+    options.saveQualityCloud = true;
+    options.enableAdjacentProfileSupport = true;
+    options.adjacentSupportRadiusMm = 1.0;
+    options.adjacentMinimumSupportingProfiles = 1;
+    options.adjacentMaximumProfileGap = 1;
 
     hik_scan::ContinuousReconstructionPipeline pipeline;
     std::string error;
@@ -116,7 +144,7 @@ void testContinuousReconstructionPipeline() {
         frame.hasBaseFromCamera = true;
         frame.baseFromCamera = Eigen::Matrix4d::Identity();
         frame.baseFromCamera(0, 3) =
-            frameId == 1U ? 100.0 : 110.0;
+            100.0 + 0.2 * static_cast<double>(frameId - 1U);
         CHECK_TRUE(enqueueEventually(&pipeline, frame),
                    "valid synchronized frame must enter reconstruction queue");
     }
@@ -141,8 +169,25 @@ void testContinuousReconstructionPipeline() {
                "two synthetic laser profiles must produce 200 raw points");
     CHECK_TRUE(statistics.rawPlySaved && statistics.voxelPlySaved,
                "raw and voxel PLY files must be saved");
+    CHECK_TRUE(statistics.qualityFramesPassed == 2U &&
+                   statistics.qualityFramesRejected == 0U,
+               "shadow quality extraction must pass both synthetic frames");
+    CHECK_TRUE(statistics.qualityOpticalPointCount == 200U &&
+                   statistics.qualityFilteredPointCount == 200U &&
+                   statistics.qualityRejectedPointCount == 0U,
+               "quality cloud must retain all adjacent supported points");
+    CHECK_TRUE(statistics.qualityOpticalPlySaved &&
+                   statistics.qualityPlySaved &&
+                   statistics.qualityVoxelPlySaved,
+               "quality before/after and weighted voxel PLYs must be saved");
     CHECK_TRUE(std::filesystem::exists(output / "continuous_raw.ply") &&
                std::filesystem::exists(output / "continuous_voxel.ply") &&
+               std::filesystem::exists(
+                   output / "continuous_quality_optical.ply") &&
+               std::filesystem::exists(
+                   output / "continuous_quality_filtered.ply") &&
+               std::filesystem::exists(
+                   output / "continuous_quality_voxel.ply") &&
                std::filesystem::exists(
                    output / "continuous_reconstruction.csv") &&
                std::filesystem::exists(
@@ -152,11 +197,42 @@ void testContinuousReconstructionPipeline() {
     CHECK_TRUE(rawPly.find("element vertex 200") != std::string::npos &&
                rawPly.find("comment frame_id base_link") != std::string::npos,
                "continuous raw PLY must contain base_link points");
+    const std::string qualityOpticalPly =
+        readText(output / "continuous_quality_optical.ply");
+    CHECK_TRUE(
+        qualityOpticalPly.find("element vertex 200") !=
+            std::string::npos &&
+        qualityOpticalPly.find(" 16 1\n") != std::string::npos,
+        "quality optical PLY must mark hard-gated observations without "
+        "mutating the formal raw cloud");
+    const std::string detail =
+        readText(output / "continuous_reconstruction.csv");
+    CHECK_TRUE(
+        detail.find("mean_selected_snr") != std::string::npos &&
+        detail.find("mean_selected_gradient_asymmetry") !=
+            std::string::npos &&
+        detail.find("offset_abs_p95_px") != std::string::npos,
+        "per-frame shadow CSV must retain optical quality and center-offset "
+        "diagnostics");
+    std::istringstream detailLines(detail);
+    std::string detailHeader;
+    std::string detailFirstRow;
+    std::getline(detailLines, detailHeader);
+    std::getline(detailLines, detailFirstRow);
+    CHECK_TRUE(
+        csvColumnCount(detailHeader) ==
+            csvColumnCount(detailFirstRow),
+        "continuous reconstruction CSV header and data rows must remain "
+        "column-aligned as diagnostics evolve");
     const std::string summary =
         readText(output / "continuous_reconstruction_summary.json");
     CHECK_TRUE(summary.find("\"reconstructed_frames\": 2") !=
                    std::string::npos &&
                summary.find("\"intrinsics_sha256\": \"intrinsics-test\"") !=
+                   std::string::npos &&
+               summary.find("\"quality_frames_passed\": 2") !=
+                   std::string::npos &&
+               summary.find("\"quality_filtered_point_count\": 200") !=
                    std::string::npos,
                "continuous summary must retain counts and calibration identity");
 

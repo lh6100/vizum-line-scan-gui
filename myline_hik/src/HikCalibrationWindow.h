@@ -3,6 +3,7 @@
 
 #include "HikCalibrationCore.h"
 #include "HandEyeCalibrationCore.h"
+#include "LineLaserDeviceProfile.h"
 
 #include <QImage>
 #include <QMainWindow>
@@ -23,15 +24,20 @@ class QSpinBox;
 class QTabWidget;
 class QTableWidget;
 class HikCameraWorker;
-class FairinoReadOnlyWorker;
+class FairinoRobotSession;
 class ImageView;
 
 class HikCalibrationWindow final : public QMainWindow {
     Q_OBJECT
 
 public:
-    explicit HikCalibrationWindow(QWidget* parent = nullptr);
+    explicit HikCalibrationWindow(const LineLaserDeviceProfile& profile,
+                                  FairinoRobotSession* robotSession,
+                                  QWidget* parent = nullptr);
     ~HikCalibrationWindow() override;
+
+    const LineLaserDeviceProfile& deviceProfile() const { return profile_; }
+    void setProfileTabActive(bool active);
 
 signals:
     void requestConnectCamera(QString ipAddress);
@@ -40,8 +46,8 @@ signals:
                               double exposureUs,
                               double gainDb,
                               int timeoutMs);
-    void requestConnectRobot(QString ipAddress);
-    void requestDisconnectRobot();
+    void requestConnectRobot(int clientId, QString ipAddress);
+    void requestDisconnectRobot(int clientId);
     void requestReadFlangePose(int requestId);
 
 protected:
@@ -95,6 +101,7 @@ private slots:
                                 qint64 hostTimestampMs);
     void onRobotLog(QString message);
     void onRobotError(int requestId, QString message);
+    void onRobotClientError(int clientId, QString message);
 
     void swapBoardAxes();
     void importIntrinsicImages();
@@ -223,8 +230,8 @@ private:
     QWidget* buildPreviewPanel();
     void setupCameraWorker();
     void shutdownCameraWorker();
-    void setupRobotWorker();
-    void shutdownRobotWorker();
+    void setupRobotSession();
+    void shutdownRobotSession();
     bool createSessionDirectories(QString* error);
     bool appendCaptureManifest(CapturePurpose purpose,
                                const QString& pairId,
@@ -254,6 +261,13 @@ private:
     void updateProfileUi();
     void updateHandEyeUi();
     void resetPendingCapture();
+    QString expectedCameraModelFromUi() const;
+    QString expectedCameraSerialFromUi() const;
+    bool currentCameraMatchesProfile(QString* error = nullptr) const;
+    bool intrinsicsMetadataMatchesProfile(
+        const hik_calibration::IntrinsicsYamlMetadata& metadata,
+        QString* error = nullptr) const;
+    bool profileIdentityCanChange() const;
 
     hik_calibration::BoardSpec boardSpecFromUi() const;
     bool checkedBoardSpec(hik_calibration::BoardSpec* board, QString* error) const;
@@ -312,8 +326,10 @@ private:
                              const QString& sampleId);
     void resetPendingLaserOff();
     void refreshLaserTable();
+    void refreshLaserGuidance();
     int acceptedLaserPairCount() const;
     void invalidateLaserSolution();
+    bool laserGuidancePasses(QString* reason = nullptr) const;
     bool laserResultPassesQuality(QString* reason = nullptr) const;
     hik_calibration::LaserPlaneYamlMetadata laserMetadata() const;
     bool writeLaserYaml(const QString& path, QString* error) const;
@@ -371,11 +387,11 @@ private:
     bool cameraConnected_{false};
     bool cameraBusy_{false};
     bool shuttingDown_{false};
-    QThread robotThread_;
-    FairinoReadOnlyWorker* robotWorker_{nullptr};
+    FairinoRobotSession* const robotSession_;
+    int robotClientId_{0};
+    bool profileTabActive_{true};
     bool robotConnected_{false};
     bool robotBusy_{false};
-    int nextRobotRequestId_{0};
     int pendingRobotRequestId_{-1};
     bool manualRobotReadPending_{false};
     RobotPoseReading currentRobotPose_;
@@ -394,8 +410,8 @@ private:
     QString intrinsicDatasetCameraModel_;
     QString intrinsicDatasetCameraSerial_;
 
+    const LineLaserDeviceProfile profile_;
     QString sourceDir_;
-    QString configDir_;
     QString sessionDir_;
     QString intrinsicSessionDir_;
     QString laserSessionDir_;
@@ -411,6 +427,8 @@ private:
     QDoubleSpinBox* gainSpin_{nullptr};
     QSpinBox* timeoutSpin_{nullptr};
     QLabel* cameraStatusLabel_{nullptr};
+    QLineEdit* expectedCameraModelEdit_{nullptr};
+    QLineEdit* expectedCameraSerialEdit_{nullptr};
     QPushButton* connectButton_{nullptr};
     QPushButton* disconnectButton_{nullptr};
     QPushButton* singleFrameButton_{nullptr};
@@ -452,6 +470,8 @@ private:
     QPushButton* saveLaserApprovedButton_{nullptr};
     QLabel* laserGateLabel_{nullptr};
     QLabel* laserResultLabel_{nullptr};
+    QLabel* laserGuidanceSummaryLabel_{nullptr};
+    QTableWidget* laserGuidanceTable_{nullptr};
     QTableWidget* laserTable_{nullptr};
 
     QPushButton* reloadProfileCalibrationButton_{nullptr};

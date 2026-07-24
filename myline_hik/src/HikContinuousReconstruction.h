@@ -19,6 +19,11 @@ struct ContinuousReconstructionOptions {
     std::string intrinsicsSha256;
     std::string laserPlaneSha256;
     std::string handEyeSha256;
+    bool saveQualityCloud{true};
+    bool enableAdjacentProfileSupport{false};
+    double adjacentSupportRadiusMm{1.0};
+    int adjacentMinimumSupportingProfiles{1};
+    int adjacentMaximumProfileGap{2};
 };
 
 struct ContinuousReconstructionStatistics {
@@ -32,14 +37,28 @@ struct ContinuousReconstructionStatistics {
     uint64_t reconstructedFrames{0U};
     uint64_t reconstructionFailures{0U};
     uint64_t lineQualityWarnings{0U};
+    uint64_t qualityFramesPassed{0U};
+    uint64_t qualityFramesRejected{0U};
     uint64_t rawPointCount{0U};
     uint64_t voxelPointCount{0U};
+    uint64_t qualityOpticalPointCount{0U};
+    uint64_t qualityFilteredPointCount{0U};
+    uint64_t qualityRejectedPointCount{0U};
+    uint64_t qualityVoxelPointCount{0U};
     double meanReconstructionMs{0.0};
     double maximumReconstructionMs{0.0};
     bool rawPlySaved{false};
     bool voxelPlySaved{false};
+    bool qualityOpticalPlySaved{false};
+    bool qualityPlySaved{false};
+    bool qualityRejectedPlySaved{false};
+    bool qualityVoxelPlySaved{false};
     std::string rawPlyPath;
     std::string voxelPlyPath;
+    std::string qualityOpticalPlyPath;
+    std::string qualityPlyPath;
+    std::string qualityRejectedPlyPath;
+    std::string qualityVoxelPlyPath;
     std::string detailCsvPath;
     std::string summaryJsonPath;
 };
@@ -70,8 +89,9 @@ public:
     bool tryEnqueue(const hik_sync::SynchronizedFrame& frame) noexcept;
 
     // Called only after SynchronizationSession::stop() has joined the producer.
-    // It drains workers, writes continuous_raw.ply/continuous_voxel.ply and
-    // releases retained image buffers.
+    // It drains workers, writes the unchanged formal raw/voxel outputs and,
+    // when enabled, the separately named optical-gated, adjacent-supported,
+    // rejected and confidence-weighted quality outputs.
     bool stopAndSave(ContinuousReconstructionStatistics* statistics = nullptr,
                      std::string* error = nullptr);
 

@@ -3,21 +3,52 @@
 这个目录提供一个独立的 Qt5 GUI，用于完成：
 
 1. 海康面阵相机的内参和畸变标定；
-2. 相机光学坐标系下的红色线激光平面标定；
+2. 相机光学坐标系下、当前设备组对应的线激光平面标定；
 3. 海康相机到 FR5 法兰的 eye-in-hand 手眼标定；
 4. 不依赖 ROS 2 的 FR5 常亮线激光停稳扫描验证与 base 坐标系 PLY 累计。
 
-标定 GUI 不依赖 ROS 2。它的手眼页面通过 Fairino SDK 只读连接 FR5，界面不提供运动按钮。独立的 `HikConstantLaserScan` 扫描程序会在操作者明确取消 dry-run、勾选安全确认并再次确认后发送低速 `MoveL` 和 `StopMotion`；它不会自动使能机器人、切换控制器模式或控制激光 IO。
+标定 GUI 不依赖 ROS 2。它的手眼页面通过 Fairino SDK 只读连接 FR5，界面不提供运动按钮。独立的 `HikConstantLaserScan` 扫描程序会在操作者明确取消 dry-run、勾选安全确认并再次确认后发送低速 `MoveL` 和 `StopMotion`；它不会自动使能机器人或切换控制器模式。扫描 GUI 通过鲁班猫 4 V1 的受限控制服务管理两路激光 TTL，日常操作不使用 SSH 密码或 `sudo`。
+
+当前提供两个完全隔离的设备组：
+
+| 设备组 | 光学系统 | TTL | 正式标定 |
+| --- | --- | --- | --- |
+| `scanner_450` | 450 nm、130 万相机、12.5 mm | Pin 11 / GPIO15 | `config/devices/scanner_450/`，完成标定前禁止建图 |
+| `scanner_650` | 650 nm、160 万相机、6 mm | Pin 7 / GPIO16 | 已有 `config/hik_*.yaml` 正式标定 |
+
+标定与扫描程序默认各显示两个独立标签页，也可用
+`--profile scanner_450` 或 `--profile scanner_650` 只打开一组。第一阶段一次只允许一组
+执行真实扫描；双相机同一运动时间线的严格同步采集不在本阶段内。详细边界和验收项见
+[`docs/双线激光双相机系统需求与实施.md`](docs/双线激光双相机系统需求与实施.md)。
+高反光场景的 `Legacy/Shadow/Quality` 策略、局部 Median/MAD、GAP 路径、中心算法、
+质量点云文件和离线回放方法见
+[`docs/stripe_quality_pipeline.md`](docs/stripe_quality_pipeline.md)。
+
+正式配置按 profile 固定映射：
+
+| 配置 | `scanner_450` | `scanner_650` |
+| --- | --- | --- |
+| 内参 | `config/devices/scanner_450/hik_intrinsics.yaml` | `config/hik_intrinsics.yaml` |
+| 激光平面 | `config/devices/scanner_450/hik_laser_plane.yaml` | `config/hik_laser_plane.yaml` |
+| 手眼 | `config/devices/scanner_450/hik_handeye.yaml` | `config/hik_handeye.yaml` |
+| 连续同步 | `config/devices/scanner_450/synchronization.yaml` | `config/synchronization.yaml` |
+| 相机 frame | `hik_450_camera_optical_frame` | `hik_camera_optical_frame` |
 
 ## 1. 开始前必须确认
 
 - 将相机、镜头和线激光固定到最终使用的机械结构上。完成标定后不能再改变镜头焦距、对焦、光圈、相机分辨率或 ROI，否则需要重新标定。
 - 运行本工具前，先在 MVS 中停止取流、关闭设备并完全退出 MVS；同时关闭其他相机采集程序。本工具以独占模式打开相机，MVS 仍占用时会连接失败。
-- 默认相机 IP 是 `192.168.1.56`。主机相机网卡必须和它位于同一网段。
-- 内参采集时必须关闭红色线激光。
+- `scanner_650` 最近实机枚举地址是 `192.168.7.45`，并绑定型号
+  `MV-CS016-10GM`、序列号 `DA8784601`；`scanner_450` 的 IP、型号和序列号必须
+  连接实机后录入，不能按像素数猜测。
+- 内参采集时必须确认两路线激光均关闭。
 - 激光平面标定的每一组 `laser-off` / `laser-on` 必须使用完全相同的曝光和增益，而且两帧之间相机与标定板都不能移动。
-- 标定 GUI 不会自动开关激光或控制机械臂运动。常亮扫描程序要求激光由人工保持开启，并会按示教路径真实控制机械臂。
-- Fairino SDK 同一时间只能由一个进程占用。进入手眼页面前，必须停止 `ros2_fr5` 的 `fairino_state_publisher`、旧 GUI 或其他 FR5 SDK 客户端。
+- 标定 GUI 不控制激光或机械臂运动。扫描 GUI 有“开启本组 TTL”和“关闭两路 TTL”按钮；只有板端 ACK 与 GPIO 逻辑回读一致时才允许真采集，完成、停止、断线或故障都会请求关光。
+- GPIO 逻辑回读不能证明排针电压或激光实际出光。首次部署后必须先断开激光 TTL 负载，用万用表或示波器验收 Pin 11、Pin 7；软件不能代替硬件下拉、急停和激光安全回路。
+- Fairino SDK 同一时间只能由一个进程占用。进入手眼或扫描页面前，必须停止
+  `ros2_fr5` 的 `fairino_state_publisher`、旧 GUI 或其他 FR5 SDK 客户端。同一 GUI
+  内的两个 profile 共用唯一 FR5 会话，空闲切页无需重连；主动断开或连接失败后因
+  3.9.4 后台线程限制仍需重启该 GUI 才能再次连接。
 
 ## 2. 独立构建和运行
 
@@ -53,6 +84,20 @@ cd /home/zhulong/lh/vizum-line-scan-gui/myline_hik
 cd /home/zhulong/lh/vizum-line-scan-gui/myline_hik
 ./run_constant_laser_scan.sh
 ```
+
+首次在鲁班猫安装免密码、失效关光的 TTL 服务：
+
+```bash
+./tools/setup_laser_control.sh
+```
+
+这一步需要人工核对 SSH host key，并可能只在安装阶段要求 `cat`/`sudo` 密码。完成后
+GUI 使用专用 forced-command 密钥；启动、状态查询、开关光和退出均不再要求密码。
+板端实现、引脚映射和失效行为见
+[`deploy/lubancat4-v1/README.md`](deploy/lubancat4-v1/README.md)。
+当前 GUI 固定使用本项目现场值 `192.168.1.12:22` 和默认专用密钥目录；若安装脚本使用
+了非默认 `--host`、`--port` 或 `--key-dir`，还必须通过代码中的
+`LineLaserConnectionConfig` 同步配置，不能只改板端。
 
 两个程序都会占用海康相机和 Fairino SDK，不能同时运行。启动扫描程序前应退出标定 GUI、MVS、`fairino_state_publisher` 以及其他 FR5 SDK 客户端。
 
@@ -120,7 +165,8 @@ env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
 ## 4. 第一步：连接相机并确认图像
 
 1. 完全退出 MVS。
-2. 启动 GUI，确认 IP。当前默认值为 `192.168.1.56`。
+2. 启动 GUI，确认当前设备组的 IP。`scanner_650` 默认填入最近实机枚举值
+   `192.168.7.45`；`scanner_450` 在首次连接实机前保持空白。
 3. 设置曝光、增益和超时。界面默认值分别为 `1825 us`、`0 dB` 和 `3000 ms`，它们只是起点，应以现场图像为准。
 4. 点击“连接”。成功后程序记录相机型号、序列号和 IP，将缩放复位为 1、ROI 复位为全幅，并工作在 `Mono8`、软件触发模式。
 5. 点击“单帧”，检查图像尺寸、清晰度、亮度以及是否过曝。
@@ -132,7 +178,7 @@ env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
 
 ### 5.1 采集 30–40 张图像
 
-1. 关闭红色线激光。
+1. 确认两路线激光均关闭。
 2. 切换到“相机内参”页。
 3. 使用“实时采样（激光关闭）”逐张采集；已有图片也可用“批量导入图片”。
 4. 建议采集 30–40 张清晰图像，不要连续拍摄几乎相同的姿态。应覆盖：
@@ -160,7 +206,7 @@ env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
 3. 查看求解结果和表格中的“标定采用/标定剔除”。如果姿态覆盖不足或误差偏大，先补拍数据再重新求解，不要仅靠删除所有高误差图像来压低 RMS。
 4. 成功求解后，程序会自动在当前 session 中保存一份候选 YAML；“保存 session 候选 YAML”可以另外保存带时间戳的候选。
 5. 如果要继续标定激光平面，切换到“激光平面”页，点击“沿用本页刚求出的内参”；也可以点击“加载内参 YAML”加载之前保存的文件。
-6. 只有结果通过软件质量门槛后，“保存通过结果到 `config/hik_intrinsics.yaml`”才会启用。
+6. 只有结果通过软件质量门槛后，“保存通过结果到当前 profile 正式内参”才会启用；实际路径见前面的 profile 映射表。
 
 当前正式内参文件的软件提升门槛为：
 
@@ -181,15 +227,15 @@ env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
 进入“激光平面”页后，先执行以下任一项：
 
 - 点击“沿用本页刚求出的内参”；
-- 点击“加载内参 YAML”，选择已批准的 `config/hik_intrinsics.yaml` 或 session 候选。
+- 点击“加载内参 YAML”，选择当前 profile 已批准的正式内参或 session 候选。
 
-内参、图像分辨率、镜头状态和标定板定义必须与激光平面采集一致。当前内参或 session 候选可用于调试和生成激光候选；只有明确加载已批准的 `config/hik_intrinsics.yaml`，激光平面才可能提升为正式配置。
+内参、图像分辨率、镜头状态和标定板定义必须与激光平面采集一致。当前内参或 session 候选可用于调试和生成激光候选；只有明确加载当前 profile 已批准的正式内参，激光平面才可能提升为正式配置。
 
 ### 6.2 严格采集 laser-off / laser-on 配对
 
 每个标定板姿态都必须按下面顺序完成一组配对：
 
-1. 把标定板放到目标距离和倾角，确保红色激光能够落在标定板有效区域内，然后等待结构完全静止。
+1. 把标定板放到目标距离和倾角，确保当前设备组对应的激光能够落在标定板有效区域内，然后等待结构完全静止。
 2. 关闭激光，点击“1. 采 laser-off”。
 3. 确认界面显示 `laser-off 已保存`。从这一刻起，严禁移动相机、标定板、支架或工作台，也不要改变曝光、增益、对焦、光圈、分辨率和 ROI。
 4. 只打开激光，点击“2. 板不动，采 laser-on”。
@@ -201,6 +247,10 @@ env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
 当前每组配对的自动质量检查包括：
 
 - off/on 两张图都通过 ChArUco 检测；
+- `laser-off` 板区域饱和比例不超过 1%；`laser-on` 允许预期的窄激光线使该比例达到 5%，但后续条纹宽度和连续性门槛仍保持不变；
+- `scanner_650` 的 Legacy 标定保持原完整半高宽质心定义；Quality 中心对窄且对称的
+  饱和条纹使用左右半高交点中点，宽平顶或非对称饱和直接拒绝，不能以单侧下降沿
+  作为中心；
 - 至少 8 个共同角点；
 - 角点位移均值不大于 0.35 px，P95 不大于 0.75 px；
 - 两次估计的板姿态平移差不大于 0.5 mm，旋转差不大于 0.2°；
@@ -210,30 +260,61 @@ env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
 
 ### 6.3 采集姿态覆盖
 
-建议采集 12–16 个用于拟合的不同姿态，而不是只满足界面允许求解的最低数量。姿态应覆盖：
+当前项目按 `300–1000 mm` 工作范围启用了专用采集引导。界面不是用标定板原点
+`tvec.z` 粗略判断深度，而是用每组有效激光 3D 交点的**中位相机 Z**自动分档：
 
-- 实际扫描的最近、常用和最远深度；
-- 标定板在视场左、中、右及上、中、下的位置；
-- 绕 X/Y 轴的正负倾角，避免全部正对相机；
-- 激光线在标定板上的不同位置。
+| 目标深度 | 自动分档范围 | 目标有效组数 |
+| --- | --- | ---: |
+| 300 mm | `[260, 350) mm` | 5 |
+| 400 mm | `[350, 475) mm` | 4 |
+| 550 mm | `[475, 625) mm` | 4 |
+| 700 mm | `[625, 775) mm` | 4 |
+| 850 mm | `[775, 925) mm` | 4 |
+| 1000 mm | `[925, 1040] mm` | 5 |
 
-不要让某一个距离或倾角占据绝大多数样本。条件允许时，再单独采集 4–6 个不参加拟合的验证姿态，用于检查近端/远端是否存在系统偏差。
+总目标为 26 个有效姿态。每完成一组通过质量检查的配对，GUI 会同步显示：
+
+- 该组的中位 Z 和所属深度档，超出引导范围时明确标为“范围外”；
+- 标定板中心的相机坐标 X/Y；
+- 标定板法向相对相机 Z 轴的 X/Y 有符号偏角；
+- 激光条纹像素位置的 U/V 中位数；
+- 每档已采数量、X/Y 跨度、倾角范围、条纹位置跨度和下一项缺口；
+- 下一组优先深度以及左/右、上/下、正/负倾角或改变激光落点的建议。
+
+采完 `laser-off` 后，界面会先用板中心 Z 显示近似深度档；如果明显放错距离，可以取消
+当前配对后重新摆板。完成 `laser-on` 后才会改用激光 3D 点中位 Z 给出最终档位。
+预览图也会叠加 `Zmed`、深度档、板中心、法向偏角和条纹位置，便于拍完立即确认。
+删除样本、清空数据集或离线导入后，引导表会从当前有效样本自动重算，不保留人工计数。
+“范围外”的有效组仍会参加当前候选拟合，因此界面会要求在正式保存前删除或按正确深度
+重拍，避免意外扩大 YAML 的有效 Z。
+
+为了防止“数量够了但姿态几乎相同”，每个深度档除达到目标组数外，还必须满足：
+
+- 标定板中心 X 跨度至少 20 mm，Y 跨度至少 20 mm；
+- 板法向 X、Y 偏角都覆盖小于等于 `-2°` 和大于等于 `+2°`；
+- 各组激光条纹 U/V 中位位置的跨度，至少有一个方向达到对应图像尺寸的 6%。
+
+最低 8 个有效姿态后仍允许提前求解并保存 session 候选，便于检查条纹和平面残差；
+但六个深度档及上述多样性未全部完成时，不能覆盖正式
+当前 profile 的正式激光平面文件。条件允许时，拟合完成后仍应另外采集 4–6 个不参加
+求解的验证姿态，用于检查近端、远端和中间深度是否存在系统偏差。
 
 ### 6.4 求解激光平面
 
 1. 只有状态为通过的配对参与求解。
 2. 界面 RANSAC 距离阈值默认是 0.3 mm。没有明确实验依据时先保持默认值，不要为了提高内点率盲目放宽。
-3. 至少 8 个通过质量检查的不同姿态后，“求解激光平面”才会启用；工程采集仍建议达到上面的 12–16 个训练姿态。
+3. 至少 8 个通过质量检查的不同姿态后，“求解激光平面”会启用；正式结果应完成上面的 26 组六档引导。
 4. 点击“求解激光平面”。算法要求每个参与姿态至少 60 个 3D 点，每个姿态最多均衡抽取 250 点，执行 2000 次跨姿态 RANSAC，再以按姿态平衡的 SVD 精化。
 5. 拟合的最小内点比例是 90%。检查结果中的姿态数、点数、内点比例、RMS、P95 和最大距离。
-6. 成功求解后先保存 session 候选；只有达到正式质量门槛后，才能提升到 `config/hik_laser_plane.yaml`。
+6. 成功求解后先保存 session 候选；只有达到正式质量门槛后，才能提升到当前 profile 的正式激光平面文件。
 
 当前正式激光平面文件的软件提升门槛为：
 
 - 有有效的平面求解结果；
-- 必须加载已批准的 `config/hik_intrinsics.yaml`，且其中至少采用 15 个视图、总 RMS 不大于 0.45 px；
+- 必须加载当前 profile 已批准的正式内参，且其中至少采用 15 个视图、总 RMS 不大于 0.45 px；
 - 所用内参文件的 SHA-256 与加载时一致，相机序列号与实时设备一致，采集清单存在且可校验；
 - 至少 8 个有效板姿态；
+- 完成 300、400、550、700、850、1000 mm 六个深度档的 5/4/4/4/4/5 组采集，以及每档的 X/Y、正负倾角和条纹位置多样性；
 - 去除平移差小于 5 mm 且法向差小于 3°的近重复样本后，仍至少有 8 个姿态；
 - 内点比例不低于 90%；
 - 法向量长度与 1 的差不超过 `1e-6`；
@@ -256,8 +337,8 @@ nx * X + ny * Y + nz * Z + d = 0
 
 进入“静态三维轮廓”页。程序启动时会自动加载并交叉校验：
 
-- `config/hik_intrinsics.yaml`；
-- `config/hik_laser_plane.yaml`；
+- 当前 profile 的正式内参；
+- 当前 profile 的正式激光平面；
 - 激光平面记录的内参 SHA-256 与当前正式内参是否一致；
 - 正式内参绑定的相机序列号、图像尺寸和激光平面有效 Z 范围。
 
@@ -272,7 +353,10 @@ nx * X + ny * Y + nz * Z + d = 0
 7. 像素经正式内参去畸变为相机射线，并与正式激光平面求交；
 8. 有效点自动保存为相机光学坐标系下的 PLY 和 CSV。
 
-当前条纹提取器按“每个图像行一个中心”工作，因此激光线应大致沿图像竖直方向并覆盖至少 80 行。输出坐标为 `hik_camera_optical_frame`，X 向右、Y 向下、Z 向前，单位 mm。超出激光平面 YAML 所记录有效 Z 范围的点会被拒绝，而不是外推。
+条纹扫描方向由设备 profile 固定：水平条纹按“每个图像列一个中心”，竖直条纹按
+“每个图像行一个中心”；`Auto` 只用于尚未固定方向的标定阶段。输出坐标为当前
+profile 的相机 frame（见映射表），X 向右、Y 向下、Z 向前，单位 mm。超出激光
+平面 YAML 所记录有效 Z 范围的点会被拒绝，而不是外推。
 
 建议在有效范围的近、中、远位置分别采至少 3 组，检查静态重复性。表格中的指标含义不同：
 
@@ -287,7 +371,7 @@ nx * X + ny * Y + nz * Z + d = 0
 ### 8.1 现场布置与连接
 
 1. 将 ChArUco 板牢固固定在机器人基座附近的工作台上；从第一张到最后一张都不能移动板。
-2. 关闭红色线激光，保持正式内参标定后的分辨率、ROI、镜头焦距、对焦和光圈不变。
+2. 确认两路线激光均关闭，保持当前 profile 正式内参标定后的分辨率、ROI、镜头焦距、对焦和光圈不变。
 3. 停止 `ros2_fr5` 的 FR5 状态发布节点和其他 Fairino SDK 客户端。
 4. 连接海康相机，然后进入“FR5 手眼标定”页，以默认 `192.168.1.200` 连接 FR5。
 5. 可先点“读取当前法兰”，确认显示的是控制器实际 `T_base_flange`，单位为 mm/deg。
@@ -328,7 +412,7 @@ nx * X + ny * Y + nz * Z + d = 0
 T_base_board = T_base_flange · T_flange_camera · T_camera_board
 ```
 
-`T_flange_camera` 将 `hik_camera_optical_frame` 中的点变换到 FR5 法兰坐标系，平移单位为 mm。正式写入 `config/hik_handeye.yaml` 的门槛为：
+`T_flange_camera` 将当前 profile 相机 frame 中的点变换到 FR5 法兰坐标系，平移单位为 mm。正式写入当前 profile 手眼文件的门槛为：
 
 - 最终采用样本不少于 15 个；
 - 固定板 base 坐标平移一致性 RMS 不大于 1.0 mm；
@@ -343,8 +427,9 @@ T_base_board = T_base_flange · T_flange_camera · T_camera_board
 ### 9.1 先做完全不运动的单点验证
 
 1. 退出标定 GUI、MVS、ROS 2 法兰发布节点和其他 Fairino SDK 客户端。
-2. 将工件放在激光平面的有效相机 Z 范围内；当前正式文件记录约为 `484.41–557.14 mm`。
-3. 让线激光保持常亮，运行 `./run_constant_laser_scan.sh`，连接相机和 FR5。
+2. 将工件放在当前 profile 激光平面的有效相机 Z 范围内；只以该 YAML 的
+   `validity.camera_z_min_mm` / `camera_z_max_mm` 为准，不跨 profile 借用范围。
+3. 运行 `./run_constant_laser_scan.sh`，连接鲁班猫 TTL、当前 profile 相机和 FR5；点击“开启本组 TTL”，等待板端 ACK、租约和两路 GPIO 逻辑回读均通过。
 4. 点击“单点常亮验证（不移动）”。它只读取采图前后法兰位姿，不发送运动。
 5. 放大检查预览中的绿色中心线必须只覆盖真实激光条纹。确认点数、深度范围和条纹饱和比例合理后，再考虑机器人运动。
 
@@ -373,21 +458,23 @@ P_base = T_base_flange · T_flange_camera · P_camera
 
 例如路径为 `182.703 mm`、步距 `0.5 mm` 时，会生成 `ceil(182.703 / 0.5) + 1 = 367` 个目标。可把“最大验证路径”设为 `200 mm`、把“最大目标数量”设为 `400`，无需关闭保护，也不会丢点。367 次停稳、取图和写盘耗时较长，必须先用较大步距验证完整路径，再生成并核对 0.5 mm 的 dry-run。
 
-每个点严格执行：非阻塞 `MoveL`、轮询到位、停稳等待、读取法兰 before、软件触发一帧、读取法兰 after、静止校验、三角重建和 base 坐标累计。扫描工具不会做碰撞规划，也不会自动从当前位置规划到起点；第一次到起点同样是一段直线 `MoveL`。界面“停止”会终止采集状态机，并在活动运动期间通过同一个 SDK 会话发送 `StopMotion`，但它不能替代控制柜物理急停。
+每个点严格执行：非阻塞 `MoveL`、轮询到位、停稳等待、读取法兰 before、软件触发一帧、读取法兰 after、静止校验、三角重建和 base 坐标累计。扫描工具不会做碰撞规划，也不会自动从当前位置规划到起点；第一次到起点同样是一段直线 `MoveL`。界面“停止”会终止采集状态机，并在活动运动期间通过同一个 SDK 会话发送 `StopMotion`，但它不能替代控制柜物理急停。`StopMotion` 返回 0 后还会等待新鲜 20004 状态连续确认 `motion_done=1` 且 TCP 线/角速度接近零；扫描完成或中止后，只有相机空闲、FR5 停止和两路 TTL LOW 三项都确认，另一组和下一次扫描才会解锁。
 
 ### 9.3 输出与首轮判断
 
 每次单点或扫描会话保存在：
 
 ```text
-data/scans/scan_YYYYMMDD_HHMMSS_mmm/
+data/scans/<profile>/scan_YYYYMMDD_HHMMSS_mmm/
 ├── images/profile_*.png
+├── session_metadata.json
+├── session_result.json
 ├── scan_manifest.csv
 ├── scan_raw.ply
 └── scan_voxel.ply
 ```
 
-`scan_manifest.csv` 记录图像、帧号、设备/主机时间戳、实际曝光和增益、采图前后完整法兰 XYZ/RPY、静止差、直线 RMS、是否启用平板门槛、条纹饱和比例及三份标定 SHA-256。`scan_raw.ply` 是未降采样 base 点云，`scan_voxel.ply` 默认按 `0.5 mm` 体素平均；PLY 单位为 mm，并保留置信度、响应、轮廓序号和原像素坐标。
+`scan_manifest.csv` 记录 profile、波长、TTL Pin、板端 generation、相机身份、图像、帧号、设备/主机时间戳、实际曝光和增益、采图前后完整法兰 XYZ/RPY、静止差、直线 RMS、是否启用平板门槛、条纹饱和比例及三份标定 SHA-256。`session_metadata.json` 固化会话设备与标定身份，`session_result.json` 原子记录完整/中止、原因、结束时间、最终计数，以及 TTL LOW、FR5 停止和相机空闲的终态互锁结果。`scan_raw.ply` 是未降采样 base 点云，`scan_voxel.ply` 默认按 `0.5 mm` 体素平均；PLY 单位为 mm，并保留置信度、响应、轮廓序号和原像素坐标。
 
 第一轮不要使用 ICP。扫描同一标准平板时，各轮廓应凭手眼与机器人位姿自然重合。建议依次验证：单点、`20–50 mm / 5 mm` 步距、`2 mm` 步距、同路径重复、反向扫描。若条纹间出现随运动方向变化的错层，优先检查手眼、法兰坐标定义、结构松动和采图前后位姿，不要靠点云配准掩盖。
 
@@ -407,7 +494,7 @@ data/scans/scan_YYYYMMDD_HHMMSS_mmm/
 ```text
 myline_hik/
 ├── data/calibration/
-│   └── session_YYYYMMDD_HHMMSS_mmm/
+│   └── <profile>/session_YYYYMMDD_HHMMSS_mmm/
 │       ├── capture_manifest.csv
 │       ├── intrinsics/
 │       │   ├── intrinsic_*.png
@@ -430,15 +517,19 @@ myline_hik/
 │           ├── hik_handeye_candidate_*.yaml
 │           └── hik_handeye_approved_*.yaml
 ├── data/scans/
-│   └── scan_YYYYMMDD_HHMMSS_mmm/
+│   └── <profile>/scan_YYYYMMDD_HHMMSS_mmm/
 │       ├── images/profile_*.png
+│       ├── session_metadata.json
+│       ├── session_result.json
 │       ├── scan_manifest.csv
 │       ├── scan_raw.ply
 │       └── scan_voxel.ply
 └── config/
-    ├── hik_intrinsics.yaml
-    ├── hik_laser_plane.yaml
-    └── hik_handeye.yaml
+    ├── hik_intrinsics.yaml                 # scanner_650 已有正式标定
+    ├── hik_laser_plane.yaml                # scanner_650 已有正式标定
+    ├── hik_handeye.yaml                    # scanner_650 已有正式标定
+    ├── synchronization.yaml                # scanner_650 已有连续同步配置
+    └── devices/scanner_450/                # scanner_450 独立四份配置
 ```
 
 导入的原图也会原样复制到当前 session。`data/calibration/` 默认不提交到 Git。
@@ -475,7 +566,7 @@ myline_hik/
 
 完全退出 MVS，并确认没有其他程序打开相机。只在 MVS 中停止取流但仍保持设备打开，也可能阻止独占访问。
 
-### 找不到 `192.168.1.56`
+### 找不到配置中的相机 IP
 
 检查相机供电、网线、主机网卡地址和子网掩码；确认 GUI 中输入的是相机当前 IP。日志会列出实际枚举到的 GigE 相机。
 
@@ -517,11 +608,16 @@ myline_hik/
 
 ### 静态轮廓提示点全部超出深度范围
 
-当前平板不在 `hik_laser_plane.yaml` 的 `validity.camera_z_min_mm` 到 `camera_z_max_mm` 范围内。应移动平板进入标定覆盖范围；不要手工放宽范围来掩盖外推。
+当前平板不在当前 profile 激光平面 YAML 的 `validity.camera_z_min_mm` 到 `camera_z_max_mm` 范围内。应移动平板进入标定覆盖范围；不要手工放宽范围来掩盖外推。
 
 ### FR5 连接报 `RPC err=-2` 或提示被占用
 
-Fairino SDK 同时只能由一个客户端持有连接。停止 `ros2_fr5` 的 `fairino_state_publisher`、其他机器人 GUI 和测试程序，然后完全退出并重启本标定工具。SDK 失败后不能在同一进程安全重连，界面会要求重启，这是为了规避旧 SDK 后台线程竞态。
+Fairino SDK 同时只能由一个客户端持有连接。先停止 `ros2_fr5` 的
+`fairino_state_publisher`、其他机器人 GUI 和测试程序，再重启本工具。标定程序和扫描
+程序内部都只创建一个进程级 FR5 会话；`scanner_450`、`scanner_650` 两个页面共享该
+连接，空闲时切页无需断开或重连。手眼采样、真实扫描及其安全收尾期间由发起页面持有
+独占命令租约，另一页只能查看共享连接状态。受 Fairino 3.9.4 后台线程生命周期限制，
+主动断开或连接失败后，本进程仍不能再次建立 RPC；此时才需要重启程序。
 
 ### 手眼样本提示机器人未静止
 
@@ -533,10 +629,10 @@ Fairino SDK 同时只能由一个客户端持有连接。停止 `ros2_fr5` 的 `
 
 ## 14. 当前边界与下一步
 
-本工具当前完成相机内参、相机坐标系下的激光平面、静态 off/on 单帧三维轮廓、FR5 eye-in-hand 手眼标定，以及独立的常亮线激光停稳式直线扫描；仍不包含：
+本工具当前完成两组独立的相机内参、相机坐标系下激光平面、静态 off/on 单帧三维轮廓、FR5 eye-in-hand 手眼标定、受限免密 TTL 控制，以及独立的常亮线激光停稳/连续直线扫描；仍不包含：
 
-- 激光器开关控制；
-- FR5 自动使能、控制器模式切换、碰撞规划、物理急停或激光 IO 控制；
+- 激光功率调节或光学出光反馈（当前只有 TTL GPIO 逻辑控制与回读）；
+- FR5 自动使能、控制器模式切换、碰撞规划、物理急停或安全等级激光联锁；
 - 相机触发线与机器人控制器之间的硬件时间同步（当前已实现软件时间同步）；
 - 任意曲面轨迹规划、ROS 2 点云发布和 RViz 实时显示。
 
@@ -558,7 +654,13 @@ FR5 SDK 20004 RecvPkg → CLOCK_MONOTONIC_RAW逐包时间戳 → SPSC队列
 独立元数据 WriterThread → robot_raw.csv、camera_raw.csv、session_summary.json
 ```
 
-同步配置在 `config/synchronization.yaml`。电脑侧同步时间全部来自 `CLOCK_MONOTONIC_RAW`；UTC 日期只用于会话摘要和目录名。默认相机 60 fps、曝光 1825 μs，FR5 CNDE 请求周期保持 10 ms；当前控制器经逐包实测的正常反馈周期是约 12 ms（83.3 Hz），由独立的 `robot.expected_feedback_period_ms` 表达。环形缓冲为 2048 条且至少覆盖 5 秒。同步会话在机器人到达扫描起点后才创建，避免把移到起点的长时间运动混入连续扫描统计。
+同步配置按 profile 隔离：650 使用已有的 `config/synchronization.yaml`，450 使用
+`config/devices/scanner_450/synchronization.yaml`；450 文件在现场标定、实测并创建前，
+连续按钮保持禁用。电脑侧同步时间全部来自 `CLOCK_MONOTONIC_RAW`；UTC 日期只用于会话
+摘要和目录名。650 当前已标定相机使用 60 fps、曝光 1825 μs，FR5 CNDE 请求周期保持
+10 ms；当前控制器经逐包实测的正常反馈周期是约 12 ms（83.3 Hz），由独立的
+`robot.expected_feedback_period_ms` 表达。环形缓冲为 2048 条且至少覆盖 5 秒。同步
+会话在机器人到达扫描起点后才创建，避免把移到起点的长时间运动混入连续扫描统计。
 
 连续重建默认使用 2 个独立工作线程和 64 帧固定容量队列。`SynchronizedFrame` 回调只使用 `try_lock` 做一次无等待入队，不执行 OpenCV、坐标变换或文件写入；队列锁忙或队列已满时只丢弃该帧的三维重建任务并累计诊断，不会反压相机回调、FR5 20004接收、同步CSV或原图写盘。扫描停止且同步队列完全清空后，主线程才等待后台重建收尾并保存PLY。
 
@@ -610,8 +712,10 @@ FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单�
 
 ### 15.3 输出和质量检查
 
-默认输出到 `data/scan/sync_scan_<时间>/`：
+默认输出到 `data/scan/<profile>/sync_scan_<时间>/`：
 
+- `session_metadata.json`：profile、相机、TTL、正式标定路径与 SHA-256；
+- `session_result.json`：完成/中止、原因、最终计数，以及 TTL、FR5、相机终态互锁；
 - `robot_raw.csv`：SDK逐包序号、原始及展开后的 `frame_cnt`、`RecvPkg`成功返回时刻、getter耗时/结果、控制器时刻、法兰、关节、原始/滤波/位置拟合速度和运动阶段；
 - `camera_raw.csv`：FrameID、设备 raw/ns 时间戳、回调时刻、曝光、尺寸、连续性、图片名和写盘入队状态；
 - `synchronization.csv`：曝光中点、前后状态、alpha、间隔、插值四元数、原始/滤波速度、运动阶段、前后SDK逐包序号和质量；
@@ -625,8 +729,8 @@ FAIRINO 3.9.4 的 `robot_types.h` 明确法兰 RPY 为绕固定 X/Y/Z 轴、单�
 查看有效同步记录：
 
 ```bash
-column -s, -t < data/scan/sync_scan_*/synchronization.csv | less -S
-awk -F, 'NR==1 || $20 != "VALID"' data/scan/sync_scan_*/synchronization.csv
+column -s, -t < data/scan/scanner_650/sync_scan_*/synchronization.csv | less -S
+awk -F, 'NR==1 || $20 != "VALID"' data/scan/scanner_650/sync_scan_*/synchronization.csv
 ```
 
 `actual_camera_device_fps` 由设备时间戳和 FrameID 跨度计算，`accepted_camera_callback_fps` 表示软件实际接受吞吐。`camera_raw.csv` 的 `frame_id_continuous=0`，或摘要中的 `camera_frame_id_skips/camera_queue_overflows/image_pool_exhaustions/image_queue_overflows` 非零，表示相机链路存在缺图。`robot_receive_sequence_gaps` 才表示SDK回调到SPSC消费链路确实缺少完整包；`robot_frame_counter_skips/robot_frame_counter_duplicates/robot_frame_counter_out_of_order` 仅为控制器内部计数诊断，不参与逐包去重。机器人同步有效性先检查 `ROBOT_PACKET_SEQUENCE_GAP`，再检查25 ms位姿跨度门槛。83.3 Hz与配置的12 ms预期相符时只打印正常诊断，不再按CNDE请求的100 Hz持续告警。加减速段仍保存，但默认标为 `SPEED_NOT_STABLE`，不计入有效建图帧。连续点云只处理 `VALID` 帧；若 `queue_full_drops` 或 `queue_contention_drops` 非零，说明三维重建算力不足，但不表示采图或机器人状态丢失。

@@ -1,7 +1,7 @@
 #include "HikCalibrationWindow.h"
 
 #include "HikCameraWorker.h"
-#include "FairinoReadOnlyWorker.h"
+#include "FairinoRobotSession.h"
 #include "ImageView.h"
 
 #include <QAbstractItemView>
@@ -40,11 +40,13 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iomanip>
 #include <limits>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 #ifndef HIK_CALIBRATION_SOURCE_DIR
@@ -62,6 +64,113 @@ const double kApprovedHandEyeTranslationRmsMm = 1.0;
 const double kApprovedHandEyeRotationRmsDeg = 0.30;
 const double kMaximumRobotStillTranslationMm = 0.10;
 const double kMaximumRobotStillRotationDeg = 0.05;
+const double kLaserGuidanceMinimumXSpanMm = 20.0;
+const double kLaserGuidanceMinimumYSpanMm = 20.0;
+const double kLaserGuidanceTiltSignThresholdDeg = 2.0;
+const double kLaserGuidanceMinimumStripeSpanFraction = 0.06;
+
+hik_stripe::Orientation calibrationStripeOrientation(
+        LineLaserStripeOrientation orientation) {
+    switch (orientation) {
+    case LineLaserStripeOrientation::Auto:
+        return hik_stripe::Orientation::Auto;
+    case LineLaserStripeOrientation::Horizontal:
+        return hik_stripe::Orientation::Horizontal;
+    case LineLaserStripeOrientation::Vertical:
+        return hik_stripe::Orientation::Vertical;
+    }
+    return hik_stripe::Orientation::Auto;
+}
+
+hik_calibration::StripeExtractionMode calibrationStripeMode(
+        LineLaserCenterlinePolicy policy) {
+    switch (policy) {
+    case LineLaserCenterlinePolicy::Legacy:
+        return hik_calibration::StripeExtractionMode::Legacy;
+    case LineLaserCenterlinePolicy::Shadow:
+        return hik_calibration::StripeExtractionMode::Shadow;
+    case LineLaserCenterlinePolicy::Quality:
+        return hik_calibration::StripeExtractionMode::Quality;
+    }
+    return hik_calibration::StripeExtractionMode::Legacy;
+}
+
+cv::Rect calibrationStripeRoi(
+        const LineLaserDeviceProfile& profile,
+        const cv::Size& imageSize) {
+    const int x = std::max(
+        0, std::min(
+            imageSize.width - 1,
+            static_cast<int>(std::floor(
+                profile.stripeRoiX * imageSize.width))));
+    const int y = std::max(
+        0, std::min(
+            imageSize.height - 1,
+            static_cast<int>(std::floor(
+                profile.stripeRoiY * imageSize.height))));
+    const int right = std::max(
+        x + 1, std::min(
+            imageSize.width,
+            static_cast<int>(std::ceil(
+                (profile.stripeRoiX + profile.stripeRoiWidth) *
+                imageSize.width))));
+    const int bottom = std::max(
+        y + 1, std::min(
+            imageSize.height,
+            static_cast<int>(std::ceil(
+                (profile.stripeRoiY + profile.stripeRoiHeight) *
+                imageSize.height))));
+    return cv::Rect(x, y, right - x, bottom - y);
+}
+
+struct LaserGuidanceBinSpec {
+    double targetDepthMm;
+    double minimumDepthMm;
+    double maximumDepthMm;
+    int targetCount;
+};
+
+const std::array<LaserGuidanceBinSpec, 6> kLaserGuidanceBins = {{
+    {300.0, 260.0, 350.0, 5},
+    {400.0, 350.0, 475.0, 4},
+    {550.0, 475.0, 625.0, 4},
+    {700.0, 625.0, 775.0, 4},
+    {850.0, 775.0, 925.0, 4},
+    {1000.0, 925.0, 1040.0, 5}
+}};
+
+struct LaserGuidanceObservation {
+    bool valid{false};
+    int binIndex{-1};
+    double medianDepthMm{std::numeric_limits<double>::quiet_NaN()};
+    double boardXmm{std::numeric_limits<double>::quiet_NaN()};
+    double boardYmm{std::numeric_limits<double>::quiet_NaN()};
+    double tiltXDeg{std::numeric_limits<double>::quiet_NaN()};
+    double tiltYDeg{std::numeric_limits<double>::quiet_NaN()};
+    double stripeUMedianPx{std::numeric_limits<double>::quiet_NaN()};
+    double stripeVMedianPx{std::numeric_limits<double>::quiet_NaN()};
+};
+
+struct LaserGuidanceBinStatistics {
+    int count{0};
+    double minimumXmm{std::numeric_limits<double>::max()};
+    double maximumXmm{-std::numeric_limits<double>::max()};
+    double minimumYmm{std::numeric_limits<double>::max()};
+    double maximumYmm{-std::numeric_limits<double>::max()};
+    double minimumTiltXDeg{std::numeric_limits<double>::max()};
+    double maximumTiltXDeg{-std::numeric_limits<double>::max()};
+    double minimumTiltYDeg{std::numeric_limits<double>::max()};
+    double maximumTiltYDeg{-std::numeric_limits<double>::max()};
+    double minimumStripeUPx{std::numeric_limits<double>::max()};
+    double maximumStripeUPx{-std::numeric_limits<double>::max()};
+    double minimumStripeVPx{std::numeric_limits<double>::max()};
+    double maximumStripeVPx{-std::numeric_limits<double>::max()};
+};
+
+struct LaserGuidanceStatistics {
+    std::array<LaserGuidanceBinStatistics, 6> bins;
+    int outsideDepthCount{0};
+};
 
 double percentileValue(std::vector<double> values, double probability) {
     if (values.empty()) {
@@ -74,6 +183,185 @@ double percentileValue(std::vector<double> values, double probability) {
     const std::size_t upper = static_cast<std::size_t>(std::ceil(position));
     const double fraction = position - static_cast<double>(lower);
     return values[lower] * (1.0 - fraction) + values[upper] * fraction;
+}
+
+int laserGuidanceBinIndex(double depthMm) {
+    if (!std::isfinite(depthMm)) {
+        return -1;
+    }
+    for (std::size_t index = 0; index < kLaserGuidanceBins.size(); ++index) {
+        const LaserGuidanceBinSpec& bin = kLaserGuidanceBins[index];
+        const bool insideUpperBound = index + 1U == kLaserGuidanceBins.size()
+            ? depthMm <= bin.maximumDepthMm
+            : depthMm < bin.maximumDepthMm;
+        if (depthMm >= bin.minimumDepthMm && insideUpperBound) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+LaserGuidanceObservation laserGuidanceObservation(
+        const hik_calibration::LaserCalibrationPairResult& pair,
+        const hik_calibration::BoardSpec& board) {
+    LaserGuidanceObservation observation;
+    if (!pair.ok || !pair.laserOffPose.ok || pair.cameraPointsMm.empty()) {
+        return observation;
+    }
+
+    std::vector<double> depths;
+    depths.reserve(pair.cameraPointsMm.size());
+    for (std::size_t index = 0; index < pair.cameraPointsMm.size(); ++index) {
+        if (std::isfinite(pair.cameraPointsMm[index].z)) {
+            depths.push_back(pair.cameraPointsMm[index].z);
+        }
+    }
+    std::vector<double> stripeU;
+    std::vector<double> stripeV;
+    stripeU.reserve(pair.stripe.size());
+    stripeV.reserve(pair.stripe.size());
+    for (std::size_t index = 0; index < pair.stripe.size(); ++index) {
+        if (std::isfinite(pair.stripe[index].pixel.x) &&
+            std::isfinite(pair.stripe[index].pixel.y)) {
+            stripeU.push_back(pair.stripe[index].pixel.x);
+            stripeV.push_back(pair.stripe[index].pixel.y);
+        }
+    }
+    if (depths.empty() || stripeU.empty() ||
+        !std::isfinite(pair.laserOffPose.tvec[0]) ||
+        !std::isfinite(pair.laserOffPose.tvec[1])) {
+        return observation;
+    }
+
+    cv::Vec3d normal(pair.laserOffPose.rotation(0, 2),
+                     pair.laserOffPose.rotation(1, 2),
+                     pair.laserOffPose.rotation(2, 2));
+    const double normalLength = cv::norm(normal);
+    if (!std::isfinite(normalLength) || normalLength <= 1.0e-12) {
+        return observation;
+    }
+    normal /= normalLength;
+    if (normal[2] < 0.0) {
+        normal = -normal;
+    }
+
+    observation.medianDepthMm = percentileValue(depths, 0.5);
+    observation.binIndex = laserGuidanceBinIndex(observation.medianDepthMm);
+    const cv::Vec3d boardCenterInCamera =
+        pair.laserOffPose.rotation *
+            cv::Vec3d(board.widthMm() * 0.5, board.heightMm() * 0.5, 0.0) +
+        pair.laserOffPose.tvec;
+    observation.boardXmm = boardCenterInCamera[0];
+    observation.boardYmm = boardCenterInCamera[1];
+    observation.tiltXDeg = std::atan2(normal[0], normal[2]) * 180.0 / CV_PI;
+    observation.tiltYDeg = std::atan2(normal[1], normal[2]) * 180.0 / CV_PI;
+    observation.stripeUMedianPx = percentileValue(stripeU, 0.5);
+    observation.stripeVMedianPx = percentileValue(stripeV, 0.5);
+    observation.valid = std::isfinite(observation.medianDepthMm) &&
+                        std::isfinite(observation.tiltXDeg) &&
+                        std::isfinite(observation.tiltYDeg) &&
+                        std::isfinite(observation.stripeUMedianPx) &&
+                        std::isfinite(observation.stripeVMedianPx);
+    return observation;
+}
+
+void addLaserGuidanceObservation(
+        const LaserGuidanceObservation& observation,
+        LaserGuidanceBinStatistics* statistics) {
+    if (!statistics || !observation.valid) {
+        return;
+    }
+    ++statistics->count;
+    statistics->minimumXmm = std::min(statistics->minimumXmm, observation.boardXmm);
+    statistics->maximumXmm = std::max(statistics->maximumXmm, observation.boardXmm);
+    statistics->minimumYmm = std::min(statistics->minimumYmm, observation.boardYmm);
+    statistics->maximumYmm = std::max(statistics->maximumYmm, observation.boardYmm);
+    statistics->minimumTiltXDeg =
+        std::min(statistics->minimumTiltXDeg, observation.tiltXDeg);
+    statistics->maximumTiltXDeg =
+        std::max(statistics->maximumTiltXDeg, observation.tiltXDeg);
+    statistics->minimumTiltYDeg =
+        std::min(statistics->minimumTiltYDeg, observation.tiltYDeg);
+    statistics->maximumTiltYDeg =
+        std::max(statistics->maximumTiltYDeg, observation.tiltYDeg);
+    statistics->minimumStripeUPx =
+        std::min(statistics->minimumStripeUPx, observation.stripeUMedianPx);
+    statistics->maximumStripeUPx =
+        std::max(statistics->maximumStripeUPx, observation.stripeUMedianPx);
+    statistics->minimumStripeVPx =
+        std::min(statistics->minimumStripeVPx, observation.stripeVMedianPx);
+    statistics->maximumStripeVPx =
+        std::max(statistics->maximumStripeVPx, observation.stripeVMedianPx);
+}
+
+LaserGuidanceStatistics summarizeLaserGuidance(
+        const std::vector<const hik_calibration::LaserCalibrationPairResult*>& pairs,
+        const hik_calibration::BoardSpec& board) {
+    LaserGuidanceStatistics statistics;
+    for (std::size_t index = 0; index < pairs.size(); ++index) {
+        if (!pairs[index] || !pairs[index]->ok) {
+            continue;
+        }
+        const LaserGuidanceObservation observation =
+            laserGuidanceObservation(*pairs[index], board);
+        if (!observation.valid) {
+            continue;
+        }
+        if (observation.binIndex < 0) {
+            ++statistics.outsideDepthCount;
+            continue;
+        }
+        addLaserGuidanceObservation(
+            observation,
+            &statistics.bins[static_cast<std::size_t>(observation.binIndex)]);
+    }
+    return statistics;
+}
+
+double laserGuidanceStripeSpanFraction(
+        const LaserGuidanceBinStatistics& statistics,
+        const cv::Size& imageSize) {
+    if (statistics.count <= 0 || imageSize.width <= 0 || imageSize.height <= 0) {
+        return 0.0;
+    }
+    const double uFraction =
+        (statistics.maximumStripeUPx - statistics.minimumStripeUPx) /
+        static_cast<double>(imageSize.width);
+    const double vFraction =
+        (statistics.maximumStripeVPx - statistics.minimumStripeVPx) /
+        static_cast<double>(imageSize.height);
+    return std::max(uFraction, vFraction);
+}
+
+QString laserGuidanceBinIssue(
+        std::size_t binIndex,
+        const LaserGuidanceBinStatistics& statistics,
+        const cv::Size& imageSize) {
+    const LaserGuidanceBinSpec& spec = kLaserGuidanceBins[binIndex];
+    if (statistics.count < spec.targetCount) {
+        return QStringLiteral("数量 %1/%2").arg(statistics.count).arg(spec.targetCount);
+    }
+    if (statistics.maximumXmm - statistics.minimumXmm <
+        kLaserGuidanceMinimumXSpanMm) {
+        return QStringLiteral("补左右(X)位置");
+    }
+    if (statistics.maximumYmm - statistics.minimumYmm <
+        kLaserGuidanceMinimumYSpanMm) {
+        return QStringLiteral("补上下(Y)位置");
+    }
+    if (statistics.minimumTiltXDeg > -kLaserGuidanceTiltSignThresholdDeg ||
+        statistics.maximumTiltXDeg < kLaserGuidanceTiltSignThresholdDeg) {
+        return QStringLiteral("补法向X正/负倾角");
+    }
+    if (statistics.minimumTiltYDeg > -kLaserGuidanceTiltSignThresholdDeg ||
+        statistics.maximumTiltYDeg < kLaserGuidanceTiltSignThresholdDeg) {
+        return QStringLiteral("补法向Y正/负倾角");
+    }
+    if (laserGuidanceStripeSpanFraction(statistics, imageSize) <
+        kLaserGuidanceMinimumStripeSpanFraction) {
+        return QStringLiteral("补激光线画面位置");
+    }
+    return QString();
 }
 
 double angleBetweenNormalsDeg(const cv::Vec3d& first, const cv::Vec3d& second) {
@@ -211,15 +499,34 @@ QString nextSessionDirectory(const QString& calibrationRoot) {
 
 } // namespace
 
-HikCalibrationWindow::HikCalibrationWindow(QWidget* parent)
+HikCalibrationWindow::HikCalibrationWindow(
+        const LineLaserDeviceProfile& profile,
+        FairinoRobotSession* robotSession,
+        QWidget* parent)
     : QMainWindow(parent),
+      robotSession_(robotSession),
+      profile_(profile),
       sourceDir_(QDir::cleanPath(QString::fromUtf8(HIK_CALIBRATION_SOURCE_DIR))) {
+    QString profileError;
+    if (!profile_.isValid(&profileError)) {
+        throw std::invalid_argument(profileError.toStdString());
+    }
+    if (!robotSession_) {
+        throw std::invalid_argument(
+            "FairinoRobotSession must be shared with the calibration window");
+    }
     // GUI approval is intentionally stricter than the numerical core.  A result
     // that can be solved may still be retained as a candidate without being
     // allowed to replace the formal calibration files.
     detectionOptions_.minLaplacianVariance = 30.0;
     intrinsicOptions_.minViews = 15;
     laserPairOptions_.detection = detectionOptions_;
+    laserPairOptions_.stripe.mode =
+        calibrationStripeMode(
+            profile_.calibrationCenterlinePolicy);
+    laserPairOptions_.stripe.quality.orientation =
+        calibrationStripeOrientation(
+            profile_.stripeOrientation);
     laserPairOptions_.pose.maxRmsErrorPx = 0.40;
     laserPairOptions_.pose.maxPointErrorPx = 0.80;
     planeOptions_.minPoseCount = 8;
@@ -233,14 +540,20 @@ HikCalibrationWindow::HikCalibrationWindow(QWidget* parent)
     handEyeBoardPoseOptions_.maxPointErrorPx = 0.80;
     handEyeOptions_.minSamples = 15;
 
-    configDir_ = QDir(sourceDir_).absoluteFilePath(QStringLiteral("config"));
-
     buildUi();
+    refreshLaserGuidance();
 
     QString sessionError;
     sessionReady_ = createSessionDirectories(&sessionError);
     if (sessionReady_) {
-        appendLog(QStringLiteral("本次标定会话: %1").arg(sessionDir_));
+        appendLog(QStringLiteral("本次标定设备=%1，会话=%2")
+                  .arg(profile_.id, sessionDir_));
+        appendLog(QStringLiteral(
+            "条纹标定策略：方向=%1，模式=%2；算法定义变化会写入会话，"
+            "不得与另一设备组或旧算法的激光平面混用。")
+            .arg(lineLaserStripeOrientationName(profile_.stripeOrientation),
+                 lineLaserCenterlinePolicyName(
+                     profile_.calibrationCenterlinePolicy)));
     } else {
         appendLog(sessionError);
         imageInfoLabel_->setText(sessionError);
@@ -248,32 +561,36 @@ HikCalibrationWindow::HikCalibrationWindow(QWidget* parent)
 
     QString profileCalibrationError;
     if (loadFormalProfileCalibration(&profileCalibrationError)) {
-        appendLog(QStringLiteral("静态轮廓已加载正式内参与激光平面。"));
+        appendLog(QStringLiteral("%1 静态轮廓已加载正式内参与激光平面。")
+                  .arg(profile_.id));
     } else {
         appendLog(QStringLiteral("静态轮廓正式标定未就绪: %1").arg(profileCalibrationError));
     }
 
     QString handEyeIntrinsicsError;
     if (loadFormalHandEyeIntrinsics(&handEyeIntrinsicsError)) {
-        appendLog(QStringLiteral("手眼标定已加载正式内参。"));
+        appendLog(QStringLiteral("%1 手眼标定已加载正式内参。")
+                  .arg(profile_.id));
     } else {
         appendLog(QStringLiteral("手眼标定内参未就绪: %1").arg(handEyeIntrinsicsError));
     }
 
+    setupRobotSession();
     setupCameraWorker();
-    setupRobotWorker();
     appendLog(QStringLiteral("板参数默认采用 OpenCV squaresX=5、squaresY=7、方格=22 mm、Marker=16 mm、DICT_4X4_50。"));
-    appendLog(QStringLiteral("内参采样时请关闭红色线激光；激光面采样必须严格保持 laser-off/on 两帧之间标定板不动。"));
+    appendLog(QStringLiteral("内参采样时请关闭 %1 nm 线激光；激光面采样必须严格保持 laser-off/on 两帧之间标定板不动。")
+              .arg(profile_.wavelengthNm));
     updateAllUiStates();
 }
 
 HikCalibrationWindow::~HikCalibrationWindow() {
-    shutdownRobotWorker();
+    shutdownRobotSession();
     shutdownCameraWorker();
 }
 
 void HikCalibrationWindow::buildUi() {
-    setWindowTitle(QStringLiteral("海康线激光标定"));
+    setWindowTitle(QStringLiteral("海康线激光标定｜%1｜%2")
+                   .arg(profile_.id, profile_.displayName));
     resize(1560, 920);
 
     QWidget* central = new QWidget(this);
@@ -300,6 +617,10 @@ void HikCalibrationWindow::buildUi() {
             this, &HikCalibrationWindow::disconnectCamera);
     connect(singleFrameButton_, &QPushButton::clicked,
             this, &HikCalibrationWindow::captureManualFrame);
+    connect(expectedCameraModelEdit_, &QLineEdit::textChanged,
+            this, &HikCalibrationWindow::updateAllUiStates);
+    connect(expectedCameraSerialEdit_, &QLineEdit::textChanged,
+            this, &HikCalibrationWindow::updateAllUiStates);
     connect(swapBoardButton_, &QPushButton::clicked,
             this, &HikCalibrationWindow::swapBoardAxes);
 
@@ -387,10 +708,12 @@ void HikCalibrationWindow::buildUi() {
 }
 
 QWidget* HikCalibrationWindow::buildCameraBar() {
-    QGroupBox* group = new QGroupBox(QStringLiteral("海康相机（公共参数）"), this);
+    QGroupBox* group = new QGroupBox(
+        QStringLiteral("海康相机｜%1").arg(profile_.displayName), this);
     QGridLayout* layout = new QGridLayout(group);
 
-    cameraIpEdit_ = new QLineEdit(QStringLiteral("192.168.1.56"), group);
+    cameraIpEdit_ = new QLineEdit(profile_.defaultCameraIp, group);
+    cameraIpEdit_->setPlaceholderText(QStringLiteral("输入本设备的相机 IPv4 地址"));
     exposureSpin_ = new QDoubleSpinBox(group);
     exposureSpin_->setRange(1.0, 10000000.0);
     exposureSpin_->setDecimals(3);
@@ -405,6 +728,14 @@ QWidget* HikCalibrationWindow::buildCameraBar() {
     timeoutSpin_->setRange(100, 10000);
     timeoutSpin_->setValue(3000);
     timeoutSpin_->setSuffix(QStringLiteral(" ms"));
+    expectedCameraModelEdit_ = new QLineEdit(profile_.expectedCameraModel, group);
+    expectedCameraModelEdit_->setPlaceholderText(
+        QStringLiteral("可选；连接后按相机实际型号绑定"));
+    expectedCameraModelEdit_->setReadOnly(!profile_.expectedCameraModel.isEmpty());
+    expectedCameraSerialEdit_ = new QLineEdit(profile_.expectedCameraSerial, group);
+    expectedCameraSerialEdit_->setPlaceholderText(
+        QStringLiteral("建议填写；用于阻止两套相机串用"));
+    expectedCameraSerialEdit_->setReadOnly(!profile_.expectedCameraSerial.isEmpty());
 
     cameraStatusLabel_ = new QLabel(QStringLiteral("未连接"), group);
     cameraStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;font-weight:bold;"));
@@ -424,6 +755,19 @@ QWidget* HikCalibrationWindow::buildCameraBar() {
     layout->addWidget(disconnectButton_, 0, 9);
     layout->addWidget(singleFrameButton_, 0, 10);
     layout->addWidget(cameraStatusLabel_, 0, 11);
+    layout->addWidget(new QLabel(QStringLiteral("预期型号"), group), 1, 0);
+    layout->addWidget(expectedCameraModelEdit_, 1, 1, 1, 3);
+    layout->addWidget(new QLabel(QStringLiteral("预期 SN"), group), 1, 4);
+    layout->addWidget(expectedCameraSerialEdit_, 1, 5, 1, 3);
+    QLabel* profileLabel = new QLabel(
+        QStringLiteral("profile=%1｜frame=%2｜TTL=物理 Pin %3｜正式内参=%4")
+            .arg(profile_.id, profile_.cameraFrame)
+            .arg(profile_.ttlPhysicalPin)
+            .arg(profile_.intrinsicsConfigRelativePath),
+        group);
+    profileLabel->setWordWrap(true);
+    profileLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(profileLabel, 1, 8, 1, 4);
     layout->setColumnStretch(1, 1);
     return group;
 }
@@ -476,7 +820,8 @@ QWidget* HikCalibrationWindow::buildIntrinsicPage() {
     QVBoxLayout* root = new QVBoxLayout(page);
 
     QLabel* warning = new QLabel(
-        QStringLiteral("实时内参采样：请关闭红色线激光，并从不同距离、角度和画面位置采集清晰标定板。"),
+        QStringLiteral("实时内参采样：请关闭 %1 nm 线激光，并从不同距离、角度和画面位置采集清晰标定板。")
+            .arg(profile_.wavelengthNm),
         page);
     warning->setWordWrap(true);
     warning->setStyleSheet(QStringLiteral("color:#b00020;font-weight:bold;"));
@@ -519,7 +864,10 @@ QWidget* HikCalibrationWindow::buildIntrinsicPage() {
 
     QHBoxLayout* saveActions = new QHBoxLayout;
     saveIntrinsicCandidateButton_ = new QPushButton(QStringLiteral("保存 session 候选 YAML"), page);
-    saveIntrinsicApprovedButton_ = new QPushButton(QStringLiteral("保存通过结果到 config/hik_intrinsics.yaml"), page);
+    saveIntrinsicApprovedButton_ = new QPushButton(
+        QStringLiteral("保存通过结果到 %1")
+            .arg(profile_.intrinsicsConfigRelativePath),
+        page);
     saveActions->addWidget(saveIntrinsicCandidateButton_);
     saveActions->addWidget(saveIntrinsicApprovedButton_);
     saveActions->addStretch(1);
@@ -558,6 +906,29 @@ QWidget* HikCalibrationWindow::buildLaserPage() {
     pairLayout->addWidget(laserPairStateLabel_, 1, 0, 1, 3);
     root->addWidget(pairGroup);
 
+    QGroupBox* guidanceGroup = new QGroupBox(
+        QStringLiteral("300–1000 mm 采集引导（正式保存门槛）"), page);
+    QVBoxLayout* guidanceLayout = new QVBoxLayout(guidanceGroup);
+    laserGuidanceSummaryLabel_ = new QLabel(guidanceGroup);
+    laserGuidanceSummaryLabel_->setWordWrap(true);
+    guidanceLayout->addWidget(laserGuidanceSummaryLabel_);
+    laserGuidanceTable_ = new QTableWidget(
+        static_cast<int>(kLaserGuidanceBins.size()), 8, guidanceGroup);
+    laserGuidanceTable_->setHorizontalHeaderLabels(QStringList()
+        << QStringLiteral("目标Z") << QStringLiteral("分档范围")
+        << QStringLiteral("有效组/目标") << QStringLiteral("板中心X跨度")
+        << QStringLiteral("板中心Y跨度") << QStringLiteral("法向X/Y范围")
+        << QStringLiteral("条纹U/V跨度") << QStringLiteral("下一项"));
+    laserGuidanceTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    laserGuidanceTable_->setSelectionMode(QAbstractItemView::NoSelection);
+    laserGuidanceTable_->verticalHeader()->setVisible(false);
+    laserGuidanceTable_->horizontalHeader()->setSectionResizeMode(
+        QHeaderView::ResizeToContents);
+    laserGuidanceTable_->horizontalHeader()->setStretchLastSection(true);
+    laserGuidanceTable_->setMaximumHeight(205);
+    guidanceLayout->addWidget(laserGuidanceTable_);
+    root->addWidget(guidanceGroup);
+
     QHBoxLayout* actions = new QHBoxLayout;
     importLaserPairsButton_ = new QPushButton(QStringLiteral("离线导入成对图"), page);
     deleteLaserPairButton_ = new QPushButton(QStringLiteral("删除选中"), page);
@@ -568,9 +939,12 @@ QWidget* HikCalibrationWindow::buildLaserPage() {
     actions->addStretch(1);
     root->addLayout(actions);
 
-    laserTable_ = new QTableWidget(0, 11, page);
+    laserTable_ = new QTableWidget(0, 16, page);
     laserTable_->setHorizontalHeaderLabels(QStringList()
         << QStringLiteral("样本") << QStringLiteral("laser-off") << QStringLiteral("laser-on")
+        << QStringLiteral("深度档") << QStringLiteral("中位Z mm")
+        << QStringLiteral("板中心X/Y mm") << QStringLiteral("法向偏角X/Y deg")
+        << QStringLiteral("条纹中位U/V px")
         << QStringLiteral("共同角点") << QStringLiteral("位移均值px") << QStringLiteral("位移P95px")
         << QStringLiteral("板平移mm") << QStringLiteral("板旋转deg") << QStringLiteral("条纹点")
         << QStringLiteral("3D点") << QStringLiteral("状态"));
@@ -590,7 +964,10 @@ QWidget* HikCalibrationWindow::buildLaserPage() {
     ransacThresholdSpin_->setSuffix(QStringLiteral(" mm"));
     solveLaserButton_ = new QPushButton(QStringLiteral("求解激光平面"), solveGroup);
     saveLaserCandidateButton_ = new QPushButton(QStringLiteral("保存 session 候选 YAML"), solveGroup);
-    saveLaserApprovedButton_ = new QPushButton(QStringLiteral("保存通过结果到 config/hik_laser_plane.yaml"), solveGroup);
+    saveLaserApprovedButton_ = new QPushButton(
+        QStringLiteral("保存通过结果到 %1")
+            .arg(profile_.laserPlaneConfigRelativePath),
+        solveGroup);
     laserGateLabel_ = new QLabel(solveGroup);
     laserGateLabel_->setWordWrap(true);
     laserResultLabel_ = new QLabel(QStringLiteral("尚未求解"), solveGroup);
@@ -612,9 +989,10 @@ QWidget* HikCalibrationWindow::buildProfilePage() {
 
     QLabel* explanation = new QLabel(
         QStringLiteral("机器人保持静止：同一姿态、同一曝光/增益依次采 laser-off 和 laser-on。"
-                       "程序使用正式内参和激光平面重建 hik_camera_optical_frame 下的三维轮廓，"
+                       "程序使用正式内参和激光平面重建 %1 下的三维轮廓，"
                        "并自动保存 PLY/CSV。单条轮廓只能检验直线度；检测到 ChArUco 板时才报告真正的平板残差。"),
         page);
+    explanation->setText(explanation->text().arg(profile_.cameraFrame));
     explanation->setWordWrap(true);
     explanation->setStyleSheet(QStringLiteral("color:#333;"));
     root->addWidget(explanation);
@@ -670,9 +1048,10 @@ QWidget* HikCalibrationWindow::buildHandEyePage() {
 
     QLabel* instructions = new QLabel(
         QStringLiteral(
-            "Eye-in-hand：将 ChArUco 板牢固固定在机器人基座/工作台，关闭线激光。"
+            "Eye-in-hand：将 ChArUco 板牢固固定在机器人基座/工作台，关闭 %1 nm 线激光。"
             "每个样本自动执行 法兰前读→相机采图→法兰后读；前后位姿变化超过 0.10 mm 或 0.05° 即拒绝。"
-            "请手动移动机器人到 15–25 个不同位置和姿态，采集时机器人必须完全停止。"),
+            "请手动移动机器人到 15–25 个不同位置和姿态，采集时机器人必须完全停止。")
+            .arg(profile_.wavelengthNm),
         page);
     instructions->setWordWrap(true);
     instructions->setStyleSheet(QStringLiteral("color:#333;"));
@@ -680,7 +1059,8 @@ QWidget* HikCalibrationWindow::buildHandEyePage() {
 
     QLabel* warning = new QLabel(
         QStringLiteral(
-            "安全/连接：本工具只读取实际法兰位姿，不发送运动指令。Fairino SDK 只允许一个客户端；"
+            "安全/连接：本工具只读取实际法兰位姿，不发送运动指令。"
+            "两个设备页共用本进程唯一的 Fairino SDK 会话，切页无需重连；"
             "连接前请停止 ros2_fr5 的 fairino_state_publisher 或其他 FR5 SDK 程序。"
             "另外，静态平板重建 RMS 仍应单独调到 <0.3 mm，手眼标定不会修复激光三角测量误差。"),
         page);
@@ -688,11 +1068,14 @@ QWidget* HikCalibrationWindow::buildHandEyePage() {
     warning->setStyleSheet(QStringLiteral("color:#b00020;font-weight:bold;"));
     root->addWidget(warning);
 
-    QGroupBox* robotGroup = new QGroupBox(QStringLiteral("FR5 只读法兰位姿"), page);
+    QGroupBox* robotGroup = new QGroupBox(
+        QStringLiteral("共享 FR5｜只读法兰位姿"), page);
     QGridLayout* robotLayout = new QGridLayout(robotGroup);
     robotIpEdit_ = new QLineEdit(QStringLiteral("192.168.1.200"), robotGroup);
-    connectRobotButton_ = new QPushButton(QStringLiteral("连接 FR5（只读）"), robotGroup);
-    disconnectRobotButton_ = new QPushButton(QStringLiteral("断开"), robotGroup);
+    connectRobotButton_ = new QPushButton(
+        QStringLiteral("连接共享 FR5（只读）"), robotGroup);
+    disconnectRobotButton_ = new QPushButton(
+        QStringLiteral("断开共享 FR5"), robotGroup);
     readRobotPoseButton_ = new QPushButton(QStringLiteral("读取当前法兰"), robotGroup);
     robotStatusLabel_ = new QLabel(QStringLiteral("未连接"), robotGroup);
     robotPoseLabel_ = new QLabel(QStringLiteral("XYZ/RPY: -"), robotGroup);
@@ -752,7 +1135,9 @@ QWidget* HikCalibrationWindow::buildHandEyePage() {
     QHBoxLayout* saveActions = new QHBoxLayout;
     saveHandEyeCandidateButton_ = new QPushButton(QStringLiteral("保存 session 候选 YAML"), page);
     saveHandEyeApprovedButton_ = new QPushButton(
-        QStringLiteral("质量通过后写入 config/hik_handeye.yaml"), page);
+        QStringLiteral("质量通过后写入 %1")
+            .arg(profile_.handEyeConfigRelativePath),
+        page);
     saveActions->addStretch(1);
     saveActions->addWidget(saveHandEyeCandidateButton_);
     saveActions->addWidget(saveHandEyeApprovedButton_);
@@ -805,28 +1190,37 @@ void HikCalibrationWindow::setupCameraWorker() {
     cameraThread_.start();
 }
 
-void HikCalibrationWindow::setupRobotWorker() {
-    robotWorker_ = new FairinoReadOnlyWorker;
-    robotWorker_->moveToThread(&robotThread_);
-    connect(&robotThread_, &QThread::finished,
-            robotWorker_, &QObject::deleteLater);
+void HikCalibrationWindow::setupRobotSession() {
+    robotClientId_ = robotSession_->registerClient(profile_.id);
+    if (robotClientId_ <= 0 || !robotSession_->isRunning()) {
+        throw std::runtime_error(
+            "unable to register with the shared FairinoRobotSession");
+    }
     connect(this, &HikCalibrationWindow::requestConnectRobot,
-            robotWorker_, &FairinoReadOnlyWorker::connectRobot, Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::connectRobot);
     connect(this, &HikCalibrationWindow::requestDisconnectRobot,
-            robotWorker_, &FairinoReadOnlyWorker::disconnectRobot, Qt::QueuedConnection);
+            robotSession_, &FairinoRobotSession::disconnectRobot);
     connect(this, &HikCalibrationWindow::requestReadFlangePose,
-            robotWorker_, &FairinoReadOnlyWorker::readFlangePose, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::connectionChanged,
+            robotSession_, &FairinoRobotSession::readFlangePose);
+    connect(robotSession_, &FairinoRobotSession::connectionChanged,
             this, &HikCalibrationWindow::onRobotConnectionChanged, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::busyChanged,
+    connect(robotSession_, &FairinoRobotSession::busyChanged,
             this, &HikCalibrationWindow::onRobotBusyChanged, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::flangePoseReady,
+    connect(robotSession_, &FairinoRobotSession::flangePoseReady,
             this, &HikCalibrationWindow::onRobotFlangePoseReady, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::log,
+    connect(robotSession_, &FairinoRobotSession::log,
             this, &HikCalibrationWindow::onRobotLog, Qt::QueuedConnection);
-    connect(robotWorker_, &FairinoReadOnlyWorker::error,
+    connect(robotSession_, &FairinoRobotSession::error,
             this, &HikCalibrationWindow::onRobotError, Qt::QueuedConnection);
-    robotThread_.start();
+    connect(robotSession_, &FairinoRobotSession::clientError,
+            this, &HikCalibrationWindow::onRobotClientError,
+            Qt::QueuedConnection);
+    connect(robotSession_, &FairinoRobotSession::exclusiveOwnerChanged,
+            this, [this](int, const QString&) {
+                updateAllUiStates();
+            }, Qt::QueuedConnection);
+    robotConnected_ = robotSession_->isConnected();
+    robotBusy_ = robotSession_->isBusy();
 }
 
 void HikCalibrationWindow::shutdownCameraWorker() {
@@ -847,37 +1241,43 @@ void HikCalibrationWindow::shutdownCameraWorker() {
     cameraWorker_ = nullptr;
     cameraConnected_ = false;
     cameraBusy_ = false;
+    currentCameraModel_.clear();
+    currentCameraSerial_.clear();
+    currentCameraIp_.clear();
     resetPendingCapture();
 }
 
-void HikCalibrationWindow::shutdownRobotWorker() {
-    if (!robotWorker_ || !robotThread_.isRunning()) {
-        return;
+void HikCalibrationWindow::shutdownRobotSession() {
+    if (robotSession_ && robotClientId_ > 0) {
+        robotSession_->releaseExclusive(robotClientId_);
     }
-    QMetaObject::invokeMethod(robotWorker_, "disconnectRobot",
-                              Qt::BlockingQueuedConnection);
-    robotThread_.quit();
-    if (!robotThread_.wait(5000)) {
-        robotThread_.wait();
-    }
-    robotWorker_ = nullptr;
     robotConnected_ = false;
     robotBusy_ = false;
     resetPendingHandEye();
 }
 
 void HikCalibrationWindow::closeEvent(QCloseEvent* event) {
-    shutdownRobotWorker();
+    shutdownRobotSession();
     shutdownCameraWorker();
     event->accept();
+}
+
+void HikCalibrationWindow::setProfileTabActive(bool active) {
+    if (profileTabActive_ == active) return;
+    profileTabActive_ = active;
+    if (!active &&
+        handEyeCaptureState_ != HandEyeCaptureState::Idle) {
+        appendLog(QStringLiteral(
+            "手眼采样事务仍由本页持有共享 FR5；事务结束前其他设备页不能发送机器人命令。"));
+    }
+    updateAllUiStates();
 }
 
 bool HikCalibrationWindow::createSessionDirectories(QString* error) {
     if (error) {
         error->clear();
     }
-    const QString calibrationRoot = QDir(sourceDir_).absoluteFilePath(
-        QStringLiteral("data/calibration"));
+    const QString calibrationRoot = profile_.calibrationSessionRoot(sourceDir_);
     if (!QDir().mkpath(calibrationRoot)) {
         if (error) {
             *error = QStringLiteral("无法创建标定数据根目录: %1").arg(calibrationRoot);
@@ -906,7 +1306,9 @@ bool HikCalibrationWindow::createSessionDirectories(QString* error) {
         QStringLiteral("capture_manifest.csv"));
     QSaveFile manifest(captureManifestPath_);
     if (!manifest.open(QIODevice::WriteOnly | QIODevice::Text) ||
-        manifest.write("utc_time,purpose,pair_id,image_path,width,height,frame_no,device_timestamp,"
+        manifest.write("utc_time,profile_id,wavelength_nm,ttl_physical_pin,camera_frame,"
+                       "expected_camera_model,expected_camera_serial,"
+                       "purpose,pair_id,image_path,width,height,frame_no,device_timestamp,"
                        "host_timestamp,exposure_us,gain_db,camera_model,camera_serial,"
                        "camera_ip,description\n") < 0 ||
         !manifest.commit()) {
@@ -920,7 +1322,7 @@ bool HikCalibrationWindow::createSessionDirectories(QString* error) {
     QSaveFile profileManifest(profileManifestPath_);
     if (!profileManifest.open(QIODevice::WriteOnly | QIODevice::Text) ||
         profileManifest.write(
-            "sample_id,laser_off_path,laser_on_path,ply_path,csv_path,point_count,"
+            "profile_id,sample_id,laser_off_path,laser_on_path,ply_path,csv_path,point_count,"
             "z_min_mm,z_max_mm,line_rms_mm,board_validation_available,board_point_count,"
             "board_rms_mm,acquisition_parameters_verified,intrinsics_file,intrinsics_sha256,"
             "laser_plane_file,laser_plane_sha256,frame_id\n") < 0 ||
@@ -935,7 +1337,7 @@ bool HikCalibrationWindow::createSessionDirectories(QString* error) {
     QSaveFile handEyeManifest(handEyeManifestPath_);
     if (!handEyeManifest.open(QIODevice::WriteOnly | QIODevice::Text) ||
         handEyeManifest.write(
-            "sample_id,image_path,before_host_timestamp_ms,camera_host_timestamp_raw,"
+            "profile_id,sample_id,image_path,before_host_timestamp_ms,camera_host_timestamp_raw,"
             "after_host_timestamp_ms,x_mm,y_mm,z_mm,rx_deg,ry_deg,rz_deg,corner_count,"
             "board_pose_rms_px,robot_translation_delta_mm,robot_rotation_delta_deg,"
             "intrinsics_file,intrinsics_sha256,camera_model,camera_serial\n") < 0 ||
@@ -983,6 +1385,12 @@ bool HikCalibrationWindow::appendCaptureManifest(
     }
     QByteArray line;
     line += csvField(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    line += ','; line += csvField(profile_.id);
+    line += ','; line += QByteArray::number(profile_.wavelengthNm);
+    line += ','; line += QByteArray::number(profile_.ttlPhysicalPin);
+    line += ','; line += csvField(profile_.cameraFrame);
+    line += ','; line += csvField(expectedCameraModelFromUi());
+    line += ','; line += csvField(expectedCameraSerialFromUi());
     line += ','; line += csvField(purposeName);
     line += ','; line += csvField(pairId);
     line += ','; line += csvField(imagePath);
@@ -1021,7 +1429,8 @@ bool HikCalibrationWindow::appendProfileManifest(const ProfileSample& sample,
     }
     const hik_calibration::StaticProfileResult& result = sample.result;
     QByteArray line;
-    line += csvField(sample.sampleId);
+    line += csvField(profile_.id);
+    line += ','; line += csvField(sample.sampleId);
     line += ','; line += csvField(sample.laserOffPath);
     line += ','; line += csvField(sample.laserOnPath);
     line += ','; line += csvField(sample.plyPath);
@@ -1068,7 +1477,8 @@ bool HikCalibrationWindow::appendHandEyeManifest(
         return false;
     }
     QByteArray line;
-    line += csvField(QString::fromStdString(sample.sample.sampleId));
+    line += csvField(profile_.id);
+    line += ','; line += csvField(QString::fromStdString(sample.sample.sampleId));
     line += ','; line += csvField(sample.imagePath);
     line += ','; line += QByteArray::number(before.hostTimestampMs);
     line += ','; line += QByteArray::number(pendingHandEyeImage_.cameraHostTimestampRaw);
@@ -1122,10 +1532,15 @@ void HikCalibrationWindow::updateAllUiStates() {
 void HikCalibrationWindow::updateCameraUi() {
     const bool operationPending = pendingCapturePurpose_ != CapturePurpose::None;
     const bool available = !shuttingDown_ && !cameraBusy_ && !operationPending;
+    const bool profileCameraReady = currentCameraMatchesProfile();
     connectButton_->setEnabled(available && !cameraConnected_);
     disconnectButton_->setEnabled(available && cameraConnected_);
-    singleFrameButton_->setEnabled(available && cameraConnected_ && sessionReady_);
+    singleFrameButton_->setEnabled(available && profileCameraReady && sessionReady_);
     cameraIpEdit_->setEnabled(available && !cameraConnected_);
+    expectedCameraModelEdit_->setEnabled(
+        profile_.expectedCameraModel.isEmpty() && profileIdentityCanChange());
+    expectedCameraSerialEdit_->setEnabled(
+        profile_.expectedCameraSerial.isEmpty() && profileIdentityCanChange());
     // A pending laser-off is a transaction: the on frame must use exactly the
     // same acquisition controls.  The actual values are checked again when the
     // on frame returns from the camera worker.
@@ -1154,9 +1569,10 @@ void HikCalibrationWindow::updateBoardUi() {
 void HikCalibrationWindow::updateIntrinsicUi() {
     const bool idle = !shuttingDown_ && !cameraBusy_ &&
                       pendingCapturePurpose_ == CapturePurpose::None;
+    const bool profileCameraReady = currentCameraMatchesProfile();
     const int accepted = acceptedIntrinsicSampleCount();
     const int minimum = intrinsicOptions_.minViews;
-    captureIntrinsicButton_->setEnabled(idle && cameraConnected_ && sessionReady_);
+    captureIntrinsicButton_->setEnabled(idle && profileCameraReady && sessionReady_);
     importIntrinsicButton_->setEnabled(idle && sessionReady_);
     deleteIntrinsicButton_->setEnabled(idle && intrinsicTable_->selectionModel() &&
         !intrinsicTable_->selectionModel()->selectedRows().isEmpty());
@@ -1179,9 +1595,10 @@ void HikCalibrationWindow::updateLaserUi() {
     const bool awaitingOff = laserCaptureState_ == LaserCaptureState::AwaitingOff;
     const bool boardCompatible = hasActiveLaserIntrinsics_ &&
         boardMatches(boardSpecFromUi(), activeLaserIntrinsics_.board);
-    captureLaserOffButton_->setEnabled(idle && cameraConnected_ && sessionReady_ &&
+    const bool profileCameraReady = currentCameraMatchesProfile();
+    captureLaserOffButton_->setEnabled(idle && profileCameraReady && sessionReady_ &&
                                        boardCompatible && awaitingOff);
-    captureLaserOnButton_->setEnabled(idle && cameraConnected_ && sessionReady_ &&
+    captureLaserOnButton_->setEnabled(idle && profileCameraReady && sessionReady_ &&
                                       boardCompatible && !awaitingOff &&
                                       pendingLaserOff_.valid);
     cancelLaserPairButton_->setEnabled(idle && pendingLaserOff_.valid);
@@ -1216,9 +1633,10 @@ void HikCalibrationWindow::updateProfileUi() {
     const bool idle = !shuttingDown_ && !cameraBusy_ &&
                       pendingCapturePurpose_ == CapturePurpose::None;
     const bool awaitingOff = profileCaptureState_ == LaserCaptureState::AwaitingOff;
-    captureProfileOffButton_->setEnabled(idle && cameraConnected_ && sessionReady_ &&
+    const bool profileCameraReady = currentCameraMatchesProfile();
+    captureProfileOffButton_->setEnabled(idle && profileCameraReady && sessionReady_ &&
                                          hasProfileCalibration_ && awaitingOff);
-    captureProfileOnButton_->setEnabled(idle && cameraConnected_ && sessionReady_ &&
+    captureProfileOnButton_->setEnabled(idle && profileCameraReady && sessionReady_ &&
                                         hasProfileCalibration_ && !awaitingOff &&
                                         pendingProfileOff_.valid);
     cancelProfilePairButton_->setEnabled(idle && pendingProfileOff_.valid);
@@ -1239,18 +1657,28 @@ void HikCalibrationWindow::updateProfileUi() {
 void HikCalibrationWindow::updateHandEyeUi() {
     const bool cameraIdle = !shuttingDown_ && !cameraBusy_ &&
                             pendingCapturePurpose_ == CapturePurpose::None;
-    const bool idle = cameraIdle && !robotBusy_ &&
-                      pendingRobotRequestId_ < 0 &&
-                      handEyeCaptureState_ == HandEyeCaptureState::Idle;
-    connectRobotButton_->setEnabled(idle && !robotConnected_);
-    disconnectRobotButton_->setEnabled(idle && robotConnected_);
-    robotIpEdit_->setEnabled(idle && !robotConnected_);
-    readRobotPoseButton_->setEnabled(idle && robotConnected_);
+    const bool stateIdle = cameraIdle && !robotBusy_ &&
+                           pendingRobotRequestId_ < 0 &&
+                           handEyeCaptureState_ == HandEyeCaptureState::Idle;
+    const bool idle = profileTabActive_ && stateIdle;
+    const bool robotAvailable =
+        robotSession_ && robotSession_->commandAvailableTo(robotClientId_);
+    connectRobotButton_->setEnabled(
+        idle && robotAvailable && !robotConnected_ &&
+        !robotSession_->connectionAttempted());
+    disconnectRobotButton_->setEnabled(
+        idle && robotAvailable && robotConnected_);
+    robotIpEdit_->setEnabled(
+        idle && !robotConnected_ && !robotSession_->connectionAttempted());
+    readRobotPoseButton_->setEnabled(
+        idle && robotAvailable && robotConnected_);
 
     const bool boardCompatible = hasHandEyeIntrinsics_ &&
         boardMatches(boardSpecFromUi(), handEyeIntrinsics_.board);
-    captureHandEyeButton_->setEnabled(idle && robotConnected_ && cameraConnected_ &&
-                                      sessionReady_ && boardCompatible);
+    const bool profileCameraReady = currentCameraMatchesProfile();
+    captureHandEyeButton_->setEnabled(
+        idle && robotAvailable && robotConnected_ && profileCameraReady &&
+        sessionReady_ && boardCompatible);
     deleteHandEyeButton_->setEnabled(idle && handEyeTable_->selectionModel() &&
         !handEyeTable_->selectionModel()->selectedRows().isEmpty());
     clearHandEyeButton_->setEnabled(idle && !handEyeSamples_.empty());
@@ -1299,11 +1727,120 @@ void HikCalibrationWindow::resetPendingCapture() {
     pendingCapturePurpose_ = CapturePurpose::None;
 }
 
+QString HikCalibrationWindow::expectedCameraModelFromUi() const {
+    return expectedCameraModelEdit_
+        ? expectedCameraModelEdit_->text().trimmed()
+        : profile_.expectedCameraModel.trimmed();
+}
+
+QString HikCalibrationWindow::expectedCameraSerialFromUi() const {
+    return expectedCameraSerialEdit_
+        ? expectedCameraSerialEdit_->text().trimmed()
+        : profile_.expectedCameraSerial.trimmed();
+}
+
+bool HikCalibrationWindow::currentCameraMatchesProfile(QString* error) const {
+    if (error) {
+        error->clear();
+    }
+    if (!cameraConnected_) {
+        if (error) {
+            *error = QStringLiteral("%1 尚未连接相机。").arg(profile_.id);
+        }
+        return false;
+    }
+    if (currentCameraSerial_.isEmpty()) {
+        if (error) {
+            *error = QStringLiteral("%1 尚未取得相机序列号。").arg(profile_.id);
+        }
+        return false;
+    }
+    const QString expectedModel = expectedCameraModelFromUi();
+    const QString expectedSerial = expectedCameraSerialFromUi();
+    if (!expectedModel.isEmpty() &&
+        expectedModel.compare(currentCameraModel_, Qt::CaseInsensitive) != 0) {
+        if (error) {
+            *error = QStringLiteral("%1 预期型号=%2，当前型号=%3。")
+                .arg(profile_.id, expectedModel,
+                     currentCameraModel_.isEmpty()
+                         ? QStringLiteral("未知") : currentCameraModel_);
+        }
+        return false;
+    }
+    if (!expectedSerial.isEmpty() &&
+        expectedSerial.compare(currentCameraSerial_, Qt::CaseInsensitive) != 0) {
+        if (error) {
+            *error = QStringLiteral("%1 预期 SN=%2，当前 SN=%3。")
+                .arg(profile_.id, expectedSerial, currentCameraSerial_);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool HikCalibrationWindow::intrinsicsMetadataMatchesProfile(
+        const hik_calibration::IntrinsicsYamlMetadata& metadata,
+        QString* error) const {
+    if (error) {
+        error->clear();
+    }
+    const QString frame = QString::fromStdString(metadata.frameId).trimmed();
+    if (frame != profile_.cameraFrame) {
+        if (error) {
+            *error = QStringLiteral("内参 frame=%1，不属于 %2（要求 %3）。")
+                .arg(frame.isEmpty() ? QStringLiteral("未设置") : frame,
+                     profile_.id, profile_.cameraFrame);
+        }
+        return false;
+    }
+    const QString serial =
+        QString::fromStdString(metadata.cameraSerial).trimmed();
+    QString expectedSerial = expectedCameraSerialFromUi();
+    if (expectedSerial.isEmpty() && cameraConnected_) {
+        expectedSerial = currentCameraSerial_;
+    }
+    if (expectedSerial.isEmpty()) {
+        expectedSerial = intrinsicDatasetCameraSerial_;
+    }
+    if (!serial.isEmpty() && !expectedSerial.isEmpty() &&
+        serial.compare(expectedSerial, Qt::CaseInsensitive) != 0) {
+        if (error) {
+            *error = QStringLiteral("内参 SN=%1，与 %2 绑定 SN=%3 不一致。")
+                .arg(serial, profile_.id, expectedSerial);
+        }
+        return false;
+    }
+    const QString model = QString::fromStdString(metadata.cameraModel).trimmed();
+    QString expectedModel = expectedCameraModelFromUi();
+    if (expectedModel.isEmpty() && cameraConnected_) {
+        expectedModel = currentCameraModel_;
+    }
+    if (!expectedModel.isEmpty() && !model.isEmpty() &&
+        model.compare(expectedModel, Qt::CaseInsensitive) != 0) {
+        if (error) {
+            *error = QStringLiteral("内参型号=%1，与 %2 绑定型号=%3 不一致。")
+                .arg(model, profile_.id, expectedModel);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool HikCalibrationWindow::profileIdentityCanChange() const {
+    return !shuttingDown_ && !cameraBusy_ &&
+           pendingCapturePurpose_ == CapturePurpose::None &&
+           intrinsicSamples_.empty() && laserPairs_.empty() &&
+           profileSamples_.empty() && handEyeSamples_.empty() &&
+           !pendingLaserOff_.valid && !pendingProfileOff_.valid &&
+           handEyeCaptureState_ == HandEyeCaptureState::Idle;
+}
+
 void HikCalibrationWindow::connectCamera() {
     const QString ip = cameraIpEdit_->text().trimmed();
     if (!isValidIpv4(ip)) {
         showError(QStringLiteral("连接失败"),
-                  QStringLiteral("请输入有效的相机 IPv4 地址，例如 192.168.1.56。"));
+                  QStringLiteral("请为 %1 输入有效的相机 IPv4 地址。")
+                      .arg(profile_.id));
         return;
     }
     if (!cameraWorker_ || !cameraThread_.isRunning() || shuttingDown_) {
@@ -1482,21 +2019,30 @@ void HikCalibrationWindow::importProfilePair() {
 }
 
 void HikCalibrationWindow::connectRobot() {
+    if (!profileTabActive_) {
+        showError(QStringLiteral("FR5 连接失败"),
+                  QStringLiteral("请先切换到设备组 %1。")
+                      .arg(profile_.displayName));
+        return;
+    }
     const QString ip = robotIpEdit_->text().trimmed();
     if (!isValidIpv4(ip)) {
         showError(QStringLiteral("FR5 连接失败"),
                   QStringLiteral("请输入有效的机器人 IPv4 地址，例如 192.168.1.200。"));
         return;
     }
-    if (!robotWorker_ || !robotThread_.isRunning() || shuttingDown_) {
-        showError(QStringLiteral("FR5 连接失败"), QStringLiteral("机器人只读工作线程不可用。"));
+    if (!robotSession_ || !robotSession_->isRunning() ||
+        robotClientId_ <= 0 || shuttingDown_) {
+        showError(QStringLiteral("FR5 连接失败"),
+                  QStringLiteral("共享机器人会话不可用。"));
         return;
     }
     robotBusy_ = true;
-    robotStatusLabel_->setText(QStringLiteral("正在连接 %1 …").arg(ip));
+    robotStatusLabel_->setText(
+        QStringLiteral("正在建立共享连接 %1 …").arg(ip));
     robotStatusLabel_->setStyleSheet(QStringLiteral("color:#a06000;font-weight:bold;"));
     updateAllUiStates();
-    emit requestConnectRobot(ip);
+    emit requestConnectRobot(robotClientId_, ip);
 }
 
 void HikCalibrationWindow::disconnectRobot() {
@@ -1504,10 +2050,10 @@ void HikCalibrationWindow::disconnectRobot() {
         showError(QStringLiteral("无法断开"), QStringLiteral("手眼样本采集事务尚未结束。"));
         return;
     }
-    if (robotWorker_ && robotThread_.isRunning()) {
+    if (robotSession_ && robotSession_->isRunning()) {
         robotBusy_ = true;
         updateAllUiStates();
-        emit requestDisconnectRobot();
+        emit requestDisconnectRobot(robotClientId_);
     }
 }
 
@@ -1516,7 +2062,8 @@ void HikCalibrationWindow::readRobotPose() {
         return;
     }
     manualRobotReadPending_ = true;
-    pendingRobotRequestId_ = ++nextRobotRequestId_;
+    pendingRobotRequestId_ =
+        robotSession_->allocateRequestId(robotClientId_);
     emit requestReadFlangePose(pendingRobotRequestId_);
     updateAllUiStates();
 }
@@ -1524,7 +2071,8 @@ void HikCalibrationWindow::readRobotPose() {
 void HikCalibrationWindow::captureHandEyeSample() {
     if (!hasHandEyeIntrinsics_) {
         showError(QStringLiteral("无法采集手眼样本"),
-                  QStringLiteral("正式内参 config/hik_intrinsics.yaml 未加载。"));
+                  QStringLiteral("正式内参 %1 未加载。")
+                      .arg(profile_.intrinsicsConfigRelativePath));
         return;
     }
     QString identityError;
@@ -1546,7 +2094,16 @@ void HikCalibrationWindow::captureHandEyeSample() {
     QString hashError;
     if (fileSha256Hex(handEyeIntrinsicsPath_, &hashError) != handEyeIntrinsicsSha256_) {
         showError(QStringLiteral("正式内参已变化"),
-                  QStringLiteral("采集前发现 config/hik_intrinsics.yaml 已变化，请重启工具重新加载。"));
+                  QStringLiteral("采集前发现 %1 已变化，请重新加载。")
+                      .arg(profile_.intrinsicsConfigRelativePath));
+        return;
+    }
+    QString leaseError;
+    if (!robotSession_->acquireExclusive(
+            robotClientId_,
+            QStringLiteral("%1 手眼样本事务").arg(profile_.id),
+            &leaseError)) {
+        showError(QStringLiteral("无法采集手眼样本"), leaseError);
         return;
     }
     hasHandEyeResult_ = false;
@@ -1556,7 +2113,8 @@ void HikCalibrationWindow::captureHandEyeSample() {
     pendingHandEyeBeforePose_ = RobotPoseReading();
     pendingHandEyeImage_ = PendingHandEyeImage();
     handEyeCaptureState_ = HandEyeCaptureState::WaitingBeforePose;
-    pendingRobotRequestId_ = ++nextRobotRequestId_;
+    pendingRobotRequestId_ =
+        robotSession_->allocateRequestId(robotClientId_);
     manualRobotReadPending_ = false;
     appendLog(QStringLiteral("开始手眼样本 %1：读取采图前实际法兰。")
               .arg(pendingHandEyeSampleId_));
@@ -1567,6 +2125,11 @@ void HikCalibrationWindow::captureHandEyeSample() {
 void HikCalibrationWindow::onRobotConnectionChanged(bool connected, QString description) {
     robotConnected_ = connected;
     robotBusy_ = false;
+    if (!connected && robotSession_->connectionAttempted()) {
+        appendLog(QStringLiteral(
+            "共享 FAIRINO RPC 会话已结束；受 SDK 3.9.4 生命周期限制，"
+            "本进程不再创建第二个 FRRobot，重新连接需重启标定程序。"));
+    }
     if (!connected && handEyeCaptureState_ != HandEyeCaptureState::Idle) {
         appendLog(QStringLiteral("FR5 断开，未完成的手眼样本已取消。"));
         resetPendingHandEye();
@@ -1592,6 +2155,10 @@ void HikCalibrationWindow::onRobotFlangePoseReady(int requestId,
                                                    double ryDeg,
                                                    double rzDeg,
                                                    qint64 hostTimestampMs) {
+    if (!robotSession_->requestBelongsToClient(
+            requestId, robotClientId_)) {
+        return;
+    }
     if (requestId != pendingRobotRequestId_) {
         appendLog(QStringLiteral("忽略过期 FR5 位姿：request=%1，当前=%2")
                   .arg(requestId).arg(pendingRobotRequestId_));
@@ -1634,6 +2201,15 @@ void HikCalibrationWindow::onRobotLog(QString message) {
 }
 
 void HikCalibrationWindow::onRobotError(int requestId, QString message) {
+    if (requestId >= 0 &&
+        !robotSession_->requestBelongsToClient(
+            requestId, robotClientId_)) {
+        return;
+    }
+    if (requestId < 0 && !profileTabActive_) {
+        appendLog(QStringLiteral("共享 FR5 错误：%1").arg(message));
+        return;
+    }
     if (requestId == pendingRobotRequestId_) {
         pendingRobotRequestId_ = -1;
         manualRobotReadPending_ = false;
@@ -1643,6 +2219,14 @@ void HikCalibrationWindow::onRobotError(int requestId, QString message) {
     }
     robotBusy_ = false;
     showError(QStringLiteral("FR5 只读错误"), message);
+    updateAllUiStates();
+}
+
+void HikCalibrationWindow::onRobotClientError(
+        int clientId, QString message) {
+    if (clientId != robotClientId_) return;
+    robotBusy_ = false;
+    showError(QStringLiteral("共享 FR5 错误"), message);
     updateAllUiStates();
 }
 
@@ -1664,6 +2248,11 @@ void HikCalibrationWindow::onCameraConnectionChanged(bool connected,
     if (!connected && handEyeCaptureState_ != HandEyeCaptureState::Idle) {
         resetPendingHandEye();
     }
+    if (!connected) {
+        currentCameraModel_.clear();
+        currentCameraSerial_.clear();
+        currentCameraIp_.clear();
+    }
     cameraStatusLabel_->setText(connected
         ? QStringLiteral("已连接：%1").arg(description)
         : QStringLiteral("未连接：%1").arg(description));
@@ -1673,6 +2262,15 @@ void HikCalibrationWindow::onCameraConnectionChanged(bool connected,
     appendLog(connected
         ? QStringLiteral("相机连接成功: %1").arg(description)
         : QStringLiteral("相机已断开: %1").arg(description));
+    if (connected && !currentCameraSerial_.isEmpty()) {
+        QString identityError;
+        if (!currentCameraMatchesProfile(&identityError)) {
+            cameraStatusLabel_->setText(QStringLiteral("设备身份不匹配：%1")
+                                        .arg(identityError));
+            cameraStatusLabel_->setStyleSheet(
+                QStringLiteral("color:#b00020;font-weight:bold;"));
+        }
+    }
     updateAllUiStates();
 }
 
@@ -1682,8 +2280,38 @@ void HikCalibrationWindow::onCameraIdentityChanged(QString model,
     currentCameraModel_ = model.trimmed();
     currentCameraSerial_ = serial.trimmed();
     currentCameraIp_ = ipAddress.trimmed();
+    if (profileIdentityCanChange()) {
+        if (profile_.expectedCameraModel.isEmpty() &&
+            expectedCameraModelEdit_->text().trimmed().isEmpty() &&
+            !currentCameraModel_.isEmpty()) {
+            expectedCameraModelEdit_->setText(currentCameraModel_);
+        }
+        if (profile_.expectedCameraSerial.isEmpty() &&
+            expectedCameraSerialEdit_->text().trimmed().isEmpty() &&
+            !currentCameraSerial_.isEmpty()) {
+            expectedCameraSerialEdit_->setText(currentCameraSerial_);
+        }
+    }
     appendLog(QStringLiteral("相机身份已锁定：model=%1，SN=%2，IP=%3")
               .arg(currentCameraModel_, currentCameraSerial_, currentCameraIp_));
+    if (cameraConnected_) {
+        QString identityError;
+        if (currentCameraMatchesProfile(&identityError)) {
+            cameraStatusLabel_->setText(
+                QStringLiteral("%1 身份通过：%2 / %3 / %4")
+                    .arg(profile_.id, currentCameraModel_,
+                         currentCameraSerial_, currentCameraIp_));
+            cameraStatusLabel_->setStyleSheet(
+                QStringLiteral("color:#087f23;font-weight:bold;"));
+        } else {
+            cameraStatusLabel_->setText(
+                QStringLiteral("设备身份不匹配：%1").arg(identityError));
+            cameraStatusLabel_->setStyleSheet(
+                QStringLiteral("color:#b00020;font-weight:bold;"));
+            appendLog(QStringLiteral("设备身份拒绝：%1").arg(identityError));
+        }
+    }
+    updateAllUiStates();
 }
 
 void HikCalibrationWindow::onCameraBusyChanged(bool busy) {
@@ -1940,6 +2568,11 @@ int HikCalibrationWindow::beginCapture(CapturePurpose purpose) {
     }
     if (!cameraConnected_) {
         showError(QStringLiteral("无法采集"), QStringLiteral("请先连接相机。"));
+        return -1;
+    }
+    QString identityError;
+    if (!currentCameraMatchesProfile(&identityError)) {
+        showError(QStringLiteral("设备身份不匹配"), identityError);
         return -1;
     }
     if (!sessionReady_) {
@@ -2586,11 +3219,12 @@ bool HikCalibrationWindow::intrinsicResultPassesQuality(QString* reason) const {
 
 hik_calibration::IntrinsicsYamlMetadata HikCalibrationWindow::intrinsicMetadata() const {
     hik_calibration::IntrinsicsYamlMetadata metadata;
-    metadata.cameraName = "hik_line_scan_camera";
+    metadata.cameraName = profile_.id.toStdString();
     metadata.cameraModel = intrinsicDatasetCameraModel_.isEmpty()
-        ? "Hikrobot GigE 1.6MP" : intrinsicDatasetCameraModel_.toStdString();
+        ? expectedCameraModelFromUi().toStdString()
+        : intrinsicDatasetCameraModel_.toStdString();
     metadata.cameraSerial = intrinsicDatasetCameraSerial_.toStdString();
-    metadata.frameId = "hik_camera_optical_frame";
+    metadata.frameId = profile_.cameraFrame.toStdString();
     metadata.pixelFormat = "Mono8";
     metadata.printedPatternSha256.clear();
     metadata.generatedAt = QDateTime::currentDateTimeUtc()
@@ -2661,14 +3295,14 @@ void HikCalibrationWindow::saveApprovedIntrinsics() {
         showError(QStringLiteral("内参保存失败"), error);
         return;
     }
-    const QString formalPath = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_intrinsics.yaml"));
-    const QString formalLaserPath = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_laser_plane.yaml"));
+    const QString formalPath = profile_.intrinsicsConfigPath(sourceDir_);
+    const QString formalLaserPath = profile_.laserPlaneConfigPath(sourceDir_);
+    const QString formalHandEyePath = profile_.handEyeConfigPath(sourceDir_);
+    const QString staleSuffix = QStringLiteral(".stale_%1").arg(captureTimestamp());
     QString staleLaserPath;
+    QString staleHandEyePath;
     if (QFileInfo(formalLaserPath).isFile()) {
-        staleLaserPath = formalLaserPath + QStringLiteral(".stale_%1")
-            .arg(captureTimestamp());
+        staleLaserPath = formalLaserPath + staleSuffix;
         if (!QFile::rename(formalLaserPath, staleLaserPath)) {
             showError(QStringLiteral("正式内参更新已取消"),
                       QStringLiteral("无法先将旧激光平面标记为失效：%1\n"
@@ -2677,9 +3311,25 @@ void HikCalibrationWindow::saveApprovedIntrinsics() {
             return;
         }
     }
+    if (QFileInfo(formalHandEyePath).isFile()) {
+        staleHandEyePath = formalHandEyePath + staleSuffix;
+        if (!QFile::rename(formalHandEyePath, staleHandEyePath)) {
+            if (!staleLaserPath.isEmpty()) {
+                QFile::rename(staleLaserPath, formalLaserPath);
+            }
+            showError(QStringLiteral("正式内参更新已取消"),
+                      QStringLiteral("无法先将旧手眼标定标记为失效：%1\n"
+                                     "正式文件均保持不变。")
+                          .arg(formalHandEyePath));
+            return;
+        }
+    }
     if (!promoteFileAtomically(approvedSessionPath, formalPath, &error)) {
         if (!staleLaserPath.isEmpty()) {
             QFile::rename(staleLaserPath, formalLaserPath);
+        }
+        if (!staleHandEyePath.isEmpty()) {
+            QFile::rename(staleHandEyePath, formalHandEyePath);
         }
         showError(QStringLiteral("正式内参更新失败"), error);
         return;
@@ -2690,15 +3340,20 @@ void HikCalibrationWindow::saveApprovedIntrinsics() {
         appendLog(QStringLiteral("旧激光平面已因内参变更标记为失效: %1")
                   .arg(staleLaserPath));
     }
+    if (!staleHandEyePath.isEmpty()) {
+        appendLog(QStringLiteral("旧手眼标定已因内参变更标记为失效: %1")
+                  .arg(staleHandEyePath));
+    }
     QMessageBox::information(this, QStringLiteral("内参已批准"),
                              QStringLiteral("已更新:\n%1").arg(formalPath));
 }
 
 void HikCalibrationWindow::loadIntrinsicsForLaser() {
-    const QString initial = QFileInfo(QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_intrinsics.yaml"))).exists()
-        ? QDir(configDir_).absoluteFilePath(QStringLiteral("hik_intrinsics.yaml"))
-        : configDir_;
+    const QString formalIntrinsicsPath =
+        profile_.intrinsicsConfigPath(sourceDir_);
+    const QString initial = QFileInfo(formalIntrinsicsPath).exists()
+        ? formalIntrinsicsPath
+        : QFileInfo(formalIntrinsicsPath).absolutePath();
     const QString path = QFileDialog::getOpenFileName(
         this, QStringLiteral("加载激光面所用内参"), initial,
         QStringLiteral("YAML (*.yaml *.yml);;所有文件 (*)"));
@@ -2758,6 +3413,9 @@ bool HikCalibrationWindow::setActiveLaserIntrinsics(
         if (error) {
             *error = QStringLiteral("已有激光样本或待配对 laser-off，不能中途更换内参。");
         }
+        return false;
+    }
+    if (!intrinsicsMetadataMatchesProfile(metadata, error)) {
         return false;
     }
     std::string boardError;
@@ -2825,10 +3483,8 @@ bool HikCalibrationWindow::loadFormalProfileCalibration(QString* error) {
     profileLaserPlane_ = hik_calibration::LaserPlaneFitResult();
     profileIntrinsicsMetadata_ = hik_calibration::IntrinsicsYamlMetadata();
     profileLaserMetadata_ = hik_calibration::LaserPlaneYamlMetadata();
-    profileIntrinsicsPath_ = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_intrinsics.yaml"));
-    profileLaserPlanePath_ = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_laser_plane.yaml"));
+    profileIntrinsicsPath_ = profile_.intrinsicsConfigPath(sourceDir_);
+    profileLaserPlanePath_ = profile_.laserPlaneConfigPath(sourceDir_);
 
     std::string coreError;
     if (!hik_calibration::loadIntrinsicsYaml(
@@ -2842,6 +3498,12 @@ bool HikCalibrationWindow::loadFormalProfileCalibration(QString* error) {
         profileCalibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
         return false;
     }
+    if (!intrinsicsMetadataMatchesProfile(profileIntrinsicsMetadata_, error)) {
+        profileCalibrationStatusLabel_->setText(
+            error ? *error : QStringLiteral("正式内参不属于当前设备"));
+        profileCalibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
+        return false;
+    }
     coreError.clear();
     if (!hik_calibration::loadLaserPlaneYaml(
             toLocalPath(profileLaserPlanePath_), &profileLaserPlane_, &profileBoard_,
@@ -2851,6 +3513,17 @@ bool HikCalibrationWindow::loadFormalProfileCalibration(QString* error) {
                 .arg(profileLaserPlanePath_, fromStdString(coreError));
         }
         profileCalibrationStatusLabel_->setText(error ? *error : QStringLiteral("正式激光平面加载失败"));
+        profileCalibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
+        return false;
+    }
+    if (QString::fromStdString(profileLaserMetadata_.cameraFrame).trimmed() !=
+        profile_.cameraFrame) {
+        if (error) {
+            *error = QStringLiteral("正式激光平面 frame 不属于 %1。")
+                .arg(profile_.id);
+        }
+        profileCalibrationStatusLabel_->setText(
+            error ? *error : QStringLiteral("激光平面 frame 不匹配"));
         profileCalibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
         return false;
     }
@@ -2874,7 +3547,8 @@ bool HikCalibrationWindow::loadFormalProfileCalibration(QString* error) {
     if (recordedIntrinsicsHash.isEmpty() ||
         recordedIntrinsicsHash.compare(profileIntrinsicsSha256_, Qt::CaseInsensitive) != 0) {
         if (error) {
-            *error = QStringLiteral("激光平面绑定的内参 SHA-256 与当前 config/hik_intrinsics.yaml 不一致。请重新标定或批准激光平面。");
+            *error = QStringLiteral("激光平面绑定的内参 SHA-256 与当前 %1 不一致。请重新标定或批准激光平面。")
+                .arg(profile_.intrinsicsConfigRelativePath);
         }
         profileCalibrationStatusLabel_->setText(error ? *error : QStringLiteral("标定哈希不一致"));
         profileCalibrationStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
@@ -2898,6 +3572,23 @@ bool HikCalibrationWindow::loadFormalProfileCalibration(QString* error) {
     profileOptions_.minimumDepthMm = profileLaserMetadata_.validCameraZMinMm;
     profileOptions_.maximumDepthMm = profileLaserMetadata_.validCameraZMaxMm;
     profileOptions_.stripe = laserPairOptions_.stripe;
+    profileOptions_.stripe.quality.roi =
+        calibrationStripeRoi(profile_, profileIntrinsics_.imageSize);
+    profileOptions_.stripeValidityMask.release();
+    if (profileOptions_.stripe.mode !=
+            hik_calibration::StripeExtractionMode::Legacy &&
+        !hik_calibration::buildLaserPlaneValidityMask(
+            profileIntrinsics_.imageSize, profileIntrinsics_,
+            profileLaserPlane_, profileOptions_.minimumDepthMm,
+            profileOptions_.maximumDepthMm,
+            profileOptions_.stripe.quality.roi,
+            &profileOptions_.stripeValidityMask, &coreError)) {
+        if (error) {
+            *error = QStringLiteral("无法建立条纹有效深度走廊: %1")
+                .arg(fromStdString(coreError));
+        }
+        return false;
+    }
     profileOptions_.boardDetection = detectionOptions_;
     profileOptions_.boardPose = laserPairOptions_.pose;
     hasProfileCalibration_ = true;
@@ -2920,8 +3611,7 @@ bool HikCalibrationWindow::loadFormalHandEyeIntrinsics(QString* error) {
     hasHandEyeIntrinsics_ = false;
     handEyeIntrinsics_ = hik_calibration::IntrinsicCalibrationResult();
     handEyeIntrinsicsMetadata_ = hik_calibration::IntrinsicsYamlMetadata();
-    handEyeIntrinsicsPath_ = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_intrinsics.yaml"));
+    handEyeIntrinsicsPath_ = profile_.intrinsicsConfigPath(sourceDir_);
     std::string coreError;
     if (!hik_calibration::loadIntrinsicsYaml(
             toLocalPath(handEyeIntrinsicsPath_), &handEyeIntrinsics_,
@@ -2932,6 +3622,12 @@ bool HikCalibrationWindow::loadFormalHandEyeIntrinsics(QString* error) {
         }
         handEyeIntrinsicsStatusLabel_->setText(
             error ? *error : QStringLiteral("手眼正式内参加载失败"));
+        handEyeIntrinsicsStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
+        return false;
+    }
+    if (!intrinsicsMetadataMatchesProfile(handEyeIntrinsicsMetadata_, error)) {
+        handEyeIntrinsicsStatusLabel_->setText(
+            error ? *error : QStringLiteral("正式内参不属于当前设备"));
         handEyeIntrinsicsStatusLabel_->setStyleSheet(QStringLiteral("color:#b00020;"));
         return false;
     }
@@ -3263,7 +3959,8 @@ void HikCalibrationWindow::processHandEyeImage(const cv::Mat& grayImage,
     pendingHandEyeImage_.boardPose = pose;
     pendingHandEyeImage_.cameraHostTimestampRaw = cameraHostTimestampRaw;
     handEyeCaptureState_ = HandEyeCaptureState::WaitingAfterPose;
-    pendingRobotRequestId_ = ++nextRobotRequestId_;
+    pendingRobotRequestId_ =
+        robotSession_->allocateRequestId(robotClientId_);
     appendLog(QStringLiteral("手眼样本 %1：ChArUco 位姿通过，RMS=%2 px；读取采图后法兰。")
               .arg(sampleId).arg(pose.reprojection.rms, 0, 'f', 4));
     emit requestReadFlangePose(pendingRobotRequestId_);
@@ -3335,6 +4032,9 @@ void HikCalibrationWindow::finishHandEyeSample(const RobotPoseReading& after) {
 }
 
 void HikCalibrationWindow::resetPendingHandEye() {
+    if (robotSession_ && robotClientId_ > 0) {
+        robotSession_->releaseExclusive(robotClientId_);
+    }
     handEyeCaptureState_ = HandEyeCaptureState::Idle;
     pendingHandEyeBeforePose_ = RobotPoseReading();
     pendingHandEyeImage_ = PendingHandEyeImage();
@@ -3527,10 +4227,9 @@ bool HikCalibrationWindow::handEyeResultPassesQuality(QString* reason) const {
 
 hik_calibration::HandEyeYamlMetadata HikCalibrationWindow::handEyeMetadata() const {
     hik_calibration::HandEyeYamlMetadata metadata;
-    metadata.cameraModel = currentCameraModel_.toStdString();
-    metadata.cameraSerial = currentCameraSerial_.toStdString();
-    metadata.cameraFrame = handEyeIntrinsicsMetadata_.frameId.empty()
-        ? std::string("hik_camera_optical_frame") : handEyeIntrinsicsMetadata_.frameId;
+    metadata.cameraModel = handEyeIntrinsicsMetadata_.cameraModel;
+    metadata.cameraSerial = handEyeIntrinsicsMetadata_.cameraSerial;
+    metadata.cameraFrame = profile_.cameraFrame.toStdString();
     metadata.flangeFrame = "fairino_flange_reported";
     metadata.baseFrame = "base_link";
     metadata.intrinsicsFile = handEyeIntrinsicsPath_.toStdString();
@@ -3597,8 +4296,7 @@ void HikCalibrationWindow::saveApprovedHandEye() {
         showError(QStringLiteral("手眼 YAML 保存失败"), error);
         return;
     }
-    const QString formalPath = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_handeye.yaml"));
+    const QString formalPath = profile_.handEyeConfigPath(sourceDir_);
     if (!promoteFileAtomically(approvedPath, formalPath, &error)) {
         showError(QStringLiteral("正式手眼标定更新失败"), error);
         return;
@@ -3656,9 +4354,28 @@ void HikCalibrationWindow::acceptLaserOffImage(const cv::Mat& grayImage,
     const bool poseOk = detection.ok && hik_calibration::estimateBoardPose(
         detection.observation, board, activeLaserIntrinsics_.cameraMatrix,
         activeLaserIntrinsics_.distCoeffs, laserPairOptions_.pose, &pose);
+    double approximateBoardDepthMm = std::numeric_limits<double>::quiet_NaN();
+    int approximateDepthBin = -1;
+    if (poseOk) {
+        const cv::Vec3d boardCenterInCamera =
+            pose.rotation *
+                cv::Vec3d(board.widthMm() * 0.5, board.heightMm() * 0.5, 0.0) +
+            pose.tvec;
+        approximateBoardDepthMm = boardCenterInCamera[2];
+        approximateDepthBin = laserGuidanceBinIndex(approximateBoardDepthMm);
+    }
+    QString offOverlayCaption = QStringLiteral("laser-off REJECT");
+    if (poseOk) {
+        offOverlayCaption = approximateDepthBin >= 0
+            ? QStringLiteral("laser-off OK: board Z=%1 mm, approx bin=%2 mm")
+                .arg(approximateBoardDepthMm, 0, 'f', 1)
+                .arg(kLaserGuidanceBins[static_cast<std::size_t>(
+                    approximateDepthBin)].targetDepthMm, 0, 'f', 0)
+            : QStringLiteral("laser-off OK: board Z=%1 mm, OUTSIDE guide")
+                .arg(approximateBoardDepthMm, 0, 'f', 1);
+    }
     imageView_->setImage(drawCharucoOverlay(
-        grayImage, detection, poseOk ? QStringLiteral("laser-off pose OK")
-                                     : QStringLiteral("laser-off REJECT")));
+        grayImage, detection, offOverlayCaption));
     if (!detection.ok || !poseOk) {
         const QString reason = !detection.ok ? fromStdString(detection.error)
                                              : fromStdString(pose.error);
@@ -3676,10 +4393,22 @@ void HikCalibrationWindow::acceptLaserOffImage(const cv::Mat& grayImage,
     pendingLaserOff_.gainDb = actualGainDb;
     pendingLaserOff_.detection = detection;
     laserCaptureState_ = LaserCaptureState::AwaitingOn;
+    const QString approximateGuide = approximateDepthBin >= 0
+        ? QStringLiteral("板中心 Z≈%1 mm，暂归 %2 mm 档")
+            .arg(approximateBoardDepthMm, 0, 'f', 1)
+            .arg(kLaserGuidanceBins[static_cast<std::size_t>(
+                approximateDepthBin)].targetDepthMm, 0, 'f', 0)
+        : QStringLiteral("板中心 Z≈%1 mm，超出 260–1040 mm 引导范围；"
+                         "如非预期请取消当前配对并重新摆板")
+            .arg(approximateBoardDepthMm, 0, 'f', 1);
     imageInfoLabel_->setText(
-        QStringLiteral("%1 | laser-off 板位姿通过，RMS=%2 px；请保持板不动并开启激光。")
-            .arg(fileNameOnly(imagePath)).arg(pose.reprojection.rms, 0, 'f', 4));
-    appendLog(QStringLiteral("laser-off 通过，等待 laser-on；期间严禁移动板/相机。"));
+        QStringLiteral("%1 | laser-off 板位姿通过，RMS=%2 px；%3。"
+                       "最终档位以 laser-on 后激光3D点中位Z为准；现在请保持板不动并开启激光。")
+            .arg(fileNameOnly(imagePath))
+            .arg(pose.reprojection.rms, 0, 'f', 4)
+            .arg(approximateGuide));
+    appendLog(QStringLiteral("laser-off 通过：%1；等待 laser-on，期间严禁移动板/相机。")
+              .arg(approximateGuide));
 }
 
 void HikCalibrationWindow::completeLaserPair(const cv::Mat& laserOnImage,
@@ -3731,6 +4460,8 @@ void HikCalibrationWindow::completeLaserPair(const cv::Mat& laserOnImage,
     pair.laserOffPath = pendingLaserOff_.imagePath;
     pair.laserOnPath = laserOnPath;
     pair.acquisitionParametersVerified = true;
+    laserPairOptions_.stripe.quality.roi =
+        calibrationStripeRoi(profile_, laserOnImage.size());
     hik_calibration::processLaserCalibrationPair(
         pendingLaserOff_.image, laserOnImage, pair.sampleId.toStdString(),
         boardSpecFromUi(), activeLaserIntrinsics_.cameraMatrix,
@@ -3740,8 +4471,16 @@ void HikCalibrationWindow::completeLaserPair(const cv::Mat& laserOnImage,
     invalidateLaserSolution();
     refreshLaserTable();
     imageView_->setImage(drawLaserOverlay(laserOnImage, pair.result));
-    const QString state = pair.result.ok ? QStringLiteral("通过")
-                                         : QStringLiteral("拒绝: %1").arg(fromStdString(pair.result.error));
+    QString state = pair.result.ok ? QStringLiteral("通过")
+                                   : QStringLiteral("拒绝: %1").arg(fromStdString(pair.result.error));
+    if (pair.result.ok &&
+        pair.result.laserOnDetection.observation.quality.saturationRatio >
+            laserPairOptions_.detection.maxSaturationRatio) {
+        state += QStringLiteral("（laser-on 饱和=%1%，按激光专用≤%2%门槛接受）")
+            .arg(pair.result.laserOnDetection.observation.quality.saturationRatio * 100.0,
+                 0, 'f', 2)
+            .arg(laserPairOptions_.maxLaserOnSaturationRatio * 100.0, 0, 'f', 1);
+    }
     imageInfoLabel_->setText(QStringLiteral("%1 + %2 | %3")
         .arg(fileNameOnly(pair.laserOffPath), fileNameOnly(pair.laserOnPath), state));
     appendLog(QStringLiteral("激光配对 %1: %2").arg(pair.sampleId, state));
@@ -3761,6 +4500,8 @@ void HikCalibrationWindow::addOfflineLaserPair(const cv::Mat& laserOffImage,
         pair.result.sampleId = sampleId.toStdString();
         pair.result.error = "offline pair image size differs from intrinsic calibration size";
     } else {
+        laserPairOptions_.stripe.quality.roi =
+            calibrationStripeRoi(profile_, laserOnImage.size());
         hik_calibration::processLaserCalibrationPair(
             laserOffImage, laserOnImage, sampleId.toStdString(), boardSpecFromUi(),
             activeLaserIntrinsics_.cameraMatrix, activeLaserIntrinsics_.distCoeffs,
@@ -3895,11 +4636,49 @@ void HikCalibrationWindow::resetPendingLaserOff() {
 
 void HikCalibrationWindow::refreshLaserTable() {
     laserTable_->setRowCount(static_cast<int>(laserPairs_.size()));
+    const hik_calibration::BoardSpec guidanceBoard = hasActiveLaserIntrinsics_
+        ? activeLaserIntrinsics_.board : boardSpecFromUi();
     for (int row = 0; row < static_cast<int>(laserPairs_.size()); ++row) {
         const LaserPairSample& sample = laserPairs_[static_cast<std::size_t>(row)];
         const hik_calibration::LaserCalibrationPairResult& result = sample.result;
+        const LaserGuidanceObservation observation =
+            laserGuidanceObservation(result, guidanceBoard);
+        QString depthBin = QStringLiteral("-");
+        if (observation.valid) {
+            depthBin = observation.binIndex >= 0
+                ? QStringLiteral("%1 mm").arg(
+                    kLaserGuidanceBins[static_cast<std::size_t>(
+                        observation.binIndex)].targetDepthMm, 0, 'f', 0)
+                : QStringLiteral("范围外");
+        }
+        QString state = result.ok ? QStringLiteral("通过")
+                                  : QStringLiteral("拒绝: %1").arg(fromStdString(result.error));
+        if (result.ok &&
+            result.laserOnDetection.observation.quality.saturationRatio >
+                laserPairOptions_.detection.maxSaturationRatio) {
+            state = QStringLiteral("通过（on饱和%1%，激光专用门槛）")
+                .arg(result.laserOnDetection.observation.quality.saturationRatio * 100.0,
+                     0, 'f', 2);
+        }
         const QStringList values = QStringList()
             << sample.sampleId << fileNameOnly(sample.laserOffPath) << fileNameOnly(sample.laserOnPath)
+            << depthBin
+            << formatNumber(observation.medianDepthMm, 1)
+            << (observation.valid
+                ? QStringLiteral("%1 / %2")
+                    .arg(observation.boardXmm, 0, 'f', 1)
+                    .arg(observation.boardYmm, 0, 'f', 1)
+                : QStringLiteral("-"))
+            << (observation.valid
+                ? QStringLiteral("%1 / %2")
+                    .arg(observation.tiltXDeg, 0, 'f', 1)
+                    .arg(observation.tiltYDeg, 0, 'f', 1)
+                : QStringLiteral("-"))
+            << (observation.valid
+                ? QStringLiteral("%1 / %2")
+                    .arg(observation.stripeUMedianPx, 0, 'f', 1)
+                    .arg(observation.stripeVMedianPx, 0, 'f', 1)
+                : QStringLiteral("-"))
             << QString::number(result.motion.commonCornerCount)
             << formatNumber(result.motion.cornerShiftPx.mean, 3)
             << formatNumber(result.motion.cornerShiftPx.p95, 3)
@@ -3907,26 +4686,234 @@ void HikCalibrationWindow::refreshLaserTable() {
             << formatNumber(result.motion.poseRotationDeltaDeg, 3)
             << QString::number(static_cast<int>(result.stripe.size()))
             << QString::number(static_cast<int>(result.cameraPointsMm.size()))
-            << (result.ok ? QStringLiteral("通过")
-                          : QStringLiteral("拒绝: %1").arg(fromStdString(result.error)));
+            << state;
         for (int column = 0; column < values.size(); ++column) {
             QTableWidgetItem* item = new QTableWidgetItem(values.at(column));
             if (column == 1) {
                 item->setToolTip(sample.laserOffPath);
             } else if (column == 2) {
                 item->setToolTip(sample.laserOnPath);
-            } else if (column == 10) {
+            } else if (column == 15) {
                 item->setToolTip(values.at(column));
             }
             laserTable_->setItem(row, column, item);
         }
     }
+    refreshLaserGuidance();
+}
+
+void HikCalibrationWindow::refreshLaserGuidance() {
+    if (!laserGuidanceTable_ || !laserGuidanceSummaryLabel_) {
+        return;
+    }
+    std::vector<const hik_calibration::LaserCalibrationPairResult*> pairResults;
+    pairResults.reserve(laserPairs_.size());
+    for (std::size_t index = 0; index < laserPairs_.size(); ++index) {
+        pairResults.push_back(&laserPairs_[index].result);
+    }
+    const LaserGuidanceStatistics statistics =
+        summarizeLaserGuidance(
+            pairResults, hasActiveLaserIntrinsics_
+                ? activeLaserIntrinsics_.board : boardSpecFromUi());
+    const cv::Size imageSize = hasActiveLaserIntrinsics_
+        ? activeLaserIntrinsics_.imageSize : cv::Size();
+
+    int targetTotal = 0;
+    int inRangeCount = 0;
+    int completedBins = 0;
+    int nextBinIndex = -1;
+    double nextCompletionRatio = std::numeric_limits<double>::max();
+    for (std::size_t index = 0; index < kLaserGuidanceBins.size(); ++index) {
+        const LaserGuidanceBinSpec& spec = kLaserGuidanceBins[index];
+        const LaserGuidanceBinStatistics& bin = statistics.bins[index];
+        const QString issue = laserGuidanceBinIssue(index, bin, imageSize);
+        targetTotal += spec.targetCount;
+        inRangeCount += bin.count;
+        if (issue.isEmpty()) {
+            ++completedBins;
+        } else {
+            const double completionRatio = std::min(
+                1.0, static_cast<double>(bin.count) /
+                     static_cast<double>(spec.targetCount));
+            if (nextBinIndex < 0 || completionRatio < nextCompletionRatio) {
+                nextBinIndex = static_cast<int>(index);
+                nextCompletionRatio = completionRatio;
+            }
+        }
+
+        const double xSpan = bin.count > 0
+            ? bin.maximumXmm - bin.minimumXmm : 0.0;
+        const double ySpan = bin.count > 0
+            ? bin.maximumYmm - bin.minimumYmm : 0.0;
+        const double uSpan = bin.count > 0
+            ? bin.maximumStripeUPx - bin.minimumStripeUPx : 0.0;
+        const double vSpan = bin.count > 0
+            ? bin.maximumStripeVPx - bin.minimumStripeVPx : 0.0;
+        const QString rangeText = index + 1U == kLaserGuidanceBins.size()
+            ? QStringLiteral("[%1, %2]")
+                .arg(spec.minimumDepthMm, 0, 'f', 0)
+                .arg(spec.maximumDepthMm, 0, 'f', 0)
+            : QStringLiteral("[%1, %2)")
+                .arg(spec.minimumDepthMm, 0, 'f', 0)
+                .arg(spec.maximumDepthMm, 0, 'f', 0);
+        const QStringList values = QStringList()
+            << QStringLiteral("%1 mm").arg(spec.targetDepthMm, 0, 'f', 0)
+            << rangeText
+            << QStringLiteral("%1 / %2").arg(bin.count).arg(spec.targetCount)
+            << (bin.count > 0 ? QStringLiteral("%1 mm").arg(xSpan, 0, 'f', 1)
+                              : QStringLiteral("-"))
+            << (bin.count > 0 ? QStringLiteral("%1 mm").arg(ySpan, 0, 'f', 1)
+                              : QStringLiteral("-"))
+            << (bin.count > 0
+                ? QStringLiteral("[%1,%2] / [%3,%4]°")
+                    .arg(bin.minimumTiltXDeg, 0, 'f', 1)
+                    .arg(bin.maximumTiltXDeg, 0, 'f', 1)
+                    .arg(bin.minimumTiltYDeg, 0, 'f', 1)
+                    .arg(bin.maximumTiltYDeg, 0, 'f', 1)
+                : QStringLiteral("-"))
+            << (bin.count > 0
+                ? QStringLiteral("%1 / %2 px")
+                    .arg(uSpan, 0, 'f', 0).arg(vSpan, 0, 'f', 0)
+                : QStringLiteral("-"))
+            << (issue.isEmpty() ? QStringLiteral("完成") : issue);
+        for (int column = 0; column < values.size(); ++column) {
+            QTableWidgetItem* item = new QTableWidgetItem(values.at(column));
+            if (column == 5) {
+                item->setToolTip(QStringLiteral(
+                    "板法向相对相机 Z 轴在 X/Y 方向的有符号偏角范围；每档要求正负方向均超过 2°。"));
+            } else if (column == 6) {
+                item->setToolTip(QStringLiteral(
+                    "各样本激光中心像素中位数的 U/V 跨度；两者至少一个达到图像尺寸的 6%。"));
+            }
+            laserGuidanceTable_->setItem(static_cast<int>(index), column, item);
+        }
+    }
+
+    QString nextSuggestion;
+    if (nextBinIndex >= 0) {
+        const std::size_t index = static_cast<std::size_t>(nextBinIndex);
+        const LaserGuidanceBinSpec& spec = kLaserGuidanceBins[index];
+        const LaserGuidanceBinStatistics& bin = statistics.bins[index];
+        const QString issue = laserGuidanceBinIssue(index, bin, imageSize);
+        if (bin.count < spec.targetCount) {
+            static const std::array<QString, 5> variations = {{
+                QStringLiteral("板居中，使用X/Y组合小倾角"),
+                QStringLiteral("板向画面左侧，使用X负/Y正倾角"),
+                QStringLiteral("板向画面右侧，使用X正/Y负倾角"),
+                QStringLiteral("板向画面上侧，改变激光线落点"),
+                QStringLiteral("板向画面下侧，使用与前几组相反的组合倾角")
+            }};
+            nextSuggestion = QStringLiteral(
+                "下一组：把激光交点深度放到约 %1 mm；%2。")
+                .arg(spec.targetDepthMm, 0, 'f', 0)
+                .arg(variations[static_cast<std::size_t>(bin.count) %
+                                variations.size()]);
+        } else {
+            nextSuggestion = QStringLiteral(
+                "下一组仍在约 %1 mm，%2。")
+                .arg(spec.targetDepthMm, 0, 'f', 0).arg(issue);
+        }
+    } else {
+        nextSuggestion = QStringLiteral("六个深度档的数量和姿态多样性均已完成，可以求解并检查残差。");
+    }
+
+    QString latestText;
+    for (std::vector<LaserPairSample>::const_reverse_iterator iterator =
+             laserPairs_.rbegin(); iterator != laserPairs_.rend(); ++iterator) {
+        const LaserGuidanceObservation observation =
+            laserGuidanceObservation(
+                iterator->result, hasActiveLaserIntrinsics_
+                    ? activeLaserIntrinsics_.board : boardSpecFromUi());
+        if (!observation.valid) {
+            continue;
+        }
+        const QString binText = observation.binIndex >= 0
+            ? QStringLiteral("%1 mm档").arg(
+                kLaserGuidanceBins[static_cast<std::size_t>(
+                    observation.binIndex)].targetDepthMm, 0, 'f', 0)
+            : QStringLiteral("范围外");
+        latestText = QStringLiteral(
+            "最近有效 %1：Z=%2 mm（%3），板XY=%4/%5 mm，法向偏角=%6/%7°，条纹UV=%8/%9 px。")
+            .arg(iterator->sampleId)
+            .arg(observation.medianDepthMm, 0, 'f', 1)
+            .arg(binText)
+            .arg(observation.boardXmm, 0, 'f', 1)
+            .arg(observation.boardYmm, 0, 'f', 1)
+            .arg(observation.tiltXDeg, 0, 'f', 1)
+            .arg(observation.tiltYDeg, 0, 'f', 1)
+            .arg(observation.stripeUMedianPx, 0, 'f', 1)
+            .arg(observation.stripeVMedianPx, 0, 'f', 1);
+        break;
+    }
+    if (latestText.isEmpty()) {
+        latestText = QStringLiteral(
+            "尚无有效配对；深度按每组有效激光3D点的中位相机Z自动分档。");
+    }
+    const QString outsideWarning = statistics.outsideDepthCount > 0
+        ? QStringLiteral(" 范围外有效组仍会参加当前拟合并扩大 YAML 有效 Z；"
+                         "正式保存前请删除或在正确深度重拍。")
+        : QString();
+    laserGuidanceSummaryLabel_->setText(
+        QStringLiteral("完成 %1 / 6 档；范围内有效 %2 / 目标 %3，范围外 %4。%5%6 %7")
+            .arg(completedBins).arg(inRangeCount).arg(targetTotal)
+            .arg(statistics.outsideDepthCount)
+            .arg(outsideWarning, nextSuggestion, latestText));
+    laserGuidanceSummaryLabel_->setStyleSheet(
+        completedBins == static_cast<int>(kLaserGuidanceBins.size())
+            ? QStringLiteral("color:#087f23;font-weight:bold;")
+            : QStringLiteral("color:#8a4b00;"));
 }
 
 int HikCalibrationWindow::acceptedLaserPairCount() const {
     return static_cast<int>(std::count_if(
         laserPairs_.begin(), laserPairs_.end(),
         [](const LaserPairSample& pair) { return pair.result.ok; }));
+}
+
+bool HikCalibrationWindow::laserGuidancePasses(QString* reason) const {
+    if (reason) {
+        reason->clear();
+    }
+    std::vector<const hik_calibration::LaserCalibrationPairResult*> pairResults;
+    pairResults.reserve(laserPairs_.size());
+    for (std::size_t index = 0; index < laserPairs_.size(); ++index) {
+        pairResults.push_back(&laserPairs_[index].result);
+    }
+    const LaserGuidanceStatistics statistics =
+        summarizeLaserGuidance(
+            pairResults, hasActiveLaserIntrinsics_
+                ? activeLaserIntrinsics_.board : boardSpecFromUi());
+    const cv::Size imageSize = hasActiveLaserIntrinsics_
+        ? activeLaserIntrinsics_.imageSize : cv::Size();
+    if (statistics.outsideDepthCount > 0) {
+        if (reason) {
+            *reason = QStringLiteral(
+                "存在 %1 个中位 Z 超出 260–1040 mm 引导范围的有效配对；"
+                "这些配对会参与拟合并扩大 YAML 有效 Z，正式保存前请删除或重拍。")
+                .arg(statistics.outsideDepthCount);
+        }
+        return false;
+    }
+    for (std::size_t index = 0; index < kLaserGuidanceBins.size(); ++index) {
+        const QString issue =
+            laserGuidanceBinIssue(index, statistics.bins[index], imageSize);
+        if (!issue.isEmpty()) {
+            if (reason) {
+                *reason = QStringLiteral(
+                    "%1 mm 深度档未完成：%2。每档还要求板中心 X 至少变化 %3 mm、"
+                    "Y 至少变化 %4 mm、法向 X/Y 均覆盖 ±%5°，"
+                    "且条纹位置跨度至少达到图像宽或高的 %6%。")
+                    .arg(kLaserGuidanceBins[index].targetDepthMm, 0, 'f', 0)
+                    .arg(issue)
+                    .arg(kLaserGuidanceMinimumXSpanMm, 0, 'f', 0)
+                    .arg(kLaserGuidanceMinimumYSpanMm, 0, 'f', 0)
+                    .arg(kLaserGuidanceTiltSignThresholdDeg, 0, 'f', 0)
+                    .arg(kLaserGuidanceMinimumStripeSpanFraction * 100.0, 0, 'f', 0);
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 void HikCalibrationWindow::invalidateLaserSolution() {
@@ -3976,6 +4963,37 @@ void HikCalibrationWindow::solveLaserPlane() {
         laserResultLabel_->setText(QStringLiteral("激光平面求解失败: %1")
                                    .arg(fromStdString(result.error)));
         appendLog(laserResultLabel_->text());
+        if (!result.poses.empty()) {
+            std::vector<const hik_calibration::PlanePoseStatistics*> rankedPoses;
+            rankedPoses.reserve(result.poses.size());
+            for (std::size_t index = 0; index < result.poses.size(); ++index) {
+                rankedPoses.push_back(&result.poses[index]);
+            }
+            std::sort(
+                rankedPoses.begin(), rankedPoses.end(),
+                [](const hik_calibration::PlanePoseStatistics* left,
+                   const hik_calibration::PlanePoseStatistics* right) {
+                    const double leftRatio = left->pointCount > 0
+                        ? static_cast<double>(left->inlierCount) / left->pointCount : 0.0;
+                    const double rightRatio = right->pointCount > 0
+                        ? static_cast<double>(right->inlierCount) / right->pointCount : 0.0;
+                    return leftRatio < rightRatio;
+                });
+            QStringList worst;
+            const std::size_t count = std::min<std::size_t>(5, rankedPoses.size());
+            for (std::size_t index = 0; index < count; ++index) {
+                const hik_calibration::PlanePoseStatistics& pose = *rankedPoses[index];
+                const double ratio = pose.pointCount > 0
+                    ? static_cast<double>(pose.inlierCount) / pose.pointCount : 0.0;
+                worst << QStringLiteral("%1=%2%(%3/%4)")
+                    .arg(QString::fromStdString(pose.sampleId))
+                    .arg(ratio * 100.0, 0, 'f', 1)
+                    .arg(pose.inlierCount)
+                    .arg(pose.pointCount);
+            }
+            appendLog(QStringLiteral("激光平面最差姿态（按内点率）：%1")
+                      .arg(worst.join(QStringLiteral("；"))));
+        }
         updateAllUiStates();
         return;
     }
@@ -4013,6 +5031,14 @@ bool HikCalibrationWindow::laserResultPassesQuality(QString* reason) const {
         }
         return false;
     }
+    QString guidanceReason;
+    if (!laserGuidancePasses(&guidanceReason)) {
+        if (reason) {
+            *reason = QStringLiteral("300–1000 mm 正式采集覆盖未完成：%1")
+                .arg(guidanceReason);
+        }
+        return false;
+    }
     if (!hasActiveLaserIntrinsics_ ||
         activeLaserIntrinsics_.acceptedViewCount < intrinsicOptions_.minViews ||
         !std::isfinite(activeLaserIntrinsics_.calibrationRmsPx) ||
@@ -4031,12 +5057,13 @@ bool HikCalibrationWindow::laserResultPassesQuality(QString* reason) const {
         }
         return false;
     }
-    const QString approvedIntrinsicsPath = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_intrinsics.yaml"));
+    const QString approvedIntrinsicsPath =
+        profile_.intrinsicsConfigPath(sourceDir_);
     if (QFileInfo(activeLaserIntrinsicsPath_).canonicalFilePath() !=
         QFileInfo(approvedIntrinsicsPath).canonicalFilePath()) {
         if (reason) {
-            *reason = QStringLiteral("正式激光平面必须加载已批准的 config/hik_intrinsics.yaml；当前内参仅可用于候选求解。");
+            *reason = QStringLiteral("正式激光平面必须加载 %1 已批准的内参 %2；当前内参仅可用于候选求解。")
+                .arg(profile_.id, profile_.intrinsicsConfigRelativePath);
         }
         return false;
     }
@@ -4191,8 +5218,7 @@ bool HikCalibrationWindow::laserResultPassesQuality(QString* reason) const {
 
 hik_calibration::LaserPlaneYamlMetadata HikCalibrationWindow::laserMetadata() const {
     hik_calibration::LaserPlaneYamlMetadata metadata;
-    metadata.cameraFrame = activeLaserIntrinsicsMetadata_.frameId.empty()
-        ? "hik_camera_optical_frame" : activeLaserIntrinsicsMetadata_.frameId;
+    metadata.cameraFrame = profile_.cameraFrame.toStdString();
     metadata.intrinsicsFile = activeLaserIntrinsicsPath_.toStdString();
     metadata.intrinsicsSha256 = activeLaserIntrinsicsSha256_.toStdString();
     metadata.printedPatternSha256 = activeLaserIntrinsicsMetadata_.printedPatternSha256;
@@ -4282,8 +5308,7 @@ void HikCalibrationWindow::saveApprovedLaserPlane() {
         showError(QStringLiteral("激光平面保存失败"), error);
         return;
     }
-    const QString formalPath = QDir(configDir_).absoluteFilePath(
-        QStringLiteral("hik_laser_plane.yaml"));
+    const QString formalPath = profile_.laserPlaneConfigPath(sourceDir_);
     if (!promoteFileAtomically(approvedSessionPath, formalPath, &error)) {
         showError(QStringLiteral("正式激光平面更新失败"), error);
         return;
@@ -4388,6 +5413,38 @@ QImage HikCalibrationWindow::drawLaserOverlay(
     cv::putText(overlay, caption, cv::Point(20, 36), cv::FONT_HERSHEY_SIMPLEX,
                 0.8, pair.ok ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255),
                 2, cv::LINE_AA);
+    const LaserGuidanceObservation guidance =
+        laserGuidanceObservation(
+            pair, hasActiveLaserIntrinsics_
+                ? activeLaserIntrinsics_.board : boardSpecFromUi());
+    if (guidance.valid) {
+        std::ostringstream depthCaption;
+        depthCaption << "Zmed=" << std::fixed << std::setprecision(1)
+                     << guidance.medianDepthMm << " mm, bin=";
+        if (guidance.binIndex >= 0) {
+            depthCaption
+                << kLaserGuidanceBins[static_cast<std::size_t>(
+                       guidance.binIndex)].targetDepthMm
+                << " mm";
+        } else {
+            depthCaption << "OUTSIDE";
+        }
+        cv::putText(overlay, depthCaption.str(), cv::Point(20, 68),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                    guidance.binIndex >= 0 ? cv::Scalar(0, 255, 255)
+                                           : cv::Scalar(0, 0, 255),
+                    2, cv::LINE_AA);
+        std::ostringstream poseCaption;
+        poseCaption << "board XY=" << std::fixed << std::setprecision(1)
+                    << guidance.boardXmm << "/" << guidance.boardYmm
+                    << " mm, tilt XY=" << guidance.tiltXDeg << "/"
+                    << guidance.tiltYDeg << " deg, stripe UV="
+                    << guidance.stripeUMedianPx << "/"
+                    << guidance.stripeVMedianPx << " px";
+        cv::putText(overlay, poseCaption.str(), cv::Point(20, 98),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255),
+                    1, cv::LINE_AA);
+    }
     return cvMatToQImageCopy(overlay);
 }
 

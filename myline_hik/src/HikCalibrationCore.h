@@ -1,6 +1,8 @@
 #ifndef MYLINE_HIK_HIK_CALIBRATION_CORE_H
 #define MYLINE_HIK_HIK_CALIBRATION_CORE_H
 
+#include "StripeCenterlineExtractor.h"
+
 #include <opencv2/core.hpp>
 
 #include <cstdint>
@@ -173,15 +175,22 @@ bool estimateBoardPose(const CharucoObservation& observation,
                        const BoardPoseOptions& options,
                        BoardPoseResult* result);
 
+enum class StripeExtractionMode {
+    Legacy,
+    Shadow,
+    Quality
+};
+
 struct StripeExtractionOptions {
     int minimumDifference;
     double thresholdStddevScale;
-    int halfWindow;
     int minPointCount;
     int maxGapRows;
     double maxWidthPx;
     double minConfidence;
     double continuityPenalty;
+    StripeExtractionMode mode;
+    hik_stripe::Options quality;
 
     StripeExtractionOptions();
 };
@@ -193,8 +202,35 @@ struct StripePoint {
     double peakDifference;
     double widthPx;
     double confidence;
+    double localBaseline;
+    double localNoiseMad;
+    double prominence;
+    double snr;
+    double saturatedFraction;
+    int saturatedPlateauWidthPx;
+    double secondPeakRatio;
+    double gradientAsymmetry;
+    double fitResidual;
+    double centerSigmaPx;
+    std::uint32_t rejectFlags;
+    bool qualityExtractor;
 
     StripePoint();
+};
+
+struct StripeShadowComparison {
+    std::size_t matchedPointCount;
+    std::size_t robustMatchedPointCount;
+    std::size_t grossMismatchPointCount;
+    double signedMeanOffsetPx;
+    double signedMedianOffsetPx;
+    double robustSignedMeanOffsetPx;
+    double robustGatePx;
+    double absoluteMedianOffsetPx;
+    double absoluteP95OffsetPx;
+    double absoluteMaximumOffsetPx;
+
+    StripeShadowComparison();
 };
 
 // Extracts one continuous, predominantly vertical laser centerline from an
@@ -231,6 +267,10 @@ struct LaserPairOptions {
     DetectionOptions detection;
     BoardPoseOptions pose;
     StripeExtractionOptions stripe;
+    // A laser-on frame is expected to contain a narrow saturated ridge.  Keep
+    // the ordinary board saturation gate for laser-off, but allow this larger
+    // board-region fraction only for laser-on ChArUco detection.
+    double maxLaserOnSaturationRatio;
     int minCommonCorners;
     double maxMeanCornerShiftPx;
     double maxP95CornerShiftPx;
@@ -364,6 +404,9 @@ struct StaticProfileOptions {
     int minBoardValidationPoints;
     double maxLineRmsMm;
     double maxBoardPlaneRmsMm;
+    // Optional precomputed CV_8UC1 mask in calibrated image coordinates.
+    // Non-zero pixels are eligible before quality-path optimization.
+    cv::Mat stripeValidityMask;
 
     StaticProfileOptions();
 };
@@ -391,8 +434,19 @@ struct StaticProfileResult {
     std::string error;
     std::string sampleId;
     cv::Mat differenceImage;
+    std::vector<StripePoint> legacyStripe;
+    std::vector<StripePoint> qualityStripe;
     std::vector<StripePoint> stripe;
+    std::vector<StaticProfilePoint> legacyPoints;
+    std::vector<StaticProfilePoint> qualityPoints;
     std::vector<StaticProfilePoint> points;
+    bool legacyExtractionPassed;
+    bool qualityExtractionPassed;
+    std::string legacyExtractionError;
+    std::string qualityExtractionError;
+    std::string centerlineAlgorithmVersion;
+    hik_stripe::Diagnostics qualityDiagnostics;
+    StripeShadowComparison shadowComparison;
     int rejectedParallelRayCount;
     int rejectedBehindCameraCount;
     int rejectedDepthCount;
@@ -435,6 +489,19 @@ bool reconstructSingleFrameProfile(const cv::Mat& laserOnImage,
                                    const LaserPlaneFitResult& laserPlane,
                                    const SingleFrameProfileOptions& options,
                                    StaticProfileResult* result);
+
+// Precomputes the exact calibrated pixel corridor whose ray/laser-plane
+// intersection lies inside the formal Z range. Build once after calibration
+// loading and reuse it in StaticProfileOptions; do not recompute per frame.
+bool buildLaserPlaneValidityMask(
+    const cv::Size& imageSize,
+    const IntrinsicCalibrationResult& intrinsics,
+    const LaserPlaneFitResult& laserPlane,
+    double minimumDepthMm,
+    double maximumDepthMm,
+    const cv::Rect& roi,
+    cv::Mat* mask,
+    std::string* error = 0);
 
 bool saveStaticProfilePly(const std::string& path,
                           const StaticProfileResult& profile,

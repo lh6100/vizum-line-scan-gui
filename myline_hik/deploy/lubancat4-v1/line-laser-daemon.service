@@ -1,0 +1,40 @@
+[Unit]
+Description=Fail-safe LubanCat-4 V1 line-laser GPIO controller
+Documentation=file:/usr/local/share/doc/myline-hik-line-laser/README.md
+After=local-fs.target
+Before=shutdown.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=line-laser-control
+UMask=0007
+RuntimeDirectory=myline-hik
+RuntimeDirectoryMode=0750
+ExecStart=/usr/bin/python3 /usr/local/libexec/myline-hik/line_laser_daemon.py --socket /run/myline-hik/laser.sock --socket-group line-laser-control --gpio-chip /dev/gpiochip0 --laser450-offset 15 --laser650-offset 16 --lease-ms 2000
+Restart=on-failure
+RestartSec=250ms
+TimeoutStopSec=3s
+KillSignal=SIGTERM
+
+# The process needs only the selected GPIO character device and its Unix socket.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+DeviceAllow=/dev/gpiochip0 rw
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

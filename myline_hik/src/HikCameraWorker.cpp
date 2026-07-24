@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 #if defined(HAVE_HIK_MVS)
 #include <MvCameraControl.h>
@@ -18,6 +19,49 @@ namespace {
 const int kConnectionRequestId = -1;
 
 #if defined(HAVE_HIK_MVS)
+
+struct MvsRuntimeState {
+    std::mutex mutex;
+    std::size_t referenceCount{0U};
+};
+
+MvsRuntimeState& mvsRuntimeState() {
+    static MvsRuntimeState state;
+    return state;
+}
+
+bool acquireMvsRuntime(bool* initializedNow,
+                       std::size_t* referenceCount,
+                       int* sdkError) {
+    MvsRuntimeState& state = mvsRuntimeState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    bool didInitialize = false;
+    if (state.referenceCount == 0U) {
+        const int code = MV_CC_Initialize();
+        if (code != MV_OK) {
+            if (initializedNow) *initializedNow = false;
+            if (referenceCount) *referenceCount = 0U;
+            if (sdkError) *sdkError = code;
+            return false;
+        }
+        didInitialize = true;
+    }
+    ++state.referenceCount;
+    if (initializedNow) *initializedNow = didInitialize;
+    if (referenceCount) *referenceCount = state.referenceCount;
+    if (sdkError) *sdkError = MV_OK;
+    return true;
+}
+
+void releaseMvsRuntime() noexcept {
+    MvsRuntimeState& state = mvsRuntimeState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.referenceCount == 0U) return;
+    --state.referenceCount;
+    if (state.referenceCount == 0U) {
+        (void)MV_CC_Finalize();
+    }
+}
 
 QString bytesToString(const unsigned char* bytes, int capacity) {
     if (!bytes || capacity <= 0) {
@@ -64,7 +108,7 @@ private:
 HikCameraWorker::HikCameraWorker(QObject* parent)
     : QObject(parent),
       m_handle(nullptr),
-      m_sdkInitialized(false),
+      m_sdkRuntimeLeaseHeld(false),
       m_connected(false),
       m_grabbing(false),
       m_busy(false),
@@ -76,9 +120,9 @@ HikCameraWorker::~HikCameraWorker() {
     // this remains a final leak-safe fallback for partial initialization.
     releaseDevice(false);
 #if defined(HAVE_HIK_MVS)
-    if (m_sdkInitialized) {
-        MV_CC_Finalize();
-        m_sdkInitialized = false;
+    if (m_sdkRuntimeLeaseHeld) {
+        releaseMvsRuntime();
+        m_sdkRuntimeLeaseHeld = false;
     }
 #endif
 }
@@ -127,25 +171,30 @@ QString HikCameraWorker::formatIpv4(quint32 value) {
 #if defined(HAVE_HIK_MVS)
 
 bool HikCameraWorker::initializeSdk(QString* failure) {
-    if (m_sdkInitialized) {
+    if (m_sdkRuntimeLeaseHeld) {
         return true;
     }
 
-    const int code = MV_CC_Initialize();
-    if (code != MV_OK) {
+    bool initializedNow = false;
+    std::size_t referenceCount = 0U;
+    int code = MV_OK;
+    if (!acquireMvsRuntime(&initializedNow, &referenceCount, &code)) {
         if (failure) {
             *failure = formatSdkError(QStringLiteral("MV_CC_Initialize"), code);
         }
         return false;
     }
 
-    m_sdkInitialized = true;
+    m_sdkRuntimeLeaseHeld = true;
     const quint32 version = MV_CC_GetSDKVersion();
-    emit log(QStringLiteral("Hik MVS SDK 已初始化: V%1.%2.%3.%4")
+    emit log(QStringLiteral("Hik MVS SDK %1: V%2.%3.%4.%5，进程级引用=%6")
+                 .arg(initializedNow ? QStringLiteral("已初始化")
+                                     : QStringLiteral("运行时已复用"))
                  .arg((version >> 24U) & 0xffU)
                  .arg((version >> 16U) & 0xffU)
                  .arg((version >> 8U) & 0xffU)
-                 .arg(version & 0xffU));
+                 .arg(version & 0xffU)
+                 .arg(static_cast<qulonglong>(referenceCount)));
     return true;
 }
 
@@ -928,20 +977,28 @@ void HikCameraWorker::startContinuous(double exposureUs,
 void HikCameraWorker::stopContinuous() {
 #if !defined(HAVE_HIK_MVS)
     setBusy(false);
-    emit continuousStopped();
+    emit continuousStopped(
+        true, QStringLiteral("未编译 MVS 支持；无活动连续取流"));
 #else
     const bool wasRunning = m_continuousRunning.exchange(false);
+    bool stopConfirmed = true;
+    QString stopDescription =
+        QStringLiteral("自由运行连续采集已停止");
     if (m_grabbing && m_handle) {
         const int code = MV_CC_StopGrabbing(m_handle);
         if (code != MV_OK) {
-            emit log(formatSdkError(QStringLiteral("MV_CC_StopGrabbing"), code));
+            stopConfirmed = false;
+            stopDescription = formatSdkError(
+                QStringLiteral("MV_CC_StopGrabbing"), code);
+            emit log(stopDescription);
+        } else {
+            m_grabbing = false;
         }
-        m_grabbing = false;
     }
     m_imagePool.reset();
-    if (wasRunning) emit log(QStringLiteral("自由运行连续采集已停止"));
+    if (wasRunning && stopConfirmed) emit log(stopDescription);
     setBusy(false);
-    emit continuousStopped();
+    emit continuousStopped(stopConfirmed, stopDescription);
 #endif
 }
 

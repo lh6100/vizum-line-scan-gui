@@ -71,7 +71,7 @@ signals:
                            double actualFps,
                            quint64 deviceTimestampFrequencyHz,
                            QString timestampDescription);
-    void continuousStopped();
+    void continuousStopped(bool confirmed, QString description);
     void continuousFrameReady(hik_sync::CameraFrame frame);
     void continuousFrameRejected(quint64 frameNo, QString reason);
     void imagePoolExhausted();
@@ -99,7 +99,10 @@ private:
 #endif
 
     void* m_handle;
-    bool m_sdkInitialized;
+    // This worker owns one reference to the process-wide MVS runtime after its
+    // first successful connection attempt. The worker destructor releases the
+    // reference only after its camera handle has been closed and destroyed.
+    bool m_sdkRuntimeLeaseHeld;
     bool m_connected;
     bool m_grabbing;
     bool m_busy;

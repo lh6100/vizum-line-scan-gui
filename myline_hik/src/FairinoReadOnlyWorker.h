@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 Q_DECLARE_METATYPE(hik_sync::RobotSample)
@@ -65,7 +66,10 @@ signals:
     void log(QString message);
     void error(int requestId, QString message);
     void motionStarted(int requestId, QString description);
-    void motionFinished(int requestId, bool success, QString description);
+    void motionFinished(int requestId,
+                        bool targetReached,
+                        bool motionStoppedConfirmed,
+                        QString description);
 
 private slots:
     void pollMotionDone();
@@ -79,6 +83,11 @@ private:
                         double rxDeg, double ryDeg, double rzDeg,
                         double speedValue, double accelerationValue,
                         int timeoutMs, bool physicalMode);
+    void beginStopConfirmation(const QString& context);
+    bool confirmStoppedBlocking(int timeoutMs);
+    void finishMotion(bool targetReached,
+                      bool motionStoppedConfirmed,
+                      const QString& description);
 
     FRRobot* robot_{nullptr};
     bool connected_{false};
@@ -89,9 +98,19 @@ private:
     std::thread realtimeThread_;
     std::unique_ptr<FairinoRealtimeReceiverState> realtimeReceiver_;
     bool motionActive_{false};
+    bool motionStopUnconfirmed_{false};
+    bool stopConfirmationPending_{false};
     int motionRequestId_{-1};
     qint64 motionStartMs_{0};
     int motionTimeoutMs_{0};
+    qint64 stopConfirmationStartMs_{0};
+    qint64 lastStopSampleReceiveNs_{0};
+    int stationaryStopSamples_{0};
+    std::mutex realtimeStopSnapshotMutex_;
+    qint64 latestRealtimeHostReceiveNs_{0};
+    int latestRealtimeMotionDone_{0};
+    double latestRealtimeLinearSpeedMmS_{0.0};
+    double latestRealtimeAngularSpeedDegS_{0.0};
 };
 
 #endif  // MYLINE_HIK_FAIRINO_READ_ONLY_WORKER_H

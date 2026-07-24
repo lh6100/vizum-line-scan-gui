@@ -494,8 +494,7 @@ bool calibrateHandEyeRobust(const std::vector<HandEyeSample>& samples,
 }
 
 HandEyeYamlMetadata::HandEyeYamlMetadata()
-    : cameraFrame("hik_camera_optical_frame"),
-      flangeFrame("fairino_flange_reported"), baseFrame("base_link") {}
+    : flangeFrame("fairino_flange_reported"), baseFrame("base_link") {}
 
 bool saveHandEyeYaml(const std::string& path,
                      const HandEyeCalibrationResult& calibration,

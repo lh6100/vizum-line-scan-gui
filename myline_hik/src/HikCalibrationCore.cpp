@@ -852,20 +852,35 @@ bool estimateBoardPose(const CharucoObservation& observation,
 }
 
 StripeExtractionOptions::StripeExtractionOptions()
-    : minimumDifference(15), thresholdStddevScale(3.0), halfWindow(5),
+    : minimumDifference(15), thresholdStddevScale(3.0),
       minPointCount(80), maxGapRows(12), maxWidthPx(20.0),
-      minConfidence(0.05), continuityPenalty(1.0) {}
+      minConfidence(0.05), continuityPenalty(1.0),
+      mode(StripeExtractionMode::Legacy) {}
 
 StripePoint::StripePoint()
     : pixel(0.0, 0.0), row(0), peakX(0), peakDifference(0.0),
-      widthPx(0.0), confidence(0.0) {}
+      widthPx(0.0), confidence(0.0), localBaseline(0.0),
+      localNoiseMad(0.0), prominence(0.0), snr(0.0),
+      saturatedFraction(0.0), saturatedPlateauWidthPx(0),
+      secondPeakRatio(0.0), gradientAsymmetry(0.0),
+      fitResidual(0.0), centerSigmaPx(0.0),
+      rejectFlags(hik_stripe::REJECT_NONE), qualityExtractor(false) {}
+
+StripeShadowComparison::StripeShadowComparison()
+    : matchedPointCount(0U), robustMatchedPointCount(0U),
+      grossMismatchPointCount(0U), signedMeanOffsetPx(0.0),
+      signedMedianOffsetPx(0.0), robustSignedMeanOffsetPx(0.0),
+      robustGatePx(0.0),
+      absoluteMedianOffsetPx(0.0), absoluteP95OffsetPx(0.0),
+      absoluteMaximumOffsetPx(0.0) {}
 
 PairMotionMetrics::PairMotionMetrics()
     : commonCornerCount(0), poseTranslationDeltaMm(0.0),
       poseRotationDeltaDeg(0.0) {}
 
 LaserPairOptions::LaserPairOptions()
-    : minCommonCorners(8), maxMeanCornerShiftPx(0.35),
+    : maxLaserOnSaturationRatio(0.05),
+      minCommonCorners(8), maxMeanCornerShiftPx(0.35),
       maxP95CornerShiftPx(0.75), maxPoseTranslationDeltaMm(0.5),
       maxPoseRotationDeltaDeg(0.2), boardBoundsMarginMm(1.0),
       minIntersectionPoints(60) {}
@@ -892,7 +907,7 @@ bool extractVerticalStripe(const cv::Mat& difference,
     }
     points->clear();
     if (difference.empty() || difference.type() != CV_8UC1 ||
-        options.minimumDifference < 1 || options.halfWindow < 1 ||
+        options.minimumDifference < 1 ||
         options.minPointCount < 1 || options.maxGapRows < 0 ||
         options.maxWidthPx <= 0.0 || options.minConfidence < 0.0 ||
         options.minConfidence > 1.0 || options.continuityPenalty < 0.0) {
@@ -945,8 +960,14 @@ bool extractVerticalStripe(const cv::Mat& difference,
             if (width > options.maxWidthPx) {
                 continue;
             }
-            const int windowLeft = std::max(left, peak - options.halfWindow);
-            const int windowRight = std::min(right, peak + options.halfWindow);
+            // The local-maximum index sits on the falling edge of a saturated
+            // flat-top ridge because the detector requires values[col] >
+            // values[col + 1].  Centering a fixed window on that index biases
+            // wide close-range stripes toward one edge.  The half-height
+            // interval has already passed maxWidthPx, so use the complete
+            // interval for an unbiased centre of mass.
+            const int windowLeft = left;
+            const int windowRight = right;
             double weightedX = 0.0;
             double weightSum = 0.0;
             for (int col = windowLeft; col <= windowRight; ++col) {
@@ -1131,6 +1152,13 @@ bool extractLaserStripe(const cv::Mat& differenceImage,
     return false;
 }
 
+namespace {
+
+std::vector<StripePoint> qualityStripePoints(
+    const hik_stripe::Result& extraction);
+
+}  // namespace
+
 bool processLaserCalibrationPair(const cv::Mat& laserOffImage,
                                  const cv::Mat& laserOnImage,
                                  const std::string& sampleId,
@@ -1159,6 +1187,12 @@ bool processLaserCalibrationPair(const cv::Mat& laserOffImage,
         result->error = "laser-off/on image sizes differ";
         return false;
     }
+    if (!finiteNumber(options.maxLaserOnSaturationRatio) ||
+        options.maxLaserOnSaturationRatio < options.detection.maxSaturationRatio ||
+        options.maxLaserOnSaturationRatio > 1.0) {
+        result->error = "invalid laser-on saturation ratio limit";
+        return false;
+    }
 
     if (!detectCharuco(offGray, sampleId + "_off", board, options.detection,
                        &result->laserOffDetection, cameraMatrix, distCoeffs)) {
@@ -1166,10 +1200,22 @@ bool processLaserCalibrationPair(const cv::Mat& laserOffImage,
             result->laserOffDetection.error;
         return false;
     }
-    if (!detectCharuco(onGray, sampleId + "_on", board, options.detection,
+    DetectionOptions laserOnDetectionOptions = options.detection;
+    laserOnDetectionOptions.maxSaturationRatio =
+        options.maxLaserOnSaturationRatio;
+    if (!detectCharuco(onGray, sampleId + "_on", board, laserOnDetectionOptions,
                        &result->laserOnDetection, cameraMatrix, distCoeffs)) {
         result->error = "laser-on ChArUco detection failed: " +
             result->laserOnDetection.error;
+        if (result->laserOnDetection.observation.quality.saturationRatio >
+            options.maxLaserOnSaturationRatio) {
+            std::ostringstream saturation;
+            saturation << " (board saturation ratio="
+                       << result->laserOnDetection.observation.quality.saturationRatio
+                       << ", laser-on limit="
+                       << options.maxLaserOnSaturationRatio << ')';
+            result->error += saturation.str();
+        }
         return false;
     }
     if (!commonCornerMotion(result->laserOffDetection.observation,
@@ -1217,8 +1263,25 @@ bool processLaserCalibrationPair(const cv::Mat& laserOffImage,
     }
 
     cv::subtract(onGray, offGray, result->differenceImage);
-    if (!extractLaserStripe(result->differenceImage, options.stripe,
-                            &result->stripe, &error)) {
+    if (options.stripe.mode == StripeExtractionMode::Quality) {
+        hik_stripe::Result quality;
+        if (!hik_stripe::extractCenterline(
+                result->differenceImage, onGray,
+                options.stripe.quality, &quality) ||
+            static_cast<int>(quality.selected.size()) <
+                options.stripe.minPointCount) {
+            std::ostringstream message;
+            message << "quality stripe extraction failed: "
+                    << quality.error << "; retained="
+                    << quality.selected.size() << ", required="
+                    << options.stripe.minPointCount;
+            result->error = message.str();
+            return false;
+        }
+        result->stripe = qualityStripePoints(quality);
+    } else if (!extractLaserStripe(
+                   result->differenceImage, options.stripe,
+                   &result->stripe, &error)) {
         result->error = "stripe extraction failed: " + error;
         return false;
     }
@@ -1316,11 +1379,336 @@ StaticProfilePoint::StaticProfilePoint()
       insideBoard(false) {}
 
 StaticProfileResult::StaticProfileResult()
-    : ok(false), rejectedParallelRayCount(0), rejectedBehindCameraCount(0),
+    : ok(false), legacyExtractionPassed(false),
+      qualityExtractionPassed(false), rejectedParallelRayCount(0),
+      rejectedBehindCameraCount(0),
       rejectedDepthCount(0), minimumDepthMm(0.0), maximumDepthMm(0.0),
       meanConfidence(0.0), lineQualityPassed(false),
       boardValidationAvailable(false), boardValidationPassed(false),
       boardValidationPointCount(0) {}
+
+namespace {
+
+struct StripeReconstructionCounters {
+    int parallel{0};
+    int behindCamera{0};
+    int outsideDepth{0};
+    double minimumDepth{std::numeric_limits<double>::max()};
+    double maximumDepth{-std::numeric_limits<double>::max()};
+    double confidenceSum{0.0};
+};
+
+std::vector<StripePoint> qualityStripePoints(
+        const hik_stripe::Result& extraction) {
+    std::vector<StripePoint> points;
+    points.reserve(extraction.selected.size());
+    for (const hik_stripe::Candidate& input : extraction.selected) {
+        if (!input.accepted()) {
+            continue;
+        }
+        StripePoint output;
+        output.pixel = input.pixel;
+        output.row = static_cast<int>(std::lround(input.pixel.y));
+        output.peakX = static_cast<int>(std::lround(input.pixel.x));
+        output.peakDifference = input.responsePeak;
+        output.widthPx = input.fwhmPx;
+        output.confidence = input.quality;
+        output.localBaseline = input.localBaseline;
+        output.localNoiseMad = input.localNoiseMad;
+        output.prominence = input.prominence;
+        output.snr = input.snr;
+        output.saturatedFraction = input.saturatedFraction;
+        output.saturatedPlateauWidthPx =
+            input.saturatedPlateauWidthPx;
+        output.secondPeakRatio = input.secondPeakRatio;
+        output.gradientAsymmetry = input.gradientAsymmetry;
+        output.fitResidual = input.fitResidual;
+        output.centerSigmaPx = input.centerSigmaPx;
+        output.rejectFlags = input.rejectFlags;
+        output.qualityExtractor = true;
+        points.push_back(output);
+    }
+    return points;
+}
+
+bool reconstructStripePoints(
+        const std::vector<StripePoint>& stripe,
+        const IntrinsicCalibrationResult& intrinsics,
+        const LaserPlaneFitResult& laserPlane,
+        const StaticProfileOptions& options,
+        std::vector<StaticProfilePoint>* points,
+        StripeReconstructionCounters* counters,
+        std::string* error) {
+    if (!points || !counters) {
+        setError("stripe reconstruction output is null", error);
+        return false;
+    }
+    points->clear();
+    *counters = StripeReconstructionCounters();
+    if (stripe.empty()) {
+        return true;
+    }
+    std::vector<cv::Point2f> distorted;
+    distorted.reserve(stripe.size());
+    for (const StripePoint& point : stripe) {
+        distorted.push_back(cv::Point2f(
+            static_cast<float>(point.pixel.x),
+            static_cast<float>(point.pixel.y)));
+    }
+    std::vector<cv::Point2f> normalized;
+    try {
+        cv::undistortPoints(
+            distorted, normalized, intrinsics.cameraMatrix,
+            intrinsics.distCoeffs);
+    } catch (const cv::Exception& exception) {
+        setError(
+            std::string("undistortPoints failed: ") +
+                exception.what(),
+            error);
+        return false;
+    }
+    points->reserve(stripe.size());
+    for (std::size_t index = 0U;
+         index < normalized.size(); ++index) {
+        const cv::Vec3d ray(
+            normalized[index].x, normalized[index].y, 1.0);
+        const double denominator =
+            laserPlane.plane.normal.dot(ray);
+        if (!finiteNumber(denominator) ||
+            std::fabs(denominator) <
+                options.rayPlaneDenominatorEpsilon) {
+            ++counters->parallel;
+            continue;
+        }
+        const double scale =
+            -laserPlane.plane.dMm / denominator;
+        if (!finiteNumber(scale) || scale <= 0.0) {
+            ++counters->behindCamera;
+            continue;
+        }
+        const cv::Vec3d point = ray * scale;
+        if (!finiteNumber(point[0]) ||
+            !finiteNumber(point[1]) ||
+            !finiteNumber(point[2]) ||
+            point[2] < options.minimumDepthMm ||
+            point[2] > options.maximumDepthMm) {
+            ++counters->outsideDepth;
+            continue;
+        }
+        StaticProfilePoint output;
+        output.stripe = stripe[index];
+        output.cameraPointMm =
+            cv::Point3d(point[0], point[1], point[2]);
+        points->push_back(output);
+        counters->confidenceSum += output.stripe.confidence;
+        counters->minimumDepth =
+            std::min(counters->minimumDepth, point[2]);
+        counters->maximumDepth =
+            std::max(counters->maximumDepth, point[2]);
+    }
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
+StripeShadowComparison compareStripeCenters(
+        const std::vector<StripePoint>& legacy,
+        const std::vector<StripePoint>& quality,
+        hik_stripe::Orientation orientation) {
+    StripeShadowComparison comparison;
+    std::map<int, double> legacyByScanline;
+    for (const StripePoint& point : legacy) {
+        const int scanline =
+            orientation == hik_stripe::Orientation::Horizontal
+            ? static_cast<int>(std::lround(point.pixel.x))
+            : static_cast<int>(std::lround(point.pixel.y));
+        const double coordinate =
+            orientation == hik_stripe::Orientation::Horizontal
+            ? point.pixel.y
+            : point.pixel.x;
+        legacyByScanline[scanline] = coordinate;
+    }
+    std::vector<double> absoluteOffsets;
+    std::vector<double> signedOffsets;
+    double signedSum = 0.0;
+    for (const StripePoint& point : quality) {
+        const int scanline =
+            orientation == hik_stripe::Orientation::Horizontal
+            ? static_cast<int>(std::lround(point.pixel.x))
+            : static_cast<int>(std::lround(point.pixel.y));
+        const std::map<int, double>::const_iterator found =
+            legacyByScanline.find(scanline);
+        if (found == legacyByScanline.end()) {
+            continue;
+        }
+        const double coordinate =
+            orientation == hik_stripe::Orientation::Horizontal
+            ? point.pixel.y
+            : point.pixel.x;
+        const double offset = coordinate - found->second;
+        signedSum += offset;
+        signedOffsets.push_back(offset);
+        absoluteOffsets.push_back(std::fabs(offset));
+    }
+    comparison.matchedPointCount = absoluteOffsets.size();
+    if (!absoluteOffsets.empty()) {
+        comparison.signedMeanOffsetPx =
+            signedSum /
+            static_cast<double>(absoluteOffsets.size());
+        comparison.signedMedianOffsetPx =
+            median(signedOffsets);
+        const double scaledMad =
+            1.4826 * medianAbsoluteDeviation(signedOffsets);
+        comparison.robustGatePx =
+            std::max(0.5, 4.0 * scaledMad);
+        const double grossGate =
+            std::max(2.0, comparison.robustGatePx);
+        double robustSum = 0.0;
+        for (const double offset : signedOffsets) {
+            const double centered = std::fabs(
+                offset - comparison.signedMedianOffsetPx);
+            if (centered <= comparison.robustGatePx) {
+                robustSum += offset;
+                ++comparison.robustMatchedPointCount;
+            }
+            if (centered > grossGate) {
+                ++comparison.grossMismatchPointCount;
+            }
+        }
+        if (comparison.robustMatchedPointCount > 0U) {
+            comparison.robustSignedMeanOffsetPx =
+                robustSum /
+                static_cast<double>(
+                    comparison.robustMatchedPointCount);
+        }
+        const ErrorMetrics metrics =
+            metricsFromValues(absoluteOffsets);
+        std::sort(absoluteOffsets.begin(), absoluteOffsets.end());
+        const std::size_t medianIndex =
+            absoluteOffsets.size() / 2U;
+        comparison.absoluteMedianOffsetPx =
+            (absoluteOffsets.size() & 1U) != 0U
+            ? absoluteOffsets[medianIndex]
+            : 0.5 * (
+                absoluteOffsets[medianIndex - 1U] +
+                absoluteOffsets[medianIndex]);
+        comparison.absoluteP95OffsetPx = metrics.p95;
+        comparison.absoluteMaximumOffsetPx = metrics.maximum;
+    }
+    return comparison;
+}
+
+}  // namespace
+
+bool buildLaserPlaneValidityMask(
+        const cv::Size& imageSize,
+        const IntrinsicCalibrationResult& intrinsics,
+        const LaserPlaneFitResult& laserPlane,
+        double minimumDepthMm,
+        double maximumDepthMm,
+        const cv::Rect& requestedRoi,
+        cv::Mat* mask,
+        std::string* error) {
+    if (!mask) {
+        setError("laser-plane validity mask output is null", error);
+        return false;
+    }
+    mask->release();
+    std::string validationError;
+    const double normalNorm = cv::norm(laserPlane.plane.normal);
+    if (imageSize.width < 1 || imageSize.height < 1 ||
+        !intrinsics.ok ||
+        !validateIntrinsics(
+            intrinsics.cameraMatrix, intrinsics.distCoeffs,
+            &validationError) ||
+        !laserPlane.ok || !finiteNumber(normalNorm) ||
+        std::fabs(normalNorm - 1.0) > 1.0e-6 ||
+        !finiteNumber(laserPlane.plane.dMm) ||
+        !finiteNumber(minimumDepthMm) ||
+        !finiteNumber(maximumDepthMm) ||
+        minimumDepthMm <= 0.0 ||
+        maximumDepthMm <= minimumDepthMm) {
+        setError(
+            validationError.empty()
+                ? "invalid calibration or depth range for stripe mask"
+                : validationError,
+            error);
+        return false;
+    }
+    const cv::Rect roi = requestedRoi.empty()
+        ? cv::Rect(0, 0, imageSize.width, imageSize.height)
+        : requestedRoi;
+    if (roi.x < 0 || roi.y < 0 ||
+        roi.width < 1 || roi.height < 1 ||
+        roi.x + roi.width > imageSize.width ||
+        roi.y + roi.height > imageSize.height) {
+        setError(
+            "stripe mask ROI is outside the calibrated image",
+            error);
+        return false;
+    }
+
+    std::vector<cv::Point2f> distorted;
+    distorted.reserve(
+        static_cast<std::size_t>(roi.width) *
+        static_cast<std::size_t>(roi.height));
+    for (int row = roi.y; row < roi.y + roi.height; ++row) {
+        for (int column = roi.x;
+             column < roi.x + roi.width; ++column) {
+            distorted.push_back(cv::Point2f(
+                static_cast<float>(column),
+                static_cast<float>(row)));
+        }
+    }
+    std::vector<cv::Point2f> normalized;
+    try {
+        cv::undistortPoints(
+            distorted, normalized, intrinsics.cameraMatrix,
+            intrinsics.distCoeffs);
+    } catch (const cv::Exception& exception) {
+        setError(
+            std::string("cannot build stripe validity mask: ") +
+                exception.what(),
+            error);
+        return false;
+    }
+    *mask = cv::Mat::zeros(imageSize, CV_8UC1);
+    std::size_t index = 0U;
+    for (int row = roi.y; row < roi.y + roi.height; ++row) {
+        unsigned char* output = mask->ptr<unsigned char>(row);
+        for (int column = roi.x;
+             column < roi.x + roi.width;
+             ++column, ++index) {
+            const cv::Vec3d ray(
+                normalized[index].x, normalized[index].y, 1.0);
+            const double denominator =
+                laserPlane.plane.normal.dot(ray);
+            if (!finiteNumber(denominator) ||
+                std::fabs(denominator) <= 1.0e-12) {
+                continue;
+            }
+            const double depth =
+                -laserPlane.plane.dMm / denominator;
+            if (finiteNumber(depth) &&
+                depth >= minimumDepthMm &&
+                depth <= maximumDepthMm) {
+                output[column] = 255U;
+            }
+        }
+    }
+    if (cv::countNonZero(*mask) == 0) {
+        mask->release();
+        setError(
+            "formal depth range produced an empty stripe validity mask",
+            error);
+        return false;
+    }
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
 
 bool reconstructStaticProfile(const cv::Mat& laserOffImage,
                               const cv::Mat& laserOnImage,
@@ -1379,60 +1767,132 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
         return false;
     }
 
+    if (!options.stripeValidityMask.empty() &&
+        (options.stripeValidityMask.type() != CV_8UC1 ||
+         options.stripeValidityMask.size() != onGray.size())) {
+        result->error =
+            "stripe validity mask differs from the calibrated image";
+        return false;
+    }
+
     cv::subtract(onGray, offGray, result->differenceImage);
-    if (!extractLaserStripe(result->differenceImage, options.stripe,
-                            &result->stripe, &error)) {
-        result->error = "stripe extraction failed: " + error;
+    result->legacyExtractionPassed = extractLaserStripe(
+        result->differenceImage, options.stripe,
+        &result->legacyStripe, &result->legacyExtractionError);
+    if (!result->legacyExtractionPassed &&
+        options.stripe.mode != StripeExtractionMode::Quality) {
+        result->error =
+            "legacy stripe extraction failed: " +
+            result->legacyExtractionError;
         return false;
     }
 
-    std::vector<cv::Point2f> distorted;
-    distorted.reserve(result->stripe.size());
-    for (std::size_t i = 0; i < result->stripe.size(); ++i) {
-        distorted.push_back(cv::Point2f(
-            static_cast<float>(result->stripe[i].pixel.x),
-            static_cast<float>(result->stripe[i].pixel.y)));
-    }
-    std::vector<cv::Point2f> normalized;
-    try {
-        cv::undistortPoints(distorted, normalized, intrinsics.cameraMatrix,
-                            intrinsics.distCoeffs);
-    } catch (const cv::Exception& exception) {
-        result->error = std::string("undistortPoints failed: ") + exception.what();
-        return false;
+    hik_stripe::Result qualityExtraction;
+    if (options.stripe.mode != StripeExtractionMode::Legacy) {
+        result->centerlineAlgorithmVersion =
+            hik_stripe::algorithmVersion();
+        result->qualityExtractionPassed =
+            hik_stripe::extractCenterline(
+                result->differenceImage, onGray,
+                options.stripe.quality, &qualityExtraction,
+                options.stripeValidityMask);
+        result->qualityDiagnostics =
+            qualityExtraction.diagnostics;
+        result->qualityExtractionError =
+            qualityExtraction.error;
+        result->qualityStripe =
+            qualityStripePoints(qualityExtraction);
+        if (static_cast<int>(result->qualityStripe.size()) <
+            options.stripe.minPointCount) {
+            std::ostringstream message;
+            message << "quality extractor retained "
+                    << result->qualityStripe.size()
+                    << " points; at least "
+                    << options.stripe.minPointCount
+                    << " are required";
+            if (!result->qualityExtractionError.empty()) {
+                message << " (" << result->qualityExtractionError
+                        << ')';
+            }
+            result->qualityExtractionError = message.str();
+            result->qualityExtractionPassed = false;
+        }
+        if (!result->legacyStripe.empty() &&
+            !result->qualityStripe.empty()) {
+            result->shadowComparison = compareStripeCenters(
+                result->legacyStripe, result->qualityStripe,
+                qualityExtraction.orientation);
+        }
+        if (!result->qualityExtractionPassed &&
+            options.stripe.mode == StripeExtractionMode::Quality) {
+            result->error =
+                "quality stripe extraction failed: " +
+                result->qualityExtractionError;
+            return false;
+        }
     }
 
-    double confidenceSum = 0.0;
-    double minimumDepth = std::numeric_limits<double>::max();
-    double maximumDepth = -std::numeric_limits<double>::max();
-    for (std::size_t i = 0; i < normalized.size(); ++i) {
-        const cv::Vec3d ray(normalized[i].x, normalized[i].y, 1.0);
-        const double denominator = laserPlane.plane.normal.dot(ray);
-        if (!finiteNumber(denominator) ||
-            std::fabs(denominator) < options.rayPlaneDenominatorEpsilon) {
-            ++result->rejectedParallelRayCount;
-            continue;
+    StripeReconstructionCounters legacyCounters;
+    StripeReconstructionCounters qualityCounters;
+    if (result->legacyExtractionPassed &&
+        !reconstructStripePoints(
+            result->legacyStripe, intrinsics, laserPlane,
+            options, &result->legacyPoints, &legacyCounters,
+            &result->legacyExtractionError)) {
+        result->legacyExtractionPassed = false;
+        if (options.stripe.mode != StripeExtractionMode::Quality) {
+            result->error =
+                "legacy stripe reconstruction failed: " +
+                result->legacyExtractionError;
+            return false;
         }
-        const double scale = -laserPlane.plane.dMm / denominator;
-        if (!finiteNumber(scale) || scale <= 0.0) {
-            ++result->rejectedBehindCameraCount;
-            continue;
-        }
-        const cv::Vec3d point = ray * scale;
-        if (!finiteNumber(point[0]) || !finiteNumber(point[1]) ||
-            !finiteNumber(point[2]) || point[2] < options.minimumDepthMm ||
-            point[2] > options.maximumDepthMm) {
-            ++result->rejectedDepthCount;
-            continue;
-        }
-        StaticProfilePoint output;
-        output.stripe = result->stripe[i];
-        output.cameraPointMm = cv::Point3d(point[0], point[1], point[2]);
-        result->points.push_back(output);
-        confidenceSum += output.stripe.confidence;
-        minimumDepth = std::min(minimumDepth, point[2]);
-        maximumDepth = std::max(maximumDepth, point[2]);
     }
+    if (result->qualityExtractionPassed &&
+        !reconstructStripePoints(
+            result->qualityStripe, intrinsics, laserPlane,
+            options, &result->qualityPoints, &qualityCounters,
+            &result->qualityExtractionError)) {
+        result->qualityExtractionPassed = false;
+        if (options.stripe.mode == StripeExtractionMode::Quality) {
+            result->error =
+                "quality stripe reconstruction failed: " +
+                result->qualityExtractionError;
+            return false;
+        }
+    }
+    if (result->qualityExtractionPassed &&
+        static_cast<int>(result->qualityPoints.size()) <
+            options.minReconstructedPoints) {
+        std::ostringstream message;
+        message << "quality path produced "
+                << result->qualityPoints.size()
+                << " valid 3-D points; at least "
+                << options.minReconstructedPoints
+                << " are required";
+        result->qualityExtractionError = message.str();
+        result->qualityExtractionPassed = false;
+        if (options.stripe.mode == StripeExtractionMode::Quality) {
+            result->error = result->qualityExtractionError;
+            return false;
+        }
+    }
+
+    StripeReconstructionCounters selectedCounters;
+    if (options.stripe.mode == StripeExtractionMode::Quality) {
+        result->stripe = result->qualityStripe;
+        result->points = result->qualityPoints;
+        selectedCounters = qualityCounters;
+    } else {
+        result->stripe = result->legacyStripe;
+        result->points = result->legacyPoints;
+        selectedCounters = legacyCounters;
+    }
+    result->rejectedParallelRayCount =
+        selectedCounters.parallel;
+    result->rejectedBehindCameraCount =
+        selectedCounters.behindCamera;
+    result->rejectedDepthCount =
+        selectedCounters.outsideDepth;
     if (static_cast<int>(result->points.size()) < options.minReconstructedPoints) {
         std::ostringstream message;
         message << "only " << result->points.size()
@@ -1442,9 +1902,9 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
         result->error = message.str();
         return false;
     }
-    result->minimumDepthMm = minimumDepth;
-    result->maximumDepthMm = maximumDepth;
-    result->meanConfidence = confidenceSum /
+    result->minimumDepthMm = selectedCounters.minimumDepth;
+    result->maximumDepthMm = selectedCounters.maximumDepth;
+    result->meanConfidence = selectedCounters.confidenceSum /
         static_cast<double>(result->points.size());
 
     cv::Vec3d centroid(0.0, 0.0, 0.0);
@@ -1587,7 +2047,25 @@ bool reconstructSingleFrameProfile(const cv::Mat& laserOnImage,
     cv::morphologyEx(onGray, verticalBackground, cv::MORPH_OPEN, verticalKernel,
                      cv::Point(-1, -1), 1, cv::BORDER_REPLICATE);
     cv::Mat background;
-    cv::min(horizontalBackground, verticalBackground, background);
+    if (options.reconstruction.stripe.mode ==
+            StripeExtractionMode::Quality &&
+        options.reconstruction.stripe.quality.orientation ==
+            hik_stripe::Orientation::Horizontal) {
+        // A tall opening removes a thin horizontal ridge while retaining the
+        // slowly varying scene background.
+        background = verticalBackground;
+    } else if (options.reconstruction.stripe.mode ==
+                   StripeExtractionMode::Quality &&
+               options.reconstruction.stripe.quality.orientation ==
+                   hik_stripe::Orientation::Vertical) {
+        background = horizontalBackground;
+    } else {
+        // Preserve the established response exactly for Legacy/Shadow. The
+        // calibrated scanner_650 therefore gets diagnostics without silently
+        // changing its production pixel definition.
+        cv::min(
+            horizontalBackground, verticalBackground, background);
+    }
     cv::Mat response;
     cv::subtract(onGray, background, response);
     if (options.minimumRawIntensity > 0) {
@@ -1992,12 +2470,10 @@ bool fitLaserPlane(const std::vector<LaserPlaneSample>& samples,
 }
 
 IntrinsicsYamlMetadata::IntrinsicsYamlMetadata()
-    : cameraName("hik_camera"), cameraModel("MV-CS016-10GM"),
-      frameId("hik_camera_optical_frame"), pixelFormat("Mono8") {}
+    : cameraName("hik_camera"), pixelFormat("Mono8") {}
 
 LaserPlaneYamlMetadata::LaserPlaneYamlMetadata()
-    : cameraFrame("hik_camera_optical_frame"), validCameraZMinMm(0.0),
-      validCameraZMaxMm(0.0) {}
+    : validCameraZMinMm(0.0), validCameraZMaxMm(0.0) {}
 
 namespace {
 

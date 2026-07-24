@@ -8,7 +8,12 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+include(CTest)
+
 find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets)
+if(BUILD_TESTING)
+    find_package(Qt5 REQUIRED COMPONENTS Test)
+endif()
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d aruco)
 find_package(Eigen3 REQUIRED NO_MODULE)
 
@@ -30,6 +35,34 @@ find_library(HIK_MVS_LIBRARY
     NO_DEFAULT_PATH
 )
 
+add_library(LineLaserDeviceProfile
+    src/LineLaserDeviceProfile.cpp
+    src/LineLaserDeviceProfile.h
+)
+target_include_directories(LineLaserDeviceProfile PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(LineLaserDeviceProfile PUBLIC Qt5::Core)
+
+add_library(LineLaserControl
+    src/LineLaserController.cpp
+    src/LineLaserController.h
+)
+target_include_directories(LineLaserControl PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(LineLaserControl PUBLIC Qt5::Core)
+
+add_library(StripeCenterlineExtractor
+    src/StripeCenterlineExtractor.cpp
+    src/StripeCenterlineExtractor.h
+)
+target_include_directories(StripeCenterlineExtractor PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(StripeCenterlineExtractor PUBLIC ${OpenCV_LIBS})
+
 add_library(HikCalibrationCore
     src/HikCalibrationCore.cpp
     src/HikCalibrationCore.h
@@ -42,7 +75,10 @@ target_include_directories(HikCalibrationCore PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(HikCalibrationCore PUBLIC ${OpenCV_LIBS})
+target_link_libraries(HikCalibrationCore PUBLIC
+    StripeCenterlineExtractor
+    ${OpenCV_LIBS}
+)
 
 add_library(HikSynchronizationCore
     src/HikSynchronizationCore.cpp
@@ -87,14 +123,40 @@ target_link_libraries(HikCameraBackend PUBLIC
     Qt5::Gui
 )
 
+add_executable(ReplayStripeQuality
+    tools/replay_stripe_quality.cpp
+)
+target_include_directories(ReplayStripeQuality PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(ReplayStripeQuality PRIVATE
+    HikCalibrationCore
+    StripeCenterlineExtractor
+    ${OpenCV_LIBS}
+)
+
+add_library(FairinoRobotBackend
+    src/FairinoReadOnlyWorker.cpp
+    src/FairinoReadOnlyWorker.h
+    src/FairinoRobotSession.cpp
+    src/FairinoRobotSession.h
+)
+target_include_directories(FairinoRobotBackend PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(FairinoRobotBackend PUBLIC
+    HikSynchronizationCore
+    Qt5::Core
+    pthread
+)
+
 add_executable(HikLineLaserCalibration
     src/main.cpp
     src/HikCalibrationWindow.cpp
     src/HikCalibrationWindow.h
     src/ImageView.cpp
     src/ImageView.h
-    src/FairinoReadOnlyWorker.cpp
-    src/FairinoReadOnlyWorker.h
 )
 target_include_directories(HikLineLaserCalibration PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -104,9 +166,11 @@ target_compile_definitions(HikLineLaserCalibration PRIVATE
     HIK_CALIBRATION_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_link_libraries(HikLineLaserCalibration PRIVATE
+    LineLaserDeviceProfile
     HikCalibrationCore
     HikSynchronizationCore
     HikCameraBackend
+    FairinoRobotBackend
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets
@@ -120,8 +184,6 @@ add_executable(HikConstantLaserScan
     src/HikConstantLaserScanWindow.h
     src/ImageView.cpp
     src/ImageView.h
-    src/FairinoReadOnlyWorker.cpp
-    src/FairinoReadOnlyWorker.h
 )
 target_include_directories(HikConstantLaserScan PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -131,10 +193,13 @@ target_compile_definitions(HikConstantLaserScan PRIVATE
     HIK_CALIBRATION_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_link_libraries(HikConstantLaserScan PRIVATE
+    LineLaserDeviceProfile
+    LineLaserControl
     HikCalibrationCore
     HikContinuousReconstruction
     HikSynchronizationCore
     HikCameraBackend
+    FairinoRobotBackend
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets
@@ -207,12 +272,9 @@ if(FAIRINO_INCLUDE_DIR AND FAIRINO_LIBRARY)
         endif()
     endif()
     message(STATUS "Fairino SDK: ${FAIRINO_LIBRARY}")
-    target_compile_definitions(HikLineLaserCalibration PRIVATE HAVE_FAIRINO_SDK=1)
-    target_compile_definitions(HikConstantLaserScan PRIVATE HAVE_FAIRINO_SDK=1)
-    target_include_directories(HikLineLaserCalibration PRIVATE "${FAIRINO_INCLUDE_DIR}")
-    target_include_directories(HikConstantLaserScan PRIVATE "${FAIRINO_INCLUDE_DIR}")
-    target_link_libraries(HikLineLaserCalibration PRIVATE "${FAIRINO_LIBRARY}")
-    target_link_libraries(HikConstantLaserScan PRIVATE "${FAIRINO_LIBRARY}")
+    target_compile_definitions(FairinoRobotBackend PRIVATE HAVE_FAIRINO_SDK=1)
+    target_include_directories(FairinoRobotBackend PRIVATE "${FAIRINO_INCLUDE_DIR}")
+    target_link_libraries(FairinoRobotBackend PRIVATE "${FAIRINO_LIBRARY}")
     get_filename_component(FAIRINO_LIBRARY_DIR "${FAIRINO_LIBRARY}" DIRECTORY)
     set_property(TARGET HikLineLaserCalibration APPEND PROPERTY
         BUILD_RPATH "${FAIRINO_LIBRARY_DIR}")
@@ -233,41 +295,100 @@ if(OpenCV_VERSION VERSION_GREATER_EQUAL "4.6.0")
         "refusing to build rather than writing mislabeled calibration files.")
 endif()
 
-enable_testing()
-add_executable(HikCalibrationCoreTest
-    tests/test_hik_calibration_core.cpp
-)
-target_include_directories(HikCalibrationCoreTest PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    ${OpenCV_INCLUDE_DIRS}
-)
-target_link_libraries(HikCalibrationCoreTest PRIVATE
-    HikCalibrationCore
-    ${OpenCV_LIBS}
-)
-add_test(NAME HikCalibrationCoreTest COMMAND HikCalibrationCoreTest)
+if(BUILD_TESTING)
+    add_executable(HikCalibrationCoreTest
+        tests/test_hik_calibration_core.cpp
+    )
+    target_include_directories(HikCalibrationCoreTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(HikCalibrationCoreTest PRIVATE
+        HikCalibrationCore
+        ${OpenCV_LIBS}
+    )
+    add_test(NAME HikCalibrationCoreTest COMMAND HikCalibrationCoreTest)
 
-add_executable(HikSynchronizationCoreTest
-    tests/test_hik_synchronization_core.cpp
-)
-target_include_directories(HikSynchronizationCoreTest PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
-target_link_libraries(HikSynchronizationCoreTest PRIVATE
-    HikSynchronizationCore
-    Eigen3::Eigen
-)
-add_test(NAME HikSynchronizationCoreTest COMMAND HikSynchronizationCoreTest)
+    add_executable(StripeCenterlineExtractorTest
+        tests/test_stripe_centerline_extractor.cpp
+    )
+    target_include_directories(StripeCenterlineExtractorTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(StripeCenterlineExtractorTest PRIVATE
+        StripeCenterlineExtractor
+        ${OpenCV_LIBS}
+    )
+    add_test(
+        NAME StripeCenterlineExtractorTest
+        COMMAND StripeCenterlineExtractorTest)
 
-add_executable(HikContinuousReconstructionTest
-    tests/test_hik_continuous_reconstruction.cpp
-)
-target_include_directories(HikContinuousReconstructionTest PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
-target_link_libraries(HikContinuousReconstructionTest PRIVATE
-    HikContinuousReconstruction
-    Eigen3::Eigen
-)
-add_test(NAME HikContinuousReconstructionTest
-         COMMAND HikContinuousReconstructionTest)
+    add_executable(HikScanCoreTest
+        tests/test_hik_scan_core.cpp
+    )
+    target_include_directories(HikScanCoreTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(HikScanCoreTest PRIVATE
+        HikCalibrationCore
+        ${OpenCV_LIBS}
+    )
+    add_test(NAME HikScanCoreTest COMMAND HikScanCoreTest)
+
+    add_executable(HikSynchronizationCoreTest
+        tests/test_hik_synchronization_core.cpp
+    )
+    target_include_directories(HikSynchronizationCoreTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_link_libraries(HikSynchronizationCoreTest PRIVATE
+        HikSynchronizationCore
+        Eigen3::Eigen
+    )
+    add_test(NAME HikSynchronizationCoreTest COMMAND HikSynchronizationCoreTest)
+
+    add_executable(LineLaserDeviceProfileTest
+        tests/test_line_laser_device_profile.cpp
+    )
+    target_link_libraries(LineLaserDeviceProfileTest PRIVATE
+        LineLaserDeviceProfile
+        Qt5::Core
+    )
+    add_test(NAME LineLaserDeviceProfileTest COMMAND LineLaserDeviceProfileTest)
+
+    add_executable(LineLaserControllerTest
+        tests/test_line_laser_controller.cpp
+    )
+    target_link_libraries(LineLaserControllerTest PRIVATE
+        LineLaserControl
+        Qt5::Core
+        Qt5::Test
+    )
+    add_test(NAME LineLaserControllerTest COMMAND LineLaserControllerTest)
+
+    add_executable(FairinoRobotSessionTest
+        tests/test_fairino_robot_session.cpp
+    )
+    target_link_libraries(FairinoRobotSessionTest PRIVATE
+        FairinoRobotBackend
+        Qt5::Core
+        Qt5::Test
+    )
+    add_test(NAME FairinoRobotSessionTest
+             COMMAND FairinoRobotSessionTest)
+
+    add_executable(HikContinuousReconstructionTest
+        tests/test_hik_continuous_reconstruction.cpp
+    )
+    target_include_directories(HikContinuousReconstructionTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_link_libraries(HikContinuousReconstructionTest PRIVATE
+        HikContinuousReconstruction
+        Eigen3::Eigen
+    )
+    add_test(NAME HikContinuousReconstructionTest
+             COMMAND HikContinuousReconstructionTest)
+endif()
