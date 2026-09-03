@@ -170,6 +170,8 @@ struct SynchronizedFrame {
     double actualScanSpeedMmS{0.0};
     double filteredScanSpeedMmS{0.0};
     MotionPhase motionPhase{MotionPhase::WARMUP};
+    int measurementSegmentId{-1};
+    bool measurementActive{true};
     SyncQuality quality{SyncQuality::ROBOT_DATA_NOT_READY};
     std::shared_ptr<ImageBuffer> image;
     std::string imageFilename;
@@ -222,8 +224,8 @@ struct SynchronizationConfig {
     std::string outputDirectory{"./data/scan"};
     std::size_t writerQueueCapacity{8192U};
     std::size_t imageWriterThreads{2U};
-    std::size_t reconstructionQueueCapacity{64U};
-    std::size_t reconstructionThreads{2U};
+    std::size_t reconstructionQueueCapacity{256U};
+    std::size_t reconstructionThreads{4U};
 
     bool validate(std::string* error = nullptr) const;
     static bool loadYaml(const std::string& path,
@@ -402,6 +404,15 @@ struct PipelineStatistics {
     ClockFitReport robotClockFit;
 };
 
+struct MeasurementSegmentGate {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    int segmentId{-1};
+    Eigen::Vector3d measurementStartMm{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d measurementEndMm{Eigen::Vector3d::Zero()};
+    double lateralToleranceMm{2.0};
+};
+
 // Threaded camera/robot association and writer pipeline. pushCamera() and
 // pushRobot() are bounded, non-blocking callback entry points.
 class SynchronizationSession {
@@ -413,6 +424,22 @@ public:
                const std::string& sessionDirectory,
                const Eigen::Matrix4d* flangeFromCamera,
                std::string* error = nullptr);
+
+    // Optional explicit measurement gate for multi-segment scans. When a
+    // gate is configured, frames outside the start/end corridor or while the
+    // gate is suspended are labeled OUTSIDE_VALID_SCAN_SEGMENT and never
+    // reach formal reconstruction.
+    bool configureMeasurementSegment(
+        int segmentId,
+        const Eigen::Vector3d& measurementStartMm,
+        const Eigen::Vector3d& measurementEndMm,
+        double lateralToleranceMm,
+        std::string* error = nullptr);
+    bool configureMeasurementSegments(
+        const std::vector<MeasurementSegmentGate>& gates,
+        std::string* error = nullptr);
+    void suspendMeasurementSegment();
+    void clearMeasurementSegmentGate();
     bool pushCamera(CameraFrame frame);
     bool pushRobot(RobotSample sample);
     void noteImagePoolExhaustion();

@@ -1,0 +1,10 @@
+octomap_builder:
+  ros__parameters:
+    input_cloud_topic: /welding_robot/stereo/points
+    map_frame: base_link
+    resolution_m: 0.02
+    minimum_range_m: 0.25
+    maximum_range_m: 3.5
+    publish_period_seconds: 1.0
+    self_filter_valid: false
+    output_bt_path: ""

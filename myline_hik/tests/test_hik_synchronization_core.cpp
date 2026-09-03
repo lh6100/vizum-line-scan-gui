@@ -191,8 +191,8 @@ void testConfigurationAndControllerTime() {
                near(config.robotExpectedFeedbackPeriodMs, 12.0, 0.0) &&
                near(config.robotWarningGapMs, 18.0, 0.0) &&
                near(config.robotInvalidGapMs, 25.0, 0.0) &&
-               config.reconstructionQueueCapacity == 64U &&
-               config.reconstructionThreads == 2U,
+               config.reconstructionQueueCapacity == 256U &&
+               config.reconstructionThreads == 4U,
                "10 ms CNDE request uses measured 12 ms feedback thresholds");
     std::string error;
     config.scanSpeedMmS = 10.0;
@@ -223,6 +223,29 @@ void testConfigurationAndControllerTime() {
     CHECK_TRUE(mapper.activeMode() == hik_sync::RobotTimeMode::ControllerTimestamp &&
                mapper.report().stable,
                "controller RobotTime affine mapping becomes active");
+}
+
+void testFormalSynchronizationConfigurations() {
+    const std::filesystem::path sourceRoot(HIK_CALIBRATION_SOURCE_DIR);
+    const std::array<std::filesystem::path, 2> paths = {
+        sourceRoot / "config/devices/scanner_450/synchronization.yaml",
+        sourceRoot / "config/devices/scanner_650/synchronization.yaml"
+    };
+    for (const std::filesystem::path& path : paths) {
+        hik_sync::SynchronizationConfig config;
+        std::string error;
+        CHECK_TRUE(
+            hik_sync::SynchronizationConfig::loadYaml(
+                path.string(), &config, &error),
+            std::string("formal synchronization configuration loads: ") +
+                path.string() + ": " + error);
+        CHECK_TRUE(
+            near(config.cameraTargetFps, 60.0, 0.0) &&
+                near(config.scanSpeedMmS, 10.0, 0.0) &&
+                near(config.robotExpectedFeedbackPeriodMs, 12.0, 0.0),
+            std::string("formal synchronization baseline changed: ") +
+                path.string());
+    }
 }
 
 void testSyntheticPipeline() {
@@ -481,6 +504,165 @@ void testContiguousSdkPacketsAllow21MsControllerGap() {
     std::filesystem::remove_all(output, removeError);
 }
 
+hik_sync::SynchronizedFrame runMeasurementGateCase(
+        const Eigen::Vector3d& start,
+        const Eigen::Vector3d& end,
+        double toleranceMm,
+        double targetX,
+        double targetY,
+        bool suspended,
+        bool configureSecondLane = false) {
+    hik_sync::SynchronizationConfig config;
+    config.robotTimeMode = hik_sync::RobotTimeMode::HostReceive;
+    config.scanSpeedMmS = 10.0;
+    config.scanStableSampleCount = 3;
+    config.saveImages = false;
+    config.saveRobotRawCsv = false;
+    config.saveCameraRawCsv = false;
+    config.saveSyncCsv = false;
+    const std::filesystem::path output =
+        std::filesystem::temp_directory_path() /
+        ("hik_sync_gate_test_" +
+         std::to_string(hik_sync::getMonotonicRawNs()));
+    hik_sync::SynchronizationSession session;
+    std::string error;
+    CHECK_TRUE(session.start(config, output.string(), nullptr, &error),
+               std::string("measurement-gate session starts: ") + error);
+    if (configureSecondLane) {
+        hik_sync::MeasurementSegmentGate first;
+        first.segmentId = 17;
+        first.measurementStartMm = start;
+        first.measurementEndMm = end;
+        first.lateralToleranceMm = toleranceMm;
+        hik_sync::MeasurementSegmentGate second = first;
+        second.segmentId = 18;
+        second.measurementStartMm.y() += 2.0;
+        second.measurementEndMm.y() += 2.0;
+        CHECK_TRUE(session.configureMeasurementSegments(
+                       {first, second}, &error),
+                   std::string("measurement gate list configures: ") +
+                       error);
+    } else {
+        CHECK_TRUE(session.configureMeasurementSegment(
+                       17, start, end, toleranceMm, &error),
+                   std::string("measurement gate configures: ") +
+                       error);
+    }
+    if (suspended) session.suspendMeasurementSegment();
+
+    std::mutex outputMutex;
+    std::vector<hik_sync::SynchronizedFrame,
+                Eigen::aligned_allocator<hik_sync::SynchronizedFrame>>
+        synchronized;
+    session.setSynchronizedFrameCallback(
+        [&outputMutex, &synchronized](
+                const hik_sync::SynchronizedFrame& frame) {
+            std::lock_guard<std::mutex> lock(outputMutex);
+            synchronized.push_back(frame);
+        });
+    const int64_t base =
+        hik_sync::getMonotonicRawNs() + 100000000LL;
+    const int64_t midpoint = base + 155000000LL;
+    for (uint64_t index = 0U; index <= 31U; ++index) {
+        const int64_t timestamp =
+            base + static_cast<int64_t>(index) * 10000000LL;
+        const double x = targetX +
+            10.0 * static_cast<double>(timestamp - midpoint) / 1.0e9;
+        hik_sync::RobotSample robot =
+            sampleAt(index + 1U, timestamp, x, 10.0);
+        robot.flangePositionMm.y() = targetY;
+        robot.flangePoseRaw[1] = targetY;
+        robot.sdkReceiveSequence = index + 1U;
+        session.pushRobot(robot);
+    }
+    hik_sync::CameraFrame camera;
+    camera.frameId = 1U;
+    camera.hostCallbackNs = midpoint + 1000000LL;
+    camera.exposureUs = 2000.0;
+    session.pushCamera(camera);
+    session.stop();
+    CHECK_TRUE(synchronized.size() == 1U,
+               "measurement gate emits one associated frame");
+    std::error_code removeError;
+    std::filesystem::remove_all(output, removeError);
+    return synchronized.empty()
+        ? hik_sync::SynchronizedFrame()
+        : synchronized.front();
+}
+
+void testMeasurementSegmentGate() {
+    const Eigen::Vector3d forwardStart(4.0, 2.0, 3.0);
+    const Eigen::Vector3d forwardEnd(6.0, 2.0, 3.0);
+    const hik_sync::SynchronizedFrame inside =
+        runMeasurementGateCase(
+            forwardStart, forwardEnd, 0.10, 5.0, 2.0, false);
+    CHECK_TRUE(
+        inside.measurementActive &&
+        inside.measurementSegmentId == 17 &&
+        inside.quality !=
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "inside point is published with its measurement segment id");
+
+    const hik_sync::SynchronizedFrame reverse =
+        runMeasurementGateCase(
+            forwardEnd, forwardStart, 0.10, 5.0, 2.0, false);
+    CHECK_TRUE(
+        reverse.measurementActive &&
+        reverse.measurementSegmentId == 17 &&
+        reverse.quality !=
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "reversed snake lane uses the same inclusive spatial gate");
+
+    const hik_sync::SynchronizedFrame beyond =
+        runMeasurementGateCase(
+            forwardStart, forwardEnd, 0.10, 7.0, 2.0, false);
+    CHECK_TRUE(
+        !beyond.measurementActive &&
+        beyond.quality ==
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "lead-out point beyond the lane is not formal evidence");
+
+    const hik_sync::SynchronizedFrame lateral =
+        runMeasurementGateCase(
+            forwardStart, forwardEnd, 0.10, 5.0, 2.5, false);
+    CHECK_TRUE(
+        !lateral.measurementActive &&
+        lateral.quality ==
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "lateral transition outside tolerance is not formal evidence");
+
+    const hik_sync::SynchronizedFrame suspended =
+        runMeasurementGateCase(
+            forwardStart, forwardEnd, 0.10, 5.0, 2.0, true);
+    CHECK_TRUE(
+        !suspended.measurementActive &&
+        suspended.measurementSegmentId == -1 &&
+        suspended.quality ==
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "explicit transition suspension rejects even geometrically inside points");
+
+    const hik_sync::SynchronizedFrame secondLane =
+        runMeasurementGateCase(
+            forwardStart, forwardEnd, 0.10, 5.0, 4.0,
+            false, true);
+    CHECK_TRUE(
+        secondLane.measurementActive &&
+        secondLane.measurementSegmentId == 18 &&
+        secondLane.quality !=
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "pre-submitted trajectory selects the matching lane gate");
+
+    const hik_sync::SynchronizedFrame betweenLanes =
+        runMeasurementGateCase(
+            forwardStart, forwardEnd, 0.10, 5.0, 3.0,
+            false, true);
+    CHECK_TRUE(
+        !betweenLanes.measurementActive &&
+        betweenLanes.quality ==
+            hik_sync::SyncQuality::OUTSIDE_VALID_SCAN_SEGMENT,
+        "MoveC transition between preconfigured lanes remains unpublished");
+}
+
 }  // namespace
 
 int main() {
@@ -491,10 +673,12 @@ int main() {
     testCameraClockMapping();
     testExposureAndSpeed();
     testConfigurationAndControllerTime();
+    testFormalSynchronizationConfigurations();
     testSyntheticPipeline();
     testRobotPacketsDoNotDependOnFrameCounter();
     testSdkPacketSequenceGapInvalidatesInterpolation();
     testContiguousSdkPacketsAllow21MsControllerGap();
+    testMeasurementSegmentGate();
     if (failures != 0) {
         std::cerr << failures << " synchronization test(s) failed\n";
         return 1;

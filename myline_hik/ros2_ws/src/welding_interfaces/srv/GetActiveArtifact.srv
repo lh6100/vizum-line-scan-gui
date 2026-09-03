@@ -1,0 +1,4 @@
+---
+bool active
+welding_interfaces/ArtifactRef artifact
+string error

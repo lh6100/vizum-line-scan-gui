@@ -1,0 +1,6 @@
+cartesian_limits:
+  # A 0.2 velocity scaling produces the default 10 mm/s process speed.
+  max_trans_vel: 0.05
+  max_trans_acc: 0.10
+  max_trans_dec: -0.10
+  max_rot_vel: 0.35

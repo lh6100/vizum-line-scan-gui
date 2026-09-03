@@ -1,0 +1,18 @@
+string session_id
+string plan_id
+string approval_id
+string trajectory_digest
+welding_interfaces/PlanDependencies dependencies
+trajectory_msgs/JointTrajectory trajectory
+bool dry_run
+float64 speed_scale
+---
+bool success
+string execution_id
+string result
+string error
+---
+float32 progress
+uint32 current_point
+string state
+string detail

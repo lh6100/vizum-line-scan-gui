@@ -1,0 +1,7 @@
+string session_id
+string result
+string summary_yaml
+---
+bool success
+string manifest_path
+string error

@@ -1,0 +1,30 @@
+stereo_depth:
+  ros__parameters:
+    left_topic: /welding_robot/camera_650/image_raw
+    right_topic: /welding_robot/camera_450/image_raw
+    left_optical_frame: camera_650_optical_frame
+    expected_calibration_package_id: ""
+    stereo_yaml: ""
+    left_intrinsics_yaml: ""
+    left_handeye_yaml: ""
+    right_intrinsics_yaml: ""
+    right_handeye_yaml: ""
+    processing_width: 612
+    processing_height: 524
+    minimum_depth_mm: 300.0
+    maximum_depth_mm: 2500.0
+    block_size: 5
+    uniqueness_ratio: 5
+    speckle_window_size: 50
+    speckle_range: 2
+    left_right_maximum_difference_px: 2
+    disparity_margin_px: 16
+    maximum_num_disparities: 512
+    enable_left_right_check: false
+    enable_clahe: true
+    clahe_clip_limit: 10.0
+    multi_band_enabled: true
+    multi_band_minimum_depths_mm: [300.0, 600.0, 1200.0]
+    multi_band_maximum_depths_mm: [600.0, 1200.0, 2500.0]
+    point_stride: 2
+    minimum_valid_fraction: 0.02

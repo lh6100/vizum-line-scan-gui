@@ -1,0 +1,12 @@
+schema_version: 2
+package_id: example_candidate_replace_me
+status: candidate
+created_at: "1970-01-01T00:00:00Z"
+files:
+  camera_650_intrinsics: {path: hik_intrinsics_650.yaml, sha256: REPLACE_WITH_SHA256}
+  camera_450_intrinsics: {path: hik_intrinsics_450.yaml, sha256: REPLACE_WITH_SHA256}
+  camera_650_handeye: {path: hik_handeye_650.yaml, sha256: REPLACE_WITH_SHA256}
+  camera_450_handeye: {path: hik_handeye_450.yaml, sha256: REPLACE_WITH_SHA256}
+  stereo_extrinsics: {path: hik_stereo.yaml, sha256: REPLACE_WITH_SHA256}
+  laser_650_plane: {path: hik_laser_plane_650.yaml, sha256: REPLACE_WITH_SHA256}
+  laser_450_plane: {path: hik_laser_plane_450.yaml, sha256: REPLACE_WITH_SHA256}

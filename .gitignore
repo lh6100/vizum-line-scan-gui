@@ -18,8 +18,15 @@ ui_*.h
 
 # Runtime output
 data/
+myline_hik/log/
+myline_hik/models/
+myline_hik/repoter/
+myline_hik/ros2_ws/build/
+myline_hik/ros2_ws/install/
+myline_hik/ros2_ws/log/
 isaacSim/generated/
 SDK/fairino-cpp-sdk-3.9.4/
+SDK/frcobot_ros2-master/
 SDK/*.zip
 SDK/DetectLaser_3.6.20.116_Windows&Linux&ARM/
 SDK/MulDetectLaser_3.6.20.110_All/
@@ -31,8 +38,22 @@ VizumLog/
 __pycache__/
 *.py[cod]
 
-# Keep the FR5 ROS 2 sources, launch files, and documentation in git. The
-# nested ros2_fr5/.gitignore excludes colcon output.
+# Large local experiments and working notes are intentionally outside the
+# deliverable (myline_hik + ros2_fr5). Keep them on the workstation without
+# accidentally publishing them with a broad `git add`.
+/00paper/
+/01weldVersion/
+/VRLSRS/
+/depth_anything_v3_deepstream/
+/researchwrite/
+/1.md
+/docs/广船/
+/isaacSim/fr5_welding_project_isaac6/
+/isaacSim/narrow-space-welding/
+
+# Keep our FR5 ROS 2 sources, launch files, and documentation in git. The
+# official FAIRINO checkout is reproducibly fetched at build time.
+/ros2_fr5/frcobot_ros2-master/
 
 # Editor and OS files
 .vscode/
@@ -40,3 +61,4 @@ __pycache__/
 *.swp
 *~
 .DS_Store
+.env.local

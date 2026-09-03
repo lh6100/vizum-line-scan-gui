@@ -1,0 +1,31 @@
+hik_stereo_camera:
+  ros__parameters:
+    left_ip: 192.168.7.45
+    left_expected_serial: DA8784601
+    left_frame_id: camera_650_optical_frame
+    left_topic: /welding_robot/camera_650/image_raw
+    right_ip: 192.168.1.46
+    right_expected_serial: DB0403208
+    right_frame_id: camera_450_optical_frame
+    right_topic: /welding_robot/camera_450/image_raw
+    exposure_us: 1825.0
+    gain_db: 0.0
+    frames_per_second: 30.0
+    maximum_pair_skew_ms: 5.0
+
+line_laser_safety:
+  ros__parameters:
+    host: 192.168.1.12
+    port: 22
+    user: laserctl
+    private_key_path: ""
+    known_hosts_path: ""
+    command_timeout_ms: 1200
+    maximum_local_lease_ms: 5000
+
+robot_feedback_bridge:
+  ros__parameters:
+    pose_topic: /fairino/flange_pose
+    joint_state_topic: /joint_states
+    output_topic: /welding_robot/robot_feedback
+    maximum_age_seconds: 0.15

@@ -1,0 +1,12 @@
+# Load this file into move_group after the complete FR5 + sensor-rig
+# robot_description is available. PointCloudOctomapUpdater removes points that
+# fall inside robot collision links and publishes its filtered cloud for audit.
+sensors:
+  - sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+    point_cloud_topic: /welding_robot/stereo/points
+    max_range: 3.5
+    point_subsample: 2
+    padding_offset: 0.03
+    padding_scale: 1.05
+    max_update_rate: 2.0
+    filtered_cloud_topic: /welding_robot/map/self_filtered_points

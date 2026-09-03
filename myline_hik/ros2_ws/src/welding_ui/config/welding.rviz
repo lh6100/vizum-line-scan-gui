@@ -1,0 +1,78 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: 工位网格
+      Enabled: true
+      Cell Size: 0.1
+      Plane: XY
+    - Class: rviz_default_plugins/RobotModel
+      Name: 机械臂与焊枪夹具
+      Enabled: true
+      Description Topic: /robot_description
+      Visual Enabled: true
+      Collision Enabled: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 双目实时点云
+      Enabled: true
+      Topic:
+        Value: /welding_robot/stereo/points
+      Size (Pixels): 2
+      Style: Points
+      Color Transformer: AxisColor
+      Decay Time: 2
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 线扫或离线点云
+      Enabled: true
+      Topic:
+        Value: /welding_robot/offline_cloud
+      Size (Pixels): 2
+      Style: Points
+      Color Transformer: AxisColor
+    - Class: rviz_default_plugins/Path
+      Name: 计划扫描路径
+      Enabled: true
+      Topic:
+        Value: /welding_robot/planning/scan_path
+      Line Style: Lines
+      Line Width: 0.01
+    - Class: rviz_default_plugins/Path
+      Name: 计划焊接路径
+      Enabled: true
+      Topic:
+        Value: /welding_robot/planning/weld_path
+      Line Style: Lines
+      Line Width: 0.012
+    - Class: moveit_rviz_plugin/MotionPlanning
+      Name: MoveIt规划与碰撞场景
+      Enabled: true
+      Planning Scene Topic: /planning_scene
+  Enabled: true
+  Global Options:
+    Background Color: 35; 35; 38
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2.5
+      Pitch: 0.55
+      Yaw: 0.75
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.5
+Window Geometry:
+  Width: 1500
+  Height: 920

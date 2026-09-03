@@ -1,0 +1,17 @@
+string session_id
+string calibration_package_id
+string backend
+bool execute_observation_path
+bool dry_run
+---
+bool success
+string scene_map_id
+uint64 scene_map_version
+string report_path
+string error
+---
+float32 progress
+string state
+string detail
+uint64 input_frames
+uint64 occupied_voxels

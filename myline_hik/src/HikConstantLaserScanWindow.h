@@ -1,6 +1,9 @@
 #ifndef MYLINE_HIK_HIK_CONSTANT_LASER_SCAN_WINDOW_H
 #define MYLINE_HIK_HIK_CONSTANT_LASER_SCAN_WINDOW_H
 
+#include "AdaptiveScanExecutor.h"
+#include "AdaptiveScanPlanner.h"
+#include "Fr5PathEvaluator.h"
 #include "HikCalibrationCore.h"
 #include "HikContinuousReconstruction.h"
 #include "HikScanCore.h"
@@ -16,7 +19,11 @@
 
 #include <atomic>
 #include <cstddef>
+#include <map>
 #include <memory>
+#include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 class DirectCallbackGate;
@@ -25,10 +32,13 @@ class HikCameraWorker;
 class ImageView;
 class QCheckBox;
 class QCloseEvent;
+class QComboBox;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
+class QProgressBar;
 class QPushButton;
 class QSpinBox;
 class QTableWidget;
@@ -42,7 +52,8 @@ public:
                                         LineLaserController* laserController,
                                         FairinoRobotSession* robotSession,
                                         QWidget* parent = nullptr,
-                                        double scanSpeedOverrideMmS = -1.0);
+                                        double scanSpeedOverrideMmS = -1.0,
+                                        bool useDeviceCalibrationAsIs = false);
     ~HikConstantLaserScanWindow() override;
 
     const LineLaserDeviceProfile& deviceProfile() const { return profile_; }
@@ -73,6 +84,10 @@ signals:
                                    double speedMmS,
                                    double accelerationMmS2,
                                    int timeoutMs);
+    void requestExecuteAdaptiveTrajectory(
+        int requestId,
+        std::vector<hik_adaptive::ScanSegment> segments,
+        int timeoutMs);
     void requestStopMotion(int requestId);
 
 protected:
@@ -86,6 +101,7 @@ private slots:
     void readCurrentPose();
     void teachStart();
     void teachEnd();
+    void swapPathEndpoints();
     void editStartPose();
     void editEndPose();
     void generateDryRun();
@@ -93,9 +109,14 @@ private slots:
     void startScan();
     void stopScan();
     void startContinuousScan();
+    void generateAdaptiveGlobalPlan();
+    void evaluateAdaptiveGlobalPlan();
+    void startAdaptiveGlobalScan();
+    void planAdaptiveLocalRescan();
     void reloadCalibration();
     void connectLaserController();
     void enableProfileLaser();
+    void enableBothLasers();
     void disableAllLasers();
 
     void onCameraConnectionChanged(bool connected, QString description);
@@ -113,6 +134,7 @@ private slots:
                                    QString timestampDescription);
     void onContinuousCameraStopped(bool confirmed, QString description);
     void onContinuousFrameRejected(quint64 frameNo, QString reason);
+    void onContinuousFinalizationFinished();
 
     void onRobotConnectionChanged(bool connected, QString description);
     void onRobotBusyChanged(bool busy);
@@ -125,9 +147,18 @@ private slots:
                                bool targetReached,
                                bool motionStoppedConfirmed,
                                QString description);
+    void onRobotMotionTimingMeasured(int requestId,
+                                     qint64 elapsedMs,
+                                     bool targetReached);
     void onRobotLog(QString message);
     void onRobotError(int requestId, QString message);
     void onRobotClientError(int clientId, QString message);
+    void onKinematicPathEvaluated(
+        int requestId,
+        int actionId,
+        hik_adaptive::RobotPathEvaluation evaluation);
+    void onKinematicPathBatchFinished(
+        int requestId, bool completed, QString description);
     void onLaserConnectionStateChanged(LineLaserConnectionState state,
                                        QString detail);
     void onLaserStatusChanged(LineLaserStatus status);
@@ -137,14 +168,52 @@ private slots:
 
 private:
     enum class ScanState { Idle, Moving, Settling, ReadingBefore, Capturing, ReadingAfter };
-    enum class ContinuousState { Idle, MovingToStart, StartingCamera, Scanning, Stopping };
-    enum class ReadRole { None, Manual, TeachStart, TeachEnd, ScanBefore, ScanAfter };
+    enum class ContinuousState {
+        Idle,
+        MovingToStart,
+        StartingCamera,
+        Scanning,
+        Stopping,
+        Finalizing
+    };
+    enum class ReadRole {
+        None,
+        Manual,
+        TeachStart,
+        TeachEnd,
+        ScanBefore,
+        ScanAfter,
+        AdaptiveGlobalEvaluation,
+        AdaptiveLocalEvaluation,
+        AdaptiveExecutionPreflight
+    };
+    enum class AdaptiveEvaluationMode {
+        None,
+        Global,
+        Local
+    };
 
     struct PoseReading {
         bool valid{false};
         hik_scan::Pose6D pose;
         cv::Matx44d baseFromFlange{cv::Matx44d::eye()};
         qint64 hostTimestampMs{0};
+    };
+
+    struct ContinuousFinalizationContext {
+        bool completed{false};
+        QString reason;
+        bool sessionStarted{false};
+        hik_sync::PipelineStatistics synchronizationStatistics;
+        QString synchronizationMode;
+        bool reconstructionWasRunning{false};
+    };
+
+    struct ContinuousFinalizationResult {
+        hik_scan::ContinuousReconstructionStatistics statistics;
+        std::string error;
+        bool cloudSaved{false};
+        hik_scan::ContinuousReconstructionArtifacts artifacts;
     };
 
     struct ProfileRow {
@@ -161,16 +230,26 @@ private:
         double stripeSaturatedRatio{0.0};
         double translationDeltaMm{0.0};
         double rotationDeltaDeg{0.0};
+        bool qualityAnalysisCompleted{false};
         bool qualityExtractionPassed{false};
+        bool multipathAuditOnly{false};
         int legacyPointCount{0};
         int qualityPointCount{0};
+        int ambiguityMaskedLegacyPointCount{0};
+        int publicationGateRejectedPointCount{0};
         int qualityCandidateCount{0};
         int qualityAcceptedCandidateCount{0};
+        int qualityPathUsableCandidateCount{0};
         int qualityRejectedCandidateCount{0};
+        int qualityProvisionalPointCount{0};
+        int qualityPublishablePointCount{0};
         int qualitySelectedPointCount{0};
         int qualitySelectedGapCount{0};
         int qualityMultiPeakScanlineCount{0};
         int qualityAmbiguousPathPointCount{0};
+        int qualityMultipathIntervalCount{0};
+        int qualityMultipathAmbiguousScanlineCount{0};
+        int qualityMultipathCandidatePointCount{0};
         int qualityRejectedLowProminenceCount{0};
         int qualityRejectedWidthCount{0};
         int qualityRejectedSaturationCount{0};
@@ -223,6 +302,8 @@ private:
     bool acquireScanActivity(QString* error);
     void releaseScanActivity();
     bool loadFormalCalibration(QString* error);
+    bool applyConfiguredReconstructionDepthRange(QString* error);
+    void updateCalibrationStatusText();
     bool formalCalibrationFilesUnchanged(QString* error) const;
     bool calibrationIdentityMatches(QString* error) const;
     bool editPoseDialog(hik_scan::Pose6D* pose,
@@ -237,6 +318,26 @@ private:
     void abortScan(const QString& reason, bool requestStop);
     void abortContinuousScan(const QString& reason, bool requestStop);
     void finalizeContinuousScan(bool completed, const QString& reason);
+    void completeContinuousFinalization();
+    void updateContinuousFinalizationProgress(
+        int percent, const QString& stage);
+    LineLaserCenterlinePolicy selectedScanCenterlinePolicy() const;
+    void applySelectedScanCenterlinePolicy(bool announce);
+    bool adaptiveQualityMappingSelected() const;
+    void clearAdaptiveQualityArtifacts();
+    bool buildAdaptiveSerpentinePlan(
+        hik_adaptive::ScanPlan* plan, QString* error) const;
+    bool loadAdaptiveScanConfig(QString* error);
+    void dispatchAdaptiveCommand(
+        const hik_adaptive::AdaptiveScanExecutor::Command& command);
+    bool buildAdaptiveQualityAndCandidates(QString* error);
+    void startAdaptiveGlobalEvaluation(const hik_scan::Pose6D& currentPose);
+    void beginAdaptiveGlobalExecutionAfterPreflight(
+        const PoseReading& currentPose);
+    void startAdaptiveLocalEvaluation(const hik_scan::Pose6D& currentPose);
+    void finishAdaptiveLocalPlanning();
+    bool saveAdaptivePlanArtifact(QString* outputPath = nullptr,
+                                  QString* error = nullptr) const;
     bool createSynchronizationSession(QString* error);
     bool createScanSession(QString* error);
     bool appendManifest(const ProfileRow& row,
@@ -258,6 +359,7 @@ private:
     const LineLaserDeviceProfile profile_;
     LineLaserController* const laserController_;
     FairinoRobotSession* const robotSession_;
+    const bool useDeviceCalibrationAsIs_{false};
     int robotClientId_{0};
     QString sourceDir_;
     bool shuttingDown_{false};
@@ -293,7 +395,57 @@ private:
     hik_scan::ContinuousReconstructionPipeline continuousReconstruction_;
     ContinuousState continuousState_{ContinuousState::Idle};
     bool continuousAbortRequested_{false};
+    bool continuousAdaptiveQualityModeActive_{false};
+    bool continuousFinalizationActive_{false};
+    bool closeAfterContinuousFinalization_{false};
+    std::thread continuousFinalizationThread_;
+    ContinuousFinalizationContext continuousFinalizationContext_;
+    ContinuousFinalizationResult continuousFinalizationResult_;
     QString synchronizationSessionDir_;
+    hik_adaptive::AdaptiveScanExecutor adaptiveExecutor_;
+    QString adaptiveConfigPath_;
+    bool adaptiveConfigReady_{false};
+    hik_adaptive::SerpentineOptions adaptiveSerpentineDefaults_;
+    hik_adaptive::QualityMapOptions adaptiveQualityMapOptions_;
+    hik_adaptive::RoiClusteringOptions adaptiveRoiOptions_;
+    hik_adaptive::CandidateLibraryOptions
+        adaptiveCandidateOptions_;
+    hik_adaptive::SearchOptions adaptiveSearchOptions_;
+    hik_fr5::PathEvaluationOptions adaptiveFr5Options_;
+    std::vector<double> adaptiveExposureScales_{0.5, 1.0};
+    std::size_t adaptiveMaximumCandidateRois_{8U};
+    std::size_t adaptiveShortlistSize_{12U};
+    int adaptiveMaximumCandidatesPerRoi_{3};
+    hik_adaptive::ScanPlan adaptiveGlobalPlan_;
+    bool adaptiveGlobalPlanReady_{false};
+    bool adaptiveGlobalKinematicsPassed_{false};
+    bool adaptiveGlobalExecutionActive_{false};
+    hik_scan::ContinuousReconstructionArtifacts
+        lastContinuousArtifacts_;
+    hik_adaptive::QualityMap adaptiveQualityMap_;
+    std::vector<hik_adaptive::RescanRoi> adaptiveRois_;
+    std::vector<hik_adaptive::CandidateAction> adaptiveCandidates_;
+    hik_adaptive::PlannedActionSequence adaptiveLocalPlan_;
+    hik_scan::Pose6D adaptivePlanningPose_;
+    hik_scan::Pose6D adaptiveGlobalEvaluationPose_;
+    bool adaptiveGlobalEvaluationPoseValid_{false};
+    bool adaptiveArcFallbackEvaluationActive_{false};
+    bool adaptiveExecutionPreflightPending_{false};
+    AdaptiveEvaluationMode adaptiveEvaluationMode_{
+        AdaptiveEvaluationMode::None};
+    int adaptiveKinematicRequestId_{-1};
+    bool adaptiveEvaluationLeaseHeld_{false};
+    std::size_t adaptiveEvaluationExpected_{0U};
+    std::size_t adaptiveEvaluationReceived_{0U};
+    std::map<int, std::pair<int, int> > adaptiveEvaluationTokens_;
+    std::map<int, hik_adaptive::RobotPathEvaluation>
+        adaptiveInitialEvaluations_;
+    std::map<std::pair<int, int>, hik_adaptive::RobotPathEvaluation>
+        adaptivePairEvaluations_;
+    std::map<int, hik_adaptive::RobotPathEvaluation>
+        adaptiveGlobalEvaluations_;
+    std::map<int, int> adaptiveMotionRequestSegments_;
+    std::map<int, double> adaptiveActualSegmentTimeS_;
 
     QThread cameraThread_;
     HikCameraWorker* cameraWorker_{nullptr};
@@ -317,6 +469,8 @@ private:
     PoseReading currentPose_;
 
     bool calibrationReady_{false};
+    bool calibrationProvenanceOverrideActive_{false};
+    QString handEyeDeclaredIntrinsicsSha256_;
     hik_calibration::IntrinsicCalibrationResult intrinsics_;
     hik_calibration::IntrinsicsYamlMetadata intrinsicsMetadata_;
     hik_calibration::LaserPlaneFitResult laserPlane_;
@@ -353,7 +507,19 @@ private:
     qint64 pendingLaserStatusAgeMs_{-1};
     std::vector<hik_scan::CloudPoint> cloud_;
     std::vector<hik_scan::CloudPoint> qualityCloud_;
+    std::vector<hik_scan::VGrooveCandidateBranch>
+        qualityAmbiguousBranches_;
+    std::vector<hik_scan::CloudPoint>
+        shadowMaskedLegacyRejectedCloud_;
+    std::vector<hik_scan::CloudPoint>
+        publicationGateRejectedCloud_;
+    std::vector<hik_scan::CloudPoint>
+        opticalRejectedCandidateCloud_;
+    hik_scan::VGrooveTemporalValidationResult
+        qualityVGrooveValidationResult_;
+    std::vector<hik_scan::CloudPoint> qualityRejectedCloud_;
     hik_scan::AdjacentProfileSupportResult qualitySupportResult_;
+    std::size_t qualityAdjacentRejectedPointCount_{0U};
     std::size_t qualityVoxelPointCount_{0U};
     std::vector<ProfileRow> profileRows_;
 
@@ -376,6 +542,7 @@ private:
     QLabel* cameraStatusLabel_{nullptr};
     QPushButton* connectLaserButton_{nullptr};
     QPushButton* enableProfileLaserButton_{nullptr};
+    QPushButton* enableBothLasersButton_{nullptr};
     QPushButton* disableAllLasersButton_{nullptr};
     QLabel* laserStatusLabel_{nullptr};
     QTimer* laserFreshnessTimer_{nullptr};
@@ -389,10 +556,13 @@ private:
 
     QPushButton* reloadCalibrationButton_{nullptr};
     QLabel* calibrationStatusLabel_{nullptr};
+    QDoubleSpinBox* reconstructionDepthMinimumSpin_{nullptr};
+    QDoubleSpinBox* reconstructionDepthMaximumSpin_{nullptr};
     QPushButton* teachStartButton_{nullptr};
     QPushButton* teachEndButton_{nullptr};
     QPushButton* editStartButton_{nullptr};
     QPushButton* editEndButton_{nullptr};
+    QPushButton* swapPathButton_{nullptr};
     QLabel* startPoseLabel_{nullptr};
     QLabel* endPoseLabel_{nullptr};
     QDoubleSpinBox* stepSpin_{nullptr};
@@ -402,6 +572,8 @@ private:
     QSpinBox* settleSpin_{nullptr};
     QSpinBox* motionTimeoutSpin_{nullptr};
     QDoubleSpinBox* voxelSpin_{nullptr};
+    QCheckBox* binaryPlyCheck_{nullptr};
+    QComboBox* centerlinePolicyCombo_{nullptr};
     QCheckBox* flatTargetGateCheck_{nullptr};
     QDoubleSpinBox* lineRmsLimitSpin_{nullptr};
     QCheckBox* pathLengthLimitCheck_{nullptr};
@@ -414,7 +586,26 @@ private:
     QPushButton* captureCurrentButton_{nullptr};
     QPushButton* startScanButton_{nullptr};
     QPushButton* startContinuousButton_{nullptr};
+    QGroupBox* adaptive650Group_{nullptr};
+    QComboBox* adaptiveMappingModeCombo_{nullptr};
+    QDoubleSpinBox* adaptiveLaneOffsetXSpin_{nullptr};
+    QDoubleSpinBox* adaptiveLaneOffsetYSpin_{nullptr};
+    QDoubleSpinBox* adaptiveLaneOffsetZSpin_{nullptr};
+    QSpinBox* adaptiveLaneCountSpin_{nullptr};
+    QDoubleSpinBox* adaptiveTransitionSpeedSpin_{nullptr};
+    QDoubleSpinBox* adaptiveLeadInSpin_{nullptr};
+    QDoubleSpinBox* adaptiveLeadOutSpin_{nullptr};
+    QDoubleSpinBox* adaptiveQualityVoxelSpin_{nullptr};
+    QSpinBox* adaptiveBeamHorizonSpin_{nullptr};
+    QSpinBox* adaptiveBeamWidthSpin_{nullptr};
+    QPushButton* adaptiveGenerateGlobalButton_{nullptr};
+    QPushButton* adaptiveEvaluateGlobalButton_{nullptr};
+    QPushButton* adaptiveStartGlobalButton_{nullptr};
+    QPushButton* adaptivePlanLocalButton_{nullptr};
+    QLabel* adaptiveStatusLabel_{nullptr};
     QPushButton* stopButton_{nullptr};
+    QLabel* continuousFinalizeProgressLabel_{nullptr};
+    QProgressBar* continuousFinalizeProgress_{nullptr};
     QLabel* scanStatusLabel_{nullptr};
     QTableWidget* profileTable_{nullptr};
     ImageView* imageView_{nullptr};

@@ -2,29 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
-SYSTEM_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-SYSTEM_QT5_DIR="/usr/lib/x86_64-linux-gnu/cmake/Qt5"
-SYSTEM_OPENCV_DIR="/usr/lib/x86_64-linux-gnu/cmake/opencv4"
+SCAN_CALIBRATION_ARGS=(--use-device-calibration-as-is)
 
-if [[ -d "${SCRIPT_DIR}/../SDK/fairino-cpp-sdk-3.9.4/libfairino/src" ]]; then
-    "${SCRIPT_DIR}/tools/build_patched_fairino_sdk.sh"
+# The field launcher uses the numeric calibration values currently stored in
+# config/devices. Set HIK_STRICT_CALIBRATION=1 only when provenance hash
+# equality should be restored as a hard startup requirement.
+if [[ "${HIK_STRICT_CALIBRATION:-0}" == "1" ]]; then
+    SCAN_CALIBRATION_ARGS=()
 fi
 
-env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
-    PATH="${SYSTEM_PATH}" \
-    /usr/bin/cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DQt5_DIR="${SYSTEM_QT5_DIR}" \
-        -DQt5Core_DIR="${SYSTEM_QT5_DIR}Core" \
-        -DQt5Gui_DIR="${SYSTEM_QT5_DIR}Gui" \
-        -DQt5Widgets_DIR="${SYSTEM_QT5_DIR}Widgets" \
-        -DOpenCV_DIR="${SYSTEM_OPENCV_DIR}"
-
-env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
-    PATH="${SYSTEM_PATH}" \
-    /usr/bin/cmake --build "${BUILD_DIR}" --target HikConstantLaserScan -j"$(/usr/bin/nproc)"
-
-exec env -u CONDA_PREFIX -u CMAKE_PREFIX_PATH -u LD_LIBRARY_PATH -u PKG_CONFIG_PATH \
-    PATH="${SYSTEM_PATH}" \
-    "${BUILD_DIR}/HikConstantLaserScan" "$@"
+exec "${SCRIPT_DIR}/tools/run_system_qt_target.sh" \
+    HikConstantLaserScan "${SCAN_CALIBRATION_ARGS[@]}" "$@"

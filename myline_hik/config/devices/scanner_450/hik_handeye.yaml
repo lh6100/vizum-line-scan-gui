@@ -1,0 +1,95 @@
+schema_version: 1
+calibration_type: eye_in_hand
+mode: camera_to_flange
+transform_convention: "T_parent_child maps child coordinates into parent coordinates"
+parent_frame: "fairino_flange_reported"
+child_frame: "hik_450_camera_optical_frame"
+base_frame: "base_link"
+translation_unit: mm
+rotation_unit: dimensionless
+T_flange_camera: [-0.999962100225, -0.00394234803421, 0.00776247414177, 65.8967727891, 0.00722493379009, -0.873251947535, 0.487215390211, -9.75216317425, 0.00485782302616, 0.487253008219, 0.873247334686, 126.228380771, 0, 0, 0, 1]
+solver:
+  selected_opencv_method: "HORAUD"
+  input_samples: 15
+  accepted_samples: 15
+  rejected_samples: 0
+  translation_span_mm: 425.238556046
+  rotation_span_deg: 43.8370972468
+  secondary_rotation_spread_deg: 10.5192505777
+quality:
+  base_board_translation_rms_mm: 0.862857477497
+  base_board_translation_p95_mm: 1.30651613875
+  base_board_translation_max_mm: 1.40779902062
+  base_board_rotation_rms_deg: 0.143947140605
+  base_board_rotation_p95_deg: 0.190660714741
+  base_board_rotation_max_deg: 0.190675046536
+camera:
+  model: "MV-CS013-60GN"
+  serial: "DB0403208"
+sources:
+  intrinsics_file: "config/devices/scanner_450/hik_intrinsics.yaml"
+  intrinsics_sha256: "5d85e0418eddd7c0de826a90a7c32ad88bca2b82fa9ea9c20c6605e97c3561ac"
+  dataset_manifest: "data/calibration/scanner_450/session_20260804_144424_271/handeye/handeye_manifest.csv"
+  dataset_manifest_sha256: "bf9fdbf015222a17b757c696d05b52c53a06af2ea2095732a3c33bb51d240696"
+generated_at: "2026-08-04T06:50:34.343Z"
+samples:
+  - id: "handeye_20260804_144444_094"
+    accepted: true
+    base_board_translation_residual_mm: 0.801374160142
+    base_board_rotation_residual_deg: 0.175201896821
+  - id: "handeye_20260804_144528_043"
+    accepted: true
+    base_board_translation_residual_mm: 1.40779902062
+    base_board_rotation_residual_deg: 0.138372471307
+  - id: "handeye_20260804_144548_209"
+    accepted: true
+    base_board_translation_residual_mm: 1.04451680556
+    base_board_rotation_residual_deg: 0.111029061538
+  - id: "handeye_20260804_144557_571"
+    accepted: true
+    base_board_translation_residual_mm: 0.78459405998
+    base_board_rotation_residual_deg: 0.108095282601
+  - id: "handeye_20260804_144627_134"
+    accepted: true
+    base_board_translation_residual_mm: 1.26310918938
+    base_board_rotation_residual_deg: 0.190654572543
+  - id: "handeye_20260804_144637_070"
+    accepted: true
+    base_board_translation_residual_mm: 0.713054781036
+    base_board_rotation_residual_deg: 0.190675046536
+  - id: "handeye_20260804_144650_168"
+    accepted: true
+    base_board_translation_residual_mm: 0.601983155116
+    base_board_rotation_residual_deg: 0.130161358906
+  - id: "handeye_20260804_144656_515"
+    accepted: true
+    base_board_translation_residual_mm: 0.745853518853
+    base_board_rotation_residual_deg: 0.135010678038
+  - id: "handeye_20260804_144702_898"
+    accepted: true
+    base_board_translation_residual_mm: 1.17879221605
+    base_board_rotation_residual_deg: 0.146336803889
+  - id: "handeye_20260804_144900_883"
+    accepted: true
+    base_board_translation_residual_mm: 0.71499663692
+    base_board_rotation_residual_deg: 0.0750449306295
+  - id: "handeye_20260804_144910_267"
+    accepted: true
+    base_board_translation_residual_mm: 0.268837841728
+    base_board_rotation_residual_deg: 0.16546363948
+  - id: "handeye_20260804_144917_376"
+    accepted: true
+    base_board_translation_residual_mm: 0.655412731215
+    base_board_rotation_residual_deg: 0.11648068935
+  - id: "handeye_20260804_144924_192"
+    accepted: true
+    base_board_translation_residual_mm: 0.468455367563
+    base_board_rotation_residual_deg: 0.151240815945
+  - id: "handeye_20260804_144936_784"
+    accepted: true
+    base_board_translation_residual_mm: 0.856816412696
+    base_board_rotation_residual_deg: 0.136558073853
+  - id: "handeye_20260804_145013_113"
+    accepted: true
+    base_board_translation_residual_mm: 0.677033772503
+    base_board_rotation_residual_deg: 0.139881873685

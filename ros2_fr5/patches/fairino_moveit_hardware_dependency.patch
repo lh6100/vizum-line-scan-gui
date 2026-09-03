@@ -1,0 +1,6 @@
+diff --git a/fairino5_v6_moveit2_config/package.xml b/fairino5_v6_moveit2_config/package.xml
+index 71b83b2..658bd59 100644
+--- a/fairino5_v6_moveit2_config/package.xml
++++ b/fairino5_v6_moveit2_config/package.xml
+@@ -34,0 +35 @@
++  <exec_depend>fairino_hardware_v3_9_4</exec_depend>

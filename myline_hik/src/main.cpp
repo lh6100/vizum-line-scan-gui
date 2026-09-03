@@ -1,5 +1,6 @@
 #include "FairinoRobotSession.h"
 #include "HikCalibrationWindow.h"
+#include "LineLaserController.h"
 #include "LineLaserDeviceProfile.h"
 
 #include <QApplication>
@@ -51,6 +52,7 @@ int main(int argc, char* argv[]) {
     }
 
     FairinoRobotSession robotSession;
+    LineLaserController laserController;
     QTabWidget deviceTabs;
     deviceTabs.setWindowTitle(QStringLiteral("海康双线激光标定"));
     deviceTabs.setDocumentMode(true);
@@ -59,7 +61,8 @@ int main(int argc, char* argv[]) {
         for (const LineLaserDeviceProfile* profile : selectedProfiles) {
             HikCalibrationWindow* window =
                 new HikCalibrationWindow(
-                    *profile, &robotSession, &deviceTabs);
+                    *profile, &laserController,
+                    &robotSession, &deviceTabs);
             deviceTabs.addTab(
                 window,
                 QStringLiteral("%1｜%2").arg(profile->id, profile->displayName));
@@ -81,6 +84,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         });
+    QObject::connect(&application, &QCoreApplication::aboutToQuit,
+                     &laserController, &LineLaserController::off);
     for (int index = 0; index < deviceTabs.count(); ++index) {
         auto* window = qobject_cast<HikCalibrationWindow*>(
             deviceTabs.widget(index));
@@ -93,6 +98,10 @@ int main(int argc, char* argv[]) {
     deviceTabs.show();
     if (arguments.contains(QStringLiteral("--smoke-test"))) {
         QTimer::singleShot(250, &application, &QCoreApplication::quit);
+    } else {
+        QTimer::singleShot(
+            0, &laserController,
+            &LineLaserController::connectController);
     }
     return application.exec();
 }

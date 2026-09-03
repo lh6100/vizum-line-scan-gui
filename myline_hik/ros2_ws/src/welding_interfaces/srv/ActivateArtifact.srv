@@ -1,0 +1,8 @@
+string manifest_path
+string expected_id
+string expected_sha256
+string approved_by
+---
+bool success
+welding_interfaces/ArtifactRef active
+string error

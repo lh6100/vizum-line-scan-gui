@@ -1,0 +1,11 @@
+uint8 OFF=1
+uint8 LASER_450=2
+uint8 LASER_650=3
+
+uint8 requested_mode
+string lease_id
+int32 requested_lease_ms
+---
+bool success
+welding_interfaces/LaserSafetyState state
+string error

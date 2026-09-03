@@ -3,7 +3,7 @@
 <package format="3">
   <name>fr5_vizum_bringup</name>
   <version>0.1.0</version>
-  <description>Launch files and RViz configuration for live FR5 Vizum visualization.</description>
+  <description>Live FR5, HIK cameras, calibrated laser planes, and weld-TCP RViz visualization.</description>
   <maintainer email="zhulong@example.com">zhulong</maintainer>
   <license>Proprietary</license>
 

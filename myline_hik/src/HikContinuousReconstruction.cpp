@@ -16,6 +16,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -26,6 +27,12 @@ namespace {
 
 void setError(const std::string& message, std::string* error) {
     if (error) *error = message;
+}
+
+bool finitePoint(const cv::Point3d& point) {
+    return std::isfinite(point.x) &&
+           std::isfinite(point.y) &&
+           std::isfinite(point.z);
 }
 
 std::string jsonEscape(const std::string& input) {
@@ -87,11 +94,19 @@ bool validImage(const hik_sync::ImageBuffer& image) {
     return image.bytes.size() >= required;
 }
 
+std::uint64_t ambiguityGroupId(int profileIndex, int intervalId) {
+    return
+        (static_cast<std::uint64_t>(
+             static_cast<std::uint32_t>(profileIndex)) << 32U) |
+        static_cast<std::uint32_t>(intervalId);
+}
+
 }  // namespace
 
 struct ContinuousReconstructionPipeline::Impl {
     struct Task {
         uint64_t frameId{0U};
+        int segmentId{-1};
         int64_t alignedTimestampNs{0};
         std::shared_ptr<hik_sync::ImageBuffer> image;
         Eigen::Matrix4d baseFromCamera{Eigen::Matrix4d::Identity()};
@@ -99,22 +114,33 @@ struct ContinuousReconstructionPipeline::Impl {
 
     struct FrameResult {
         uint64_t frameId{0U};
+        int segmentId{-1};
         int64_t alignedTimestampNs{0};
         bool reconstructed{false};
         bool lineQualityPassed{false};
         bool qualityAttempted{false};
+        bool qualityAnalysisCompleted{false};
         bool qualityExtractionPassed{false};
+        bool multipathAuditOnly{false};
         std::size_t pointCount{0U};
         std::size_t qualityPointCount{0U};
+        std::size_t qualityAmbiguousIntervalCount{0U};
+        std::size_t qualityAmbiguousCandidatePointCount{0U};
+        std::size_t ambiguityMaskedLegacyPointCount{0U};
         double lineRmsMm{0.0};
         double reconstructionMs{0.0};
         std::string error;
         std::string qualityError;
         std::string centerlineAlgorithmVersion;
+        cv::Point3d cameraOriginBaseMm{0.0, 0.0, 0.0};
         hik_stripe::Diagnostics qualityDiagnostics;
         hik_calibration::StripeShadowComparison shadowComparison;
         std::vector<CloudPoint> points;
         std::vector<CloudPoint> qualityPoints;
+        std::vector<CloudPoint> shadowMaskedLegacyRejectedPoints;
+        std::vector<CloudPoint> publicationGateRejectedPoints;
+        std::vector<CloudPoint> qualityRejectedCandidatePoints;
+        std::vector<VGrooveCandidateBranch> qualityAmbiguousBranches;
     };
 
     ContinuousReconstructionOptions options;
@@ -177,6 +203,7 @@ struct ContinuousReconstructionPipeline::Impl {
         }
         Task& task = queue[queueTail];
         task.frameId = frame.frameId;
+        task.segmentId = frame.measurementSegmentId;
         task.alignedTimestampNs = frame.alignedTimestampNs;
         task.image = frame.image;
         task.baseFromCamera = frame.baseFromCamera;
@@ -206,7 +233,12 @@ struct ContinuousReconstructionPipeline::Impl {
         const auto started = std::chrono::steady_clock::now();
         FrameResult result;
         result.frameId = task.frameId;
+        result.segmentId = task.segmentId;
         result.alignedTimestampNs = task.alignedTimestampNs;
+        result.cameraOriginBaseMm = cv::Point3d(
+            task.baseFromCamera(0, 3),
+            task.baseFromCamera(1, 3),
+            task.baseFromCamera(2, 3));
 
         try {
             if (!task.image || !validImage(*task.image)) {
@@ -228,8 +260,12 @@ struct ContinuousReconstructionPipeline::Impl {
                 result.qualityAttempted =
                     profileOptions.reconstruction.stripe.mode !=
                     hik_calibration::StripeExtractionMode::Legacy;
+                result.qualityAnalysisCompleted =
+                    profile.qualityAnalysisCompleted;
                 result.qualityExtractionPassed =
                     profile.qualityExtractionPassed;
+                result.multipathAuditOnly =
+                    profile.multipathAuditOnly;
                 result.qualityError =
                     profile.qualityExtractionError;
                 result.centerlineAlgorithmVersion =
@@ -238,6 +274,8 @@ struct ContinuousReconstructionPipeline::Impl {
                     profile.qualityDiagnostics;
                 result.shadowComparison =
                     profile.shadowComparison;
+                result.ambiguityMaskedLegacyPointCount =
+                    profile.ambiguityMaskedLegacyPoints.size();
                 if (!profileOk || !profile.ok) {
                     result.error = profile.error.empty()
                         ? "single-frame profile reconstruction failed"
@@ -251,12 +289,23 @@ struct ContinuousReconstructionPipeline::Impl {
                             std::numeric_limits<int>::max())
                         ? static_cast<int>(task.frameId)
                         : std::numeric_limits<int>::max();
-                    if (!appendProfileUsingBaseFromCamera(
-                            profile, baseFromCamera, profileIndex,
-                            &result.points, &appendError) ||
-                        result.points.empty()) {
+                    const bool qualityArtifactsEnabled =
+                        options.saveQualityCloud ||
+                        options.retainQualityArtifacts;
+                    const bool collectVGrooveEvidence =
+                        options.enableVGrooveTemporalValidation;
+                    const bool formalAppendFailed =
+                        !profile.points.empty() &&
+                        (!appendProfileUsingBaseFromCamera(
+                             profile, baseFromCamera, profileIndex,
+                             &result.points, &appendError) ||
+                         result.points.empty());
+                    if (formalAppendFailed ||
+                        (profile.points.empty() &&
+                         !profile.multipathAuditOnly)) {
                         result.error = appendError.empty()
-                            ? "profile produced no finite base-frame points"
+                            ? "profile produced neither formal base-frame "
+                              "points nor a multipath audit-only result"
                             : appendError;
                     } else {
                         result.reconstructed = true;
@@ -264,8 +313,9 @@ struct ContinuousReconstructionPipeline::Impl {
                             profile.lineQualityPassed;
                         result.lineRmsMm = profile.lineDistanceMm.rms;
                         result.pointCount = result.points.size();
-                        if (options.saveQualityCloud &&
+                        if (qualityArtifactsEnabled &&
                             profile.qualityExtractionPassed &&
+                            !profile.multipathAuditOnly &&
                             !profile.qualityPoints.empty()) {
                             std::string qualityAppendError;
                             if (!appendProfilePointsUsingBaseFromCamera(
@@ -285,6 +335,152 @@ struct ContinuousReconstructionPipeline::Impl {
                                     result.qualityPoints.size();
                             }
                         }
+                        bool multipathAuditFailed = false;
+                        std::string multipathAuditError;
+                        if (qualityArtifactsEnabled &&
+                            !profile.ambiguityMaskedLegacyPoints.empty()) {
+                            std::string maskedLegacyAppendError;
+                            if (!appendProfilePointsUsingBaseFromCamera(
+                                    profile.ambiguityMaskedLegacyPoints,
+                                    baseFromCamera, profileIndex,
+                                    &result
+                                         .shadowMaskedLegacyRejectedPoints,
+                                    &maskedLegacyAppendError) ||
+                                result.shadowMaskedLegacyRejectedPoints
+                                    .empty()) {
+                                multipathAuditFailed = true;
+                                multipathAuditError =
+                                    maskedLegacyAppendError.empty()
+                                    ? "shadow-masked legacy points produced "
+                                      "no finite base-frame audit points"
+                                    : maskedLegacyAppendError;
+                            } else {
+                                for (CloudPoint& point :
+                                     result
+                                         .shadowMaskedLegacyRejectedPoints) {
+                                    point.qualityFlags |=
+                                        CLOUD_QUALITY_REJECTED_SHADOW_LEGACY_MULTIPATH;
+                                }
+                            }
+                        }
+                        if (qualityArtifactsEnabled &&
+                            !multipathAuditFailed &&
+                            !profile.publicationGateRejectedPoints.empty()) {
+                            std::string publicationGateAppendError;
+                            if (!appendProfilePointsUsingBaseFromCamera(
+                                    profile.publicationGateRejectedPoints,
+                                    baseFromCamera, profileIndex,
+                                    &result.publicationGateRejectedPoints,
+                                    &publicationGateAppendError) ||
+                                result.publicationGateRejectedPoints.empty()) {
+                                multipathAuditFailed = true;
+                                multipathAuditError =
+                                    publicationGateAppendError.empty()
+                                    ? "publication-gate rejected points "
+                                      "produced no finite base-frame audit "
+                                      "points"
+                                    : publicationGateAppendError;
+                            } else {
+                                for (CloudPoint& point :
+                                     result
+                                         .publicationGateRejectedPoints) {
+                                    point.qualityFlags |=
+                                        CLOUD_QUALITY_REJECTED_PROFILE_PUBLICATION_GATE;
+                                }
+                            }
+                        }
+                        if (qualityArtifactsEnabled &&
+                            !multipathAuditFailed &&
+                            !profile.qualityRejectedCandidatePoints.empty()) {
+                            std::string rejectedCandidateAppendError;
+                            if (!appendProfilePointsUsingBaseFromCamera(
+                                    profile.qualityRejectedCandidatePoints,
+                                    baseFromCamera, profileIndex,
+                                    &result.qualityRejectedCandidatePoints,
+                                    &rejectedCandidateAppendError)) {
+                                multipathAuditFailed = true;
+                                multipathAuditError =
+                                    rejectedCandidateAppendError.empty()
+                                    ? "quality rejected candidates produced "
+                                      "no finite base-frame audit points"
+                                    : rejectedCandidateAppendError;
+                            }
+                        }
+                        std::set<int> ambiguousIntervals;
+                        for (const hik_calibration::
+                                 StaticProfileAmbiguousBranch& input :
+                             profile.qualityAmbiguousBranches) {
+                            if (!collectVGrooveEvidence) {
+                                break;
+                            }
+                            if (multipathAuditFailed) {
+                                break;
+                            }
+                            if (input.points.empty()) {
+                                continue;
+                            }
+                            VGrooveCandidateBranch branch;
+                            branch.ambiguityGroupId =
+                                ambiguityGroupId(
+                                    profileIndex,
+                                    input.intervalId);
+                            branch.branchId = input.branchId;
+                            branch.formalPublicationEligible =
+                                result.qualityExtractionPassed &&
+                                !profile.multipathAuditOnly;
+                            std::string ambiguousAppendError;
+                            if (!appendProfilePointsUsingBaseFromCamera(
+                                    input.points, baseFromCamera,
+                                    profileIndex, &branch.points,
+                                    &ambiguousAppendError) ||
+                                branch.points.empty()) {
+                                if (!result.qualityError.empty()) {
+                                    result.qualityError += "; ";
+                                }
+                                result.qualityError +=
+                                    ambiguousAppendError.empty()
+                                    ? "multipath branch produced no finite "
+                                      "base-frame points"
+                                    : ambiguousAppendError;
+                                multipathAuditFailed = true;
+                                multipathAuditError =
+                                    ambiguousAppendError.empty()
+                                    ? "multipath branch produced no finite "
+                                      "base-frame audit points"
+                                    : ambiguousAppendError;
+                                break;
+                            }
+                            for (CloudPoint& point : branch.points) {
+                                point.qualityFlags |=
+                                    CLOUD_QUALITY_2D_MULTIPATH_CANDIDATE;
+                            }
+                            ambiguousIntervals.insert(
+                                input.intervalId);
+                            result.qualityAmbiguousCandidatePointCount +=
+                                branch.points.size();
+                            result.qualityAmbiguousBranches.push_back(
+                                std::move(branch));
+                        }
+                        if (multipathAuditFailed) {
+                            result.reconstructed = false;
+                            result.error =
+                                "multipath rejected-audit reconstruction "
+                                "failed: " +
+                                multipathAuditError;
+                            result.points.clear();
+                            result.qualityPoints.clear();
+                            result.shadowMaskedLegacyRejectedPoints.clear();
+                            result.publicationGateRejectedPoints.clear();
+                            result.qualityRejectedCandidatePoints.clear();
+                            result.qualityAmbiguousBranches.clear();
+                            result.pointCount = 0U;
+                            result.qualityPointCount = 0U;
+                            result.qualityAmbiguousCandidatePointCount = 0U;
+                            result.qualityAmbiguousIntervalCount = 0U;
+                        } else {
+                            result.qualityAmbiguousIntervalCount =
+                                ambiguousIntervals.size();
+                        }
                     }
                 }
             }
@@ -292,6 +488,10 @@ struct ContinuousReconstructionPipeline::Impl {
             result.reconstructed = false;
             result.points.clear();
             result.qualityPoints.clear();
+            result.shadowMaskedLegacyRejectedPoints.clear();
+            result.publicationGateRejectedPoints.clear();
+            result.qualityRejectedCandidatePoints.clear();
+            result.qualityAmbiguousBranches.clear();
             result.pointCount = 0U;
             result.qualityPointCount = 0U;
             result.error =
@@ -300,6 +500,10 @@ struct ContinuousReconstructionPipeline::Impl {
             result.reconstructed = false;
             result.points.clear();
             result.qualityPoints.clear();
+            result.shadowMaskedLegacyRejectedPoints.clear();
+            result.publicationGateRejectedPoints.clear();
+            result.qualityRejectedCandidatePoints.clear();
+            result.qualityAmbiguousBranches.clear();
             result.pointCount = 0U;
             result.qualityPointCount = 0U;
             result.error =
@@ -308,6 +512,10 @@ struct ContinuousReconstructionPipeline::Impl {
             result.reconstructed = false;
             result.points.clear();
             result.qualityPoints.clear();
+            result.shadowMaskedLegacyRejectedPoints.clear();
+            result.publicationGateRejectedPoints.clear();
+            result.qualityRejectedCandidatePoints.clear();
+            result.qualityAmbiguousBranches.clear();
             result.pointCount = 0U;
             result.qualityPointCount = 0U;
             result.error = "unknown reconstruction exception";
@@ -318,7 +526,8 @@ struct ContinuousReconstructionPipeline::Impl {
                 std::chrono::steady_clock::now() - started).count();
         if (result.reconstructed) {
             reconstructedFrames.fetch_add(1U, std::memory_order_relaxed);
-            if (!result.lineQualityPassed) {
+            if (!result.multipathAuditOnly &&
+                !result.lineQualityPassed) {
                 lineQualityWarnings.fetch_add(1U, std::memory_order_relaxed);
             }
         } else {
@@ -399,10 +608,19 @@ struct ContinuousReconstructionPipeline::Impl {
                      error);
             return false;
         }
-        output << "frame_id,aligned_timestamp_ns,status,point_count,"
+        output << "frame_id,segment_id,aligned_timestamp_ns,status,point_count,"
                   "line_quality_passed,line_rms_mm,quality_attempted,"
-                  "quality_passed,quality_point_count,total_candidates,"
-                  "accepted_candidates,selected_points,selected_gaps,"
+                  "quality_analysis_completed,quality_passed,"
+                  "multipath_audit_only,"
+                  "quality_point_count,total_candidates,"
+                  "accepted_candidates,path_usable_candidates,"
+                  "provisional_selected_points,publishable_selected_points,"
+                  "selected_points,selected_gaps,multipath_intervals,"
+                  "multipath_ambiguous_scanlines,"
+                  "multipath_candidate_points,"
+                  "ambiguity_masked_legacy_points,"
+                  "publication_gate_rejected_points,"
+                  "optical_rejected_candidate_points,"
                   "saturated_candidates,multi_peak_scanlines,"
                   "rejected_low_prominence,rejected_width,"
                   "rejected_saturation,rejected_multi_peak,"
@@ -424,18 +642,39 @@ struct ContinuousReconstructionPipeline::Impl {
                   "reconstruction_ms,quality_error,error\n";
         output << std::setprecision(12);
         for (const FrameResult& result : sorted) {
-            output << result.frameId << ',' << result.alignedTimestampNs << ','
-                   << (result.reconstructed ? "RECONSTRUCTED" : "FAILED") << ','
+            output << result.frameId << ',' << result.segmentId << ','
+                   << result.alignedTimestampNs << ','
+                   << (result.reconstructed
+                           ? (result.multipathAuditOnly
+                                  ? "AUDIT_ONLY"
+                                  : "RECONSTRUCTED")
+                           : "FAILED")
+                   << ','
                    << result.pointCount << ','
                    << (result.lineQualityPassed ? 1 : 0) << ','
                    << result.lineRmsMm << ','
                    << (result.qualityAttempted ? 1 : 0) << ','
+                   << (result.qualityAnalysisCompleted ? 1 : 0) << ','
                    << (result.qualityExtractionPassed ? 1 : 0) << ','
+                   << (result.multipathAuditOnly ? 1 : 0) << ','
                    << result.qualityPointCount << ','
                    << result.qualityDiagnostics.totalCandidateCount << ','
                    << result.qualityDiagnostics.acceptedCandidateCount << ','
+                   << result.qualityDiagnostics.pathUsableCandidateCount
+                   << ','
+                   << result.qualityDiagnostics
+                          .provisionalSelectedPointCount << ','
+                   << result.qualityDiagnostics
+                          .publishableSelectedPointCount << ','
                    << result.qualityDiagnostics.selectedPointCount << ','
                    << result.qualityDiagnostics.selectedGapCount << ','
+                   << result.qualityAmbiguousIntervalCount << ','
+                   << result.qualityDiagnostics
+                          .multipathAmbiguousScanlineCount << ','
+                   << result.qualityAmbiguousCandidatePointCount << ','
+                   << result.ambiguityMaskedLegacyPointCount << ','
+                   << result.publicationGateRejectedPoints.size() << ','
+                   << result.qualityRejectedCandidatePoints.size() << ','
                    << result.qualityDiagnostics.saturatedCandidateCount << ','
                    << result.qualityDiagnostics.multiPeakScanlineCount << ','
                    << result.qualityDiagnostics.rejectedLowProminenceCount
@@ -484,18 +723,48 @@ struct ContinuousReconstructionPipeline::Impl {
         return true;
     }
 
-    void writeSummary(const ContinuousReconstructionStatistics& statistics,
-                      const std::string& saveError) const {
-        std::ofstream output(statistics.summaryJsonPath,
+    bool writeSummary(
+            const ContinuousReconstructionStatistics& statistics,
+            const std::string& saveError,
+            std::string* error) const {
+        const std::string temporaryPath =
+            statistics.summaryJsonPath + ".tmp";
+        std::ofstream output(temporaryPath,
                              std::ios::out | std::ios::trunc);
-        if (!output) return;
+        if (!output) {
+            setError(
+                "cannot create continuous reconstruction summary: " +
+                    temporaryPath,
+                error);
+            return false;
+        }
         output << std::setprecision(12)
                << "{\n"
+               << "  \"schema_version\": 2,\n"
                << "  \"queue_capacity\": " << options.queueCapacity << ",\n"
                << "  \"worker_threads\": " << options.workerThreads << ",\n"
                << "  \"voxel_size_mm\": " << options.voxelSizeMm << ",\n"
+               << "  \"camera_z_min_mm\": "
+               << profileOptions.reconstruction.minimumDepthMm << ",\n"
+               << "  \"camera_z_max_mm\": "
+               << profileOptions.reconstruction.maximumDepthMm << ",\n"
+               << "  \"voxel_color_map\": \"turbo\",\n"
+               << "  \"voxel_color_scalar\": \"base_z_mm\",\n"
+               << "  \"voxel_color_percentile\": [1, 99],\n"
+               << "  \"ply_encoding\": \""
+               << (options.binaryPly
+                       ? "binary_little_endian"
+                       : "ascii")
+               << "\",\n"
                << "  \"save_quality_cloud\": "
                << (options.saveQualityCloud ? "true" : "false") << ",\n"
+               << "  \"retain_quality_artifacts\": "
+               << (options.retainQualityArtifacts ? "true" : "false")
+               << ",\n"
+               << "  \"v_groove_temporal_validation_enabled\": "
+               << (options.enableVGrooveTemporalValidation
+                       ? "true" : "false")
+               << ",\n"
                << "  \"adjacent_profile_support_enabled\": "
                << (options.enableAdjacentProfileSupport
                        ? "true" : "false") << ",\n"
@@ -525,6 +794,8 @@ struct ContinuousReconstructionPipeline::Impl {
                << statistics.reconstructionFailures << ",\n"
                << "  \"line_quality_warnings\": "
                << statistics.lineQualityWarnings << ",\n"
+               << "  \"multipath_audit_only_frames\": "
+               << statistics.multipathAuditOnlyFrames << ",\n"
                << "  \"quality_frames_passed\": "
                << statistics.qualityFramesPassed << ",\n"
                << "  \"quality_frames_rejected\": "
@@ -533,10 +804,46 @@ struct ContinuousReconstructionPipeline::Impl {
                << statistics.rawPointCount << ",\n"
                << "  \"voxel_point_count\": "
                << statistics.voxelPointCount << ",\n"
+               << "  \"quality_multipath_interval_count\": "
+               << statistics.qualityMultipathIntervalCount << ",\n"
+               << "  \"quality_multipath_candidate_point_count\": "
+               << statistics.qualityMultipathCandidatePointCount
+               << ",\n"
+               << "  \"quality_shadow_masked_legacy_rejected_point_count\": "
+               << statistics
+                      .qualityShadowMaskedLegacyRejectedPointCount
+               << ",\n"
+               << "  \"quality_profile_gate_rejected_point_count\": "
+               << statistics.qualityProfileGateRejectedPointCount
+               << ",\n"
+               << "  \"quality_optical_rejected_candidate_point_count\": "
+               << statistics.qualityOpticalRejectedCandidatePointCount
+               << ",\n"
+               << "  \"quality_v_groove_promoted_candidate_point_count\": "
+               << statistics
+                      .qualityVGroovePromotedCandidatePointCount
+               << ",\n"
+               << "  \"quality_v_groove_rejected_candidate_point_count\": "
+               << statistics
+                      .qualityVGrooveRejectedCandidatePointCount
+               << ",\n"
+               << "  \"quality_v_groove_ambiguous_group_count\": "
+               << statistics.qualityVGrooveAmbiguousGroupCount
+               << ",\n"
+               << "  \"quality_v_groove_insufficient_group_count\": "
+               << statistics.qualityVGrooveInsufficientGroupCount
+               << ",\n"
+               << "  \"quality_v_groove_invalid_geometry_group_count\": "
+               << statistics
+                      .qualityVGrooveInvalidGeometryGroupCount
+               << ",\n"
                << "  \"quality_optical_point_count\": "
                << statistics.qualityOpticalPointCount << ",\n"
                << "  \"quality_filtered_point_count\": "
                << statistics.qualityFilteredPointCount << ",\n"
+               << "  \"quality_adjacent_rejected_point_count\": "
+               << statistics.qualityAdjacentRejectedPointCount
+               << ",\n"
                << "  \"quality_rejected_point_count\": "
                << statistics.qualityRejectedPointCount << ",\n"
                << "  \"quality_voxel_point_count\": "
@@ -580,6 +887,28 @@ struct ContinuousReconstructionPipeline::Impl {
                << jsonEscape(options.handEyeSha256) << "\",\n"
                << "  \"error\": \"" << jsonEscape(saveError) << "\"\n"
                << "}\n";
+        output.flush();
+        output.close();
+        if (output.fail()) {
+            setError(
+                "failed while writing continuous reconstruction summary: " +
+                    temporaryPath,
+                error);
+            return false;
+        }
+        std::error_code renameError;
+        std::filesystem::rename(
+            temporaryPath, statistics.summaryJsonPath, renameError);
+        if (renameError) {
+            setError(
+                "cannot atomically publish continuous reconstruction "
+                "summary: " +
+                    renameError.message(),
+                error);
+            return false;
+        }
+        if (error) error->clear();
+        return true;
     }
 };
 
@@ -611,6 +940,9 @@ bool ContinuousReconstructionPipeline::start(
     if (options.queueCapacity == 0U || options.workerThreads == 0U ||
         options.workerThreads > 16U || options.outputDirectory.empty() ||
         !std::isfinite(options.voxelSizeMm) || options.voxelSizeMm < 0.0 ||
+        (options.enableVGrooveTemporalValidation &&
+         !options.saveQualityCloud &&
+         !options.retainQualityArtifacts) ||
         (options.enableAdjacentProfileSupport &&
          (!std::isfinite(options.adjacentSupportRadiusMm) ||
           options.adjacentSupportRadiusMm <= 0.0 ||
@@ -674,22 +1006,47 @@ bool ContinuousReconstructionPipeline::tryEnqueue(
 
 bool ContinuousReconstructionPipeline::stopAndSave(
         ContinuousReconstructionStatistics* statistics,
-        std::string* error) {
+        std::string* error,
+        ContinuousReconstructionArtifacts* artifacts,
+        const ContinuousReconstructionProgressCallback& progress) {
+    const auto reportProgress =
+        [&progress](int percent, const char* stage) {
+            if (!progress) return;
+            try {
+                progress(percent, stage ? stage : "");
+            } catch (...) {
+                // Progress reporting is diagnostic only and must never make
+                // point-cloud finalization fail.
+            }
+        };
+    reportProgress(1, "正在停止重建输入");
+    if (artifacts) *artifacts = ContinuousReconstructionArtifacts{};
     if (!impl_) {
         if (statistics) *statistics = lastStatistics_;
         setError("continuous reconstruction is not running", error);
         return false;
     }
     Impl* implementation = impl_.get();
+    const auto savePly =
+        [implementation](const std::string& path,
+                         const std::vector<CloudPoint>& cloud,
+                         const std::string& frameId,
+                         std::string* saveError) {
+            return implementation->options.binaryPly
+                ? saveScanPlyBinary(path, cloud, frameId, saveError)
+                : saveScanPly(path, cloud, frameId, saveError);
+        };
     implementation->accepting.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(implementation->queueMutex);
         implementation->stopping = true;
     }
     implementation->queueCondition.notify_all();
+    reportProgress(5, "正在清空重建队列");
     for (std::thread& worker : implementation->workers) {
         if (worker.joinable()) worker.join();
     }
+    reportProgress(20, "重建队列已清空，正在合并帧结果");
 
     std::vector<Impl::FrameResult> sorted;
     {
@@ -706,12 +1063,36 @@ bool ContinuousReconstructionPipeline::stopAndSave(
         implementation->snapshot();
     std::vector<CloudPoint> rawCloud;
     std::vector<CloudPoint> qualityOpticalCloud;
+    std::vector<CloudPoint> shadowMaskedLegacyRejectedCloud;
+    std::vector<CloudPoint> publicationGateRejectedCloud;
+    std::vector<CloudPoint> opticalRejectedCandidateCloud;
+    std::vector<VGrooveCandidateBranch> ambiguousBranches;
     std::size_t rawPointCount = 0U;
     std::size_t qualityOpticalPointCount = 0U;
+    std::size_t shadowMaskedLegacyRejectedPointCount = 0U;
+    std::size_t publicationGateRejectedPointCount = 0U;
+    std::size_t opticalRejectedCandidatePointCount = 0U;
+    std::size_t ambiguousBranchCount = 0U;
     long double durationSumMs = 0.0L;
     for (const Impl::FrameResult& result : sorted) {
+        if (result.reconstructed &&
+            result.multipathAuditOnly) {
+            ++finalStatistics.multipathAuditOnlyFrames;
+        }
         rawPointCount += result.points.size();
         qualityOpticalPointCount += result.qualityPoints.size();
+        shadowMaskedLegacyRejectedPointCount +=
+            result.shadowMaskedLegacyRejectedPoints.size();
+        publicationGateRejectedPointCount +=
+            result.publicationGateRejectedPoints.size();
+        opticalRejectedCandidatePointCount +=
+            result.qualityRejectedCandidatePoints.size();
+        ambiguousBranchCount +=
+            result.qualityAmbiguousBranches.size();
+        finalStatistics.qualityMultipathIntervalCount +=
+            result.qualityAmbiguousIntervalCount;
+        finalStatistics.qualityMultipathCandidatePointCount +=
+            result.qualityAmbiguousCandidatePointCount;
         durationSumMs += result.reconstructionMs;
         finalStatistics.maximumReconstructionMs = std::max(
             finalStatistics.maximumReconstructionMs,
@@ -724,6 +1105,13 @@ bool ContinuousReconstructionPipeline::stopAndSave(
     }
     rawCloud.reserve(rawPointCount);
     qualityOpticalCloud.reserve(qualityOpticalPointCount);
+    shadowMaskedLegacyRejectedCloud.reserve(
+        shadowMaskedLegacyRejectedPointCount);
+    publicationGateRejectedCloud.reserve(
+        publicationGateRejectedPointCount);
+    opticalRejectedCandidateCloud.reserve(
+        opticalRejectedCandidatePointCount);
+    ambiguousBranches.reserve(ambiguousBranchCount);
     for (Impl::FrameResult& result : sorted) {
         rawCloud.insert(rawCloud.end(),
                         std::make_move_iterator(result.points.begin()),
@@ -732,53 +1120,185 @@ bool ContinuousReconstructionPipeline::stopAndSave(
             qualityOpticalCloud.end(),
             std::make_move_iterator(result.qualityPoints.begin()),
             std::make_move_iterator(result.qualityPoints.end()));
+        shadowMaskedLegacyRejectedCloud.insert(
+            shadowMaskedLegacyRejectedCloud.end(),
+            std::make_move_iterator(
+                result.shadowMaskedLegacyRejectedPoints.begin()),
+            std::make_move_iterator(
+                result.shadowMaskedLegacyRejectedPoints.end()));
+        publicationGateRejectedCloud.insert(
+            publicationGateRejectedCloud.end(),
+            std::make_move_iterator(
+                result.publicationGateRejectedPoints.begin()),
+            std::make_move_iterator(
+                result.publicationGateRejectedPoints.end()));
+        opticalRejectedCandidateCloud.insert(
+            opticalRejectedCandidateCloud.end(),
+            std::make_move_iterator(
+                result.qualityRejectedCandidatePoints.begin()),
+            std::make_move_iterator(
+                result.qualityRejectedCandidatePoints.end()));
+        ambiguousBranches.insert(
+            ambiguousBranches.end(),
+            std::make_move_iterator(
+                result.qualityAmbiguousBranches.begin()),
+            std::make_move_iterator(
+                result.qualityAmbiguousBranches.end()));
     }
+
+    std::string combinedError;
+    std::vector<CloudPoint> vGrooveRejectedCloud;
+    if (implementation->options.enableVGrooveTemporalValidation &&
+        !ambiguousBranches.empty()) {
+        reportProgress(30, "正在执行V槽时序质量验证");
+        VGrooveTemporalValidationOptions vGrooveOptions;
+        VGrooveTemporalValidationResult vGroove;
+        std::string validationError;
+        if (!validateVGrooveTemporalGeometry(
+                qualityOpticalCloud, ambiguousBranches,
+                vGrooveOptions, &vGroove, &validationError)) {
+            combinedError =
+                "V-groove temporal validation failed: " +
+                validationError;
+            for (const VGrooveCandidateBranch& branch :
+                 ambiguousBranches) {
+                for (CloudPoint point : branch.points) {
+                    point.qualityFlags |=
+                        CLOUD_QUALITY_REJECTED_V_GROOVE_INSUFFICIENT;
+                    vGrooveRejectedCloud.push_back(point);
+                }
+            }
+        } else {
+            qualityOpticalCloud =
+                std::move(vGroove.passThroughPublishable);
+            qualityOpticalCloud.insert(
+                qualityOpticalCloud.end(),
+                std::make_move_iterator(
+                    vGroove.promotedCandidates.begin()),
+                std::make_move_iterator(
+                    vGroove.promotedCandidates.end()));
+            vGrooveRejectedCloud =
+                std::move(vGroove.rejectedCandidates);
+            finalStatistics
+                .qualityVGroovePromotedCandidatePointCount =
+                vGroove.statistics.promotedCandidatePointCount;
+            finalStatistics
+                .qualityVGrooveRejectedCandidatePointCount =
+                vGroove.statistics.rejectedCandidatePointCount;
+            for (const VGrooveAmbiguityGroupValidation& group :
+                 vGroove.ambiguityGroups) {
+                switch (group.status) {
+                case VGrooveProfileStatus::PromotedUnique:
+                case VGrooveProfileStatus::NotEvaluated:
+                    break;
+                case VGrooveProfileStatus::RejectedAmbiguous:
+                    ++finalStatistics
+                          .qualityVGrooveAmbiguousGroupCount;
+                    break;
+                case VGrooveProfileStatus::
+                        RejectedInsufficientEvidence:
+                    ++finalStatistics
+                          .qualityVGrooveInsufficientGroupCount;
+                    break;
+                case VGrooveProfileStatus::RejectedInvalidGeometry:
+                    ++finalStatistics
+                          .qualityVGrooveInvalidGeometryGroupCount;
+                    break;
+                }
+            }
+        }
+    }
+    reportProgress(62, "正在写入逐帧重建诊断");
+    finalStatistics.qualityVGrooveRejectedCandidatePointCount =
+        vGrooveRejectedCloud.size();
     finalStatistics.rawPointCount = rawCloud.size();
     finalStatistics.qualityOpticalPointCount =
         qualityOpticalCloud.size();
 
-    std::string combinedError;
     std::string detailError;
     if (!implementation->writeDetailCsv(
             sorted, finalStatistics.detailCsvPath, &detailError)) {
-        combinedError = detailError;
-    }
-
-    if (rawCloud.empty()) {
         if (!combinedError.empty()) combinedError += "; ";
-        combinedError += "continuous reconstruction produced an empty cloud";
-    } else {
-        std::string saveError;
-        finalStatistics.rawPlySaved = saveScanPly(
-            finalStatistics.rawPlyPath, rawCloud, "base_link", &saveError);
-        if (!finalStatistics.rawPlySaved) {
-            if (!combinedError.empty()) combinedError += "; ";
-            combinedError += saveError;
-        }
-        const std::vector<CloudPoint> voxelCloud =
-            voxelDownsample(rawCloud, implementation->options.voxelSizeMm);
-        finalStatistics.voxelPointCount = voxelCloud.size();
-        saveError.clear();
-        finalStatistics.voxelPlySaved = saveScanPly(
-            finalStatistics.voxelPlyPath, voxelCloud, "base_link", &saveError);
-        if (!finalStatistics.voxelPlySaved) {
-            if (!combinedError.empty()) combinedError += "; ";
-            combinedError += saveError;
-        }
+        combinedError += detailError;
     }
 
-    if (implementation->options.saveQualityCloud &&
+    std::string saveError;
+    reportProgress(68, "正在保存 continuous_raw.ply");
+    finalStatistics.rawPlySaved = savePly(
+        finalStatistics.rawPlyPath, rawCloud, "base_link", &saveError);
+    if (!finalStatistics.rawPlySaved) {
+        if (!combinedError.empty()) combinedError += "; ";
+        combinedError += saveError;
+    }
+    reportProgress(77, "正在计算 continuous_voxel.ply");
+    const std::vector<CloudPoint> voxelCloud =
+        voxelDownsample(rawCloud, implementation->options.voxelSizeMm);
+    finalStatistics.voxelPointCount = voxelCloud.size();
+    saveError.clear();
+    reportProgress(85, "正在保存世界 Z 高度着色 continuous_voxel.ply");
+    PlyColorOptions voxelColorOptions;
+    voxelColorOptions.scalar = PlyColorScalar::BaseZ;
+    finalStatistics.voxelPlySaved =
+        implementation->options.binaryPly
+            ? saveScanPlyBinary(
+                  finalStatistics.voxelPlyPath, voxelCloud, "base_link",
+                  voxelColorOptions, &saveError)
+            : saveScanPly(
+                  finalStatistics.voxelPlyPath, voxelCloud, "base_link",
+                  voxelColorOptions, &saveError);
+    if (!finalStatistics.voxelPlySaved) {
+        if (!combinedError.empty()) combinedError += "; ";
+        combinedError += saveError;
+    }
+
+    std::vector<CloudPoint> qualityRejectedCloud;
+    std::vector<CloudPoint> finalQualityAcceptedCloud;
+    const bool qualityArtifactsEnabled =
+        implementation->options.saveQualityCloud ||
+        implementation->options.retainQualityArtifacts;
+    if (qualityArtifactsEnabled) {
+        qualityRejectedCloud = std::move(vGrooveRejectedCloud);
+        finalStatistics
+            .qualityShadowMaskedLegacyRejectedPointCount =
+            shadowMaskedLegacyRejectedCloud.size();
+        finalStatistics.qualityProfileGateRejectedPointCount =
+            publicationGateRejectedCloud.size();
+        finalStatistics.qualityOpticalRejectedCandidatePointCount =
+            opticalRejectedCandidateCloud.size();
+        qualityRejectedCloud.insert(
+            qualityRejectedCloud.end(),
+            std::make_move_iterator(
+                shadowMaskedLegacyRejectedCloud.begin()),
+            std::make_move_iterator(
+                shadowMaskedLegacyRejectedCloud.end()));
+        qualityRejectedCloud.insert(
+            qualityRejectedCloud.end(),
+            std::make_move_iterator(
+                publicationGateRejectedCloud.begin()),
+            std::make_move_iterator(
+                publicationGateRejectedCloud.end()));
+        qualityRejectedCloud.insert(
+            qualityRejectedCloud.end(),
+            std::make_move_iterator(
+                opticalRejectedCandidateCloud.begin()),
+            std::make_move_iterator(
+                opticalRejectedCandidateCloud.end()));
+    }
+    if (qualityArtifactsEnabled &&
         !qualityOpticalCloud.empty()) {
-        std::string saveError;
-        finalStatistics.qualityOpticalPlySaved = saveScanPly(
-            finalStatistics.qualityOpticalPlyPath,
-            qualityOpticalCloud, "base_link", &saveError);
-        if (!finalStatistics.qualityOpticalPlySaved) {
-            if (!combinedError.empty()) combinedError += "; ";
-            combinedError += saveError;
+        if (implementation->options.saveQualityCloud) {
+            std::string qualitySaveError;
+            finalStatistics.qualityOpticalPlySaved = savePly(
+                finalStatistics.qualityOpticalPlyPath,
+                qualityOpticalCloud, "base_link", &qualitySaveError);
+            if (!finalStatistics.qualityOpticalPlySaved) {
+                if (!combinedError.empty()) combinedError += "; ";
+                combinedError += qualitySaveError;
+            }
         }
 
         AdjacentProfileSupportOptions supportOptions;
+        reportProgress(91, "正在执行相邻轮廓质量过滤");
         supportOptions.enabled =
             implementation->options.enableAdjacentProfileSupport;
         supportOptions.radiusMm =
@@ -797,18 +1317,26 @@ bool ContinuousReconstructionPipeline::stopAndSave(
                 "quality adjacent-profile filter failed: " +
                 supportError;
         } else {
+            finalQualityAcceptedCloud = support.kept;
             finalStatistics.qualityFilteredPointCount =
                 support.kept.size();
-            finalStatistics.qualityRejectedPointCount =
+            finalStatistics.qualityAdjacentRejectedPointCount =
                 support.rejected.size();
-            if (!support.kept.empty()) {
-                saveError.clear();
-                finalStatistics.qualityPlySaved = saveScanPly(
+            qualityRejectedCloud.insert(
+                qualityRejectedCloud.end(),
+                std::make_move_iterator(
+                    support.rejected.begin()),
+                std::make_move_iterator(
+                    support.rejected.end()));
+            if (implementation->options.saveQualityCloud &&
+                !support.kept.empty()) {
+                std::string qualitySaveError;
+                finalStatistics.qualityPlySaved = savePly(
                     finalStatistics.qualityPlyPath,
-                    support.kept, "base_link", &saveError);
+                    support.kept, "base_link", &qualitySaveError);
                 if (!finalStatistics.qualityPlySaved) {
                     if (!combinedError.empty()) combinedError += "; ";
-                    combinedError += saveError;
+                    combinedError += qualitySaveError;
                 }
 
                 VoxelDownsampleOptions voxelOptions;
@@ -820,34 +1348,71 @@ bool ContinuousReconstructionPipeline::stopAndSave(
                 finalStatistics.qualityVoxelPointCount =
                     qualityVoxelCloud.size();
                 if (!qualityVoxelCloud.empty()) {
-                    saveError.clear();
-                    finalStatistics.qualityVoxelPlySaved = saveScanPly(
+                    qualitySaveError.clear();
+                    finalStatistics.qualityVoxelPlySaved = savePly(
                         finalStatistics.qualityVoxelPlyPath,
-                        qualityVoxelCloud, "base_link", &saveError);
+                        qualityVoxelCloud, "base_link",
+                        &qualitySaveError);
                     if (!finalStatistics.qualityVoxelPlySaved) {
                         if (!combinedError.empty()) combinedError += "; ";
-                        combinedError += saveError;
+                        combinedError += qualitySaveError;
                     }
-                }
-            }
-            if (!support.rejected.empty()) {
-                saveError.clear();
-                finalStatistics.qualityRejectedPlySaved = saveScanPly(
-                    finalStatistics.qualityRejectedPlyPath,
-                    support.rejected, "base_link", &saveError);
-                if (!finalStatistics.qualityRejectedPlySaved) {
-                    if (!combinedError.empty()) combinedError += "; ";
-                    combinedError += saveError;
                 }
             }
         }
     }
-    implementation->writeSummary(finalStatistics, combinedError);
+    finalStatistics.qualityRejectedPointCount =
+        qualityRejectedCloud.size();
+    if (implementation->options.saveQualityCloud &&
+        !qualityRejectedCloud.empty()) {
+        std::string saveError;
+        finalStatistics.qualityRejectedPlySaved = savePly(
+            finalStatistics.qualityRejectedPlyPath,
+            qualityRejectedCloud, "base_link", &saveError);
+        if (!finalStatistics.qualityRejectedPlySaved) {
+            if (!combinedError.empty()) combinedError += "; ";
+            combinedError += saveError;
+        }
+    }
+    std::string summaryError;
+    reportProgress(97, "正在写入重建摘要");
+    if (!implementation->writeSummary(
+            finalStatistics, combinedError, &summaryError)) {
+        if (!combinedError.empty()) combinedError += "; ";
+        combinedError += summaryError;
+    }
+
+    if (artifacts) {
+        artifacts->formal = std::move(rawCloud);
+        artifacts->qualityAccepted =
+            std::move(finalQualityAcceptedCloud);
+        artifacts->rejected =
+            std::move(qualityRejectedCloud);
+        artifacts->viewpoints.reserve(sorted.size());
+        for (const Impl::FrameResult& frame : sorted) {
+            if (!frame.reconstructed ||
+                !finitePoint(frame.cameraOriginBaseMm)) {
+                continue;
+            }
+            ContinuousFrameViewpoint viewpoint;
+            viewpoint.frameId = frame.frameId;
+            viewpoint.profileIndex =
+                frame.frameId <= static_cast<std::uint64_t>(
+                    std::numeric_limits<int>::max())
+                ? static_cast<int>(frame.frameId)
+                : std::numeric_limits<int>::max();
+            viewpoint.segmentId = frame.segmentId;
+            viewpoint.cameraOriginBaseMm =
+                frame.cameraOriginBaseMm;
+            artifacts->viewpoints.push_back(viewpoint);
+        }
+    }
 
     lastStatistics_ = finalStatistics;
     impl_.reset();
     if (statistics) *statistics = finalStatistics;
     if (error) *error = combinedError;
+    reportProgress(100, "连续点云计算与保存完成");
     return combinedError.empty() &&
            finalStatistics.rawPlySaved &&
            finalStatistics.voxelPlySaved;

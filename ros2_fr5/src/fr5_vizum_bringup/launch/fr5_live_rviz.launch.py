@@ -11,14 +11,18 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
-def find_project_config(bringup_share: Path, filename: str) -> str:
-    """Find the live repository config from either a source or install launch path."""
+def find_project_file(bringup_share: Path, relative_path: str) -> str:
+    """Find a repository file from either a source or install launch path."""
     for directory in (bringup_share, *bringup_share.parents):
-        candidate = directory / "config" / filename
+        candidate = directory / relative_path
         if candidate.is_file():
             return str(candidate)
     # Keep launch-argument overrides usable when the package is installed elsewhere.
-    return str(Path("config") / filename)
+    return relative_path
+
+
+def find_project_config(bringup_share: Path, filename: str) -> str:
+    return find_project_file(bringup_share, str(Path("config") / filename))
 
 
 def generate_launch_description():
@@ -38,11 +42,14 @@ def generate_launch_description():
     publish_flange_marker = LaunchConfiguration("publish_flange_marker")
     publish_calibrated_frames = LaunchConfiguration("publish_calibrated_frames")
     publish_calibrated_markers = LaunchConfiguration("publish_calibrated_markers")
+    publish_laser_planes = LaunchConfiguration("publish_laser_planes")
     tool_config_path = LaunchConfiguration("tool_config_path")
-    handeye_config_path = LaunchConfiguration("handeye_config_path")
     tcp_frame = LaunchConfiguration("tcp_frame")
-    camera_frame = LaunchConfiguration("camera_frame")
     calibration_marker_topic = LaunchConfiguration("calibration_marker_topic")
+    laser_650_plane_path = LaunchConfiguration("laser_650_plane_path")
+    laser_650_intrinsics_path = LaunchConfiguration("laser_650_intrinsics_path")
+    laser_450_plane_path = LaunchConfiguration("laser_450_plane_path")
+    laser_450_intrinsics_path = LaunchConfiguration("laser_450_intrinsics_path")
     use_rviz = LaunchConfiguration("use_rviz")
 
     state_publisher = Node(
@@ -70,14 +77,19 @@ def generate_launch_description():
         output="screen",
         parameters=[{
             "tool_config_path": tool_config_path,
-            "handeye_config_path": handeye_config_path,
             "flange_frame": flange_frame,
             "tcp_frame": tcp_frame,
-            "camera_frame": camera_frame,
             "marker_topic": calibration_marker_topic,
             "publish_markers": ParameterValue(
                 publish_calibrated_markers, value_type=bool
             ),
+            "publish_laser_planes": ParameterValue(
+                publish_laser_planes, value_type=bool
+            ),
+            "laser_650_plane_path": laser_650_plane_path,
+            "laser_650_intrinsics_path": laser_650_intrinsics_path,
+            "laser_450_plane_path": laser_450_plane_path,
+            "laser_450_intrinsics_path": laser_450_intrinsics_path,
         }],
         condition=IfCondition(publish_calibrated_frames),
     )
@@ -121,12 +133,17 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "publish_calibrated_frames",
             default_value="true",
-            description="Publish calibrated flange -> weld TCP and left-camera TFs.",
+            description="Publish the calibrated flange -> weld TCP TF.",
         ),
         DeclareLaunchArgument(
             "publish_calibrated_markers",
             default_value="true",
-            description="Show colored TCP/camera origin points and labels in RViz.",
+            description="Show the weld-TCP origin and calibrated geometry in RViz.",
+        ),
+        DeclareLaunchArgument(
+            "publish_laser_planes",
+            default_value="true",
+            description="Show both calibrated HIK line-laser planes in RViz.",
         ),
         DeclareLaunchArgument(
             "tool_config_path",
@@ -134,24 +151,46 @@ def generate_launch_description():
             description="Path to flange -> weld-gun TCP calibration YAML.",
         ),
         DeclareLaunchArgument(
-            "handeye_config_path",
-            default_value=find_project_config(bringup_share, "handeye_config.yaml"),
-            description="Path to Vizum left-camera hand-eye calibration YAML.",
-        ),
-        DeclareLaunchArgument(
             "tcp_frame",
             default_value="weld_gun_tcp",
             description="TF child frame at the calibrated weld-gun TCP.",
         ),
         DeclareLaunchArgument(
-            "camera_frame",
-            default_value="vizum_left_camera_optical_frame",
-            description="TF child frame at the calibrated Vizum left-camera origin.",
-        ),
-        DeclareLaunchArgument(
             "calibration_marker_topic",
             default_value="fairino/calibrated_points",
-            description="MarkerArray topic for calibrated TCP/camera origin points.",
+            description="MarkerArray topic for weld-TCP and HIK laser planes.",
+        ),
+        DeclareLaunchArgument(
+            "laser_650_plane_path",
+            default_value=find_project_file(
+                bringup_share,
+                "myline_hik/config/devices/scanner_650/hik_laser_plane.yaml",
+            ),
+            description="Path to the HIK 650 line-laser plane calibration YAML.",
+        ),
+        DeclareLaunchArgument(
+            "laser_650_intrinsics_path",
+            default_value=find_project_file(
+                bringup_share,
+                "myline_hik/config/devices/scanner_650/hik_intrinsics.yaml",
+            ),
+            description="Path to the HIK 650 camera intrinsics YAML.",
+        ),
+        DeclareLaunchArgument(
+            "laser_450_plane_path",
+            default_value=find_project_file(
+                bringup_share,
+                "myline_hik/config/devices/scanner_450/hik_laser_plane.yaml",
+            ),
+            description="Path to the HIK 450 line-laser plane calibration YAML.",
+        ),
+        DeclareLaunchArgument(
+            "laser_450_intrinsics_path",
+            default_value=find_project_file(
+                bringup_share,
+                "myline_hik/config/devices/scanner_450/hik_intrinsics.yaml",
+            ),
+            description="Path to the HIK 450 camera intrinsics YAML.",
         ),
         DeclareLaunchArgument(
             "use_rviz",

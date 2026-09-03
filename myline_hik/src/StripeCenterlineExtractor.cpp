@@ -644,6 +644,10 @@ void finalizeLineCandidates(LineCandidates* line,
     if (!line || line->values.empty()) {
         return;
     }
+    // A clipped or slightly asymmetric physical ridge can create several
+    // adjacent discrete local maxima. Treat those maxima as one optical
+    // hypothesis before computing the competing-peak ratio; otherwise the
+    // duplicate maxima can erase every real branch on the scanline.
     std::sort(
         line->values.begin(), line->values.end(),
         [](const Candidate& first, const Candidate& second) {
@@ -652,6 +656,28 @@ void finalizeLineCandidates(LineCandidates* line,
             }
             return first.peakIndex < second.peakIndex;
         });
+    std::vector<Candidate> clustered;
+    clustered.reserve(line->values.size());
+    for (const Candidate& candidate : line->values) {
+        bool duplicate = false;
+        for (const Candidate& representative : clustered) {
+            const double dx = candidate.pixel.x - representative.pixel.x;
+            const double dy = candidate.pixel.y - representative.pixel.y;
+            const double distance = std::sqrt(dx * dx + dy * dy);
+            const double mergeDistance = std::max(
+                options.peakMergeMinimumDistancePx,
+                options.peakMergeFwhmScale *
+                    std::min(candidate.fwhmPx, representative.fwhmPx));
+            if (distance <= mergeDistance) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            clustered.push_back(candidate);
+        }
+    }
+    line->values.swap(clustered);
     if (line->values.size() > static_cast<std::size_t>(
             options.maximumCandidatesPerScanline)) {
         line->values.resize(static_cast<std::size_t>(
@@ -668,6 +694,9 @@ void finalizeLineCandidates(LineCandidates* line,
     for (Candidate& candidate : line->values) {
         candidate.secondPeakRatio = secondPeakRatio;
         if (secondPeakRatio > options.maximumSecondPeakRatio) {
+            // This is deliberately a soft lattice flag. usableForPath()
+            // excludes only fatal optical/mask failures, so continuity can
+            // resolve a multi-peak scanline instead of turning it into GAP.
             candidate.rejectFlags |= REJECT_MULTI_PEAK_AMBIGUOUS;
         }
         const double multiPeakScore = clamp01(
@@ -683,6 +712,9 @@ void finalizeLineCandidates(LineCandidates* line,
             if (candidate.saturatedFraction > 0.0) {
                 ++diagnostics->saturatedCandidateCount;
             }
+            if (candidate.usableForPath()) {
+                ++diagnostics->pathUsableCandidateCount;
+            }
             if (candidate.accepted()) {
                 ++diagnostics->acceptedCandidateCount;
             } else {
@@ -693,14 +725,257 @@ void finalizeLineCandidates(LineCandidates* line,
 }
 
 struct PathState {
-    bool valid{false};
-    double cost{std::numeric_limits<double>::infinity()};
+    int currentLine{-1};
+    int currentCandidate{-1};
     int previousLine{-1};
     int previousCandidate{-1};
+    int bestPreviousState{-1};
+    int bestNextState{-1};
+    double forwardCost{std::numeric_limits<double>::infinity()};
+    double backwardCost{std::numeric_limits<double>::infinity()};
     double lastSlope{0.0};
     bool hasSlope{false};
     int pointCount{0};
 };
+
+struct EdgeLookup {
+    int previousLine{-1};
+    int previousCandidate{-1};
+    int stateId{-1};
+};
+
+struct LocalAlternative {
+    std::size_t diagnosticIndex{0U};
+    int alternateState{-1};
+    double totalCost{std::numeric_limits<double>::infinity()};
+    int differenceCount{0};
+};
+
+struct IntervalHypothesis {
+    double pathCost{std::numeric_limits<double>::infinity()};
+    std::vector<std::pair<int, int>> path;
+};
+
+double pathNodeCost(const Candidate& candidate, const Options& options) {
+    return -options.pathCandidateReward * candidate.quality;
+}
+
+bool transitionIncrement(const std::vector<LineCandidates>& lines,
+                         const PathState& previousState,
+                         int currentLine,
+                         int currentCandidate,
+                         Orientation orientation,
+                         const Options& options,
+                         double* increment) {
+    if (!increment || previousState.currentLine < 0 ||
+        previousState.currentCandidate < 0) {
+        return false;
+    }
+    const Candidate& previous =
+        lines[static_cast<std::size_t>(previousState.currentLine)]
+             .values[static_cast<std::size_t>(
+                 previousState.currentCandidate)];
+    const Candidate& current =
+        lines[static_cast<std::size_t>(currentLine)]
+             .values[static_cast<std::size_t>(currentCandidate)];
+    const int scanDelta =
+        current.scanIndex - previous.scanIndex;
+    if (scanDelta <= 0) {
+        return false;
+    }
+    const int gap = scanDelta - 1;
+    if (gap > options.pathMaximumGap) {
+        return false;
+    }
+    const double displacement =
+        minorCoordinate(current, orientation) -
+        minorCoordinate(previous, orientation);
+    const double signedSlope =
+        displacement / static_cast<double>(scanDelta);
+    const double step = std::fabs(signedSlope);
+    if (step > options.pathMaximumStepPx) {
+        return false;
+    }
+    if (gap > 0) {
+        // Missing/ambiguous columns must not make a branch jump appear safe
+        // merely because the displacement was divided by scanDelta.
+        const double predicted = minorCoordinate(previous, orientation) +
+            (previousState.hasSlope
+                 ? previousState.lastSlope *
+                       static_cast<double>(scanDelta)
+                 : 0.0);
+        if (std::fabs(
+                minorCoordinate(current, orientation) - predicted) >
+                options.pathMaximumPredictionResidualPx ||
+            std::fabs(displacement) >
+                options.pathMaximumStepPx +
+                    options.pathMaximumPredictionResidualPx) {
+            return false;
+        }
+    }
+
+    double transitionCost =
+        options.pathPositionPenalty * huber(step, 1.0);
+    if (previousState.hasSlope) {
+        transitionCost += options.pathCurvaturePenalty *
+            huber(
+                std::fabs(signedSlope - previousState.lastSlope),
+                0.5);
+    }
+    if (gap > 0) {
+        transitionCost += options.pathGapOpenPenalty +
+            options.pathGapExtendPenalty * static_cast<double>(gap);
+    }
+    *increment = transitionCost + pathNodeCost(current, options);
+    return std::isfinite(*increment);
+}
+
+std::vector<std::pair<int, int>> tracePrefix(
+        const std::vector<PathState>& states,
+        int stateId) {
+    std::vector<std::pair<int, int>> reversed;
+    while (stateId >= 0) {
+        const PathState& state =
+            states[static_cast<std::size_t>(stateId)];
+        reversed.push_back(std::make_pair(
+            state.currentLine, state.currentCandidate));
+        stateId = state.bestPreviousState;
+    }
+    std::reverse(reversed.begin(), reversed.end());
+    return reversed;
+}
+
+std::vector<std::pair<int, int>> traceComplete(
+        const std::vector<PathState>& states,
+        int stateId) {
+    std::vector<std::pair<int, int>> path =
+        tracePrefix(states, stateId);
+    int nextState =
+        states[static_cast<std::size_t>(stateId)].bestNextState;
+    while (nextState >= 0) {
+        const PathState& state =
+            states[static_cast<std::size_t>(nextState)];
+        path.push_back(std::make_pair(
+            state.currentLine, state.currentCandidate));
+        nextState = state.bestNextState;
+    }
+    return path;
+}
+
+int pathDifferenceCount(
+        const std::vector<std::pair<int, int>>& first,
+        const std::vector<std::pair<int, int>>& second) {
+    std::map<int, int> firstByLine;
+    std::map<int, int> secondByLine;
+    for (const std::pair<int, int>& node : first) {
+        firstByLine[node.first] = node.second;
+    }
+    for (const std::pair<int, int>& node : second) {
+        secondByLine[node.first] = node.second;
+    }
+    std::map<int, int>::const_iterator firstIt = firstByLine.begin();
+    std::map<int, int>::const_iterator secondIt = secondByLine.begin();
+    int different = 0;
+    while (firstIt != firstByLine.end() ||
+           secondIt != secondByLine.end()) {
+        if (secondIt == secondByLine.end() ||
+            (firstIt != firstByLine.end() &&
+             firstIt->first < secondIt->first)) {
+            ++different;
+            ++firstIt;
+        } else if (firstIt == firstByLine.end() ||
+                   secondIt->first < firstIt->first) {
+            ++different;
+            ++secondIt;
+        } else {
+            if (firstIt->second != secondIt->second) {
+                ++different;
+            }
+            ++firstIt;
+            ++secondIt;
+        }
+    }
+    return different;
+}
+
+void findDivergenceBoundaries(
+        const std::vector<std::pair<int, int>>& bestPath,
+        const std::vector<std::pair<int, int>>& alternatePath,
+        int evidenceLine,
+        int lineCount,
+        int* coreFirstLine,
+        int* coreLastLine,
+        int* leftAnchorLine,
+        int* rightAnchorLine) {
+    std::map<int, int> bestByLine;
+    std::map<int, int> alternateByLine;
+    for (const std::pair<int, int>& node : bestPath) {
+        bestByLine[node.first] = node.second;
+    }
+    for (const std::pair<int, int>& node : alternatePath) {
+        alternateByLine[node.first] = node.second;
+    }
+    const auto isCommonCandidate =
+        [&bestByLine, &alternateByLine](int line) {
+            const std::map<int, int>::const_iterator best =
+                bestByLine.find(line);
+            const std::map<int, int>::const_iterator alternate =
+                alternateByLine.find(line);
+            return best != bestByLine.end() &&
+                   alternate != alternateByLine.end() &&
+                   best->second == alternate->second;
+        };
+
+    int leftAnchor = -1;
+    for (int line = evidenceLine - 1; line >= 0; --line) {
+        if (isCommonCandidate(line)) {
+            leftAnchor = line;
+            break;
+        }
+    }
+    int rightAnchor = -1;
+    for (int line = evidenceLine + 1;
+         line < lineCount; ++line) {
+        if (isCommonCandidate(line)) {
+            rightAnchor = line;
+            break;
+        }
+    }
+    if (leftAnchorLine) {
+        *leftAnchorLine = leftAnchor;
+    }
+    if (rightAnchorLine) {
+        *rightAnchorLine = rightAnchor;
+    }
+    if (coreFirstLine) {
+        *coreFirstLine = leftAnchor >= 0
+            ? leftAnchor + 1 : 0;
+    }
+    if (coreLastLine) {
+        *coreLastLine = rightAnchor >= 0
+            ? rightAnchor - 1 : std::max(0, lineCount - 1);
+    }
+}
+
+int findEdgeState(
+        const std::vector<EdgeLookup>& lookup,
+        int previousLine,
+        int previousCandidate) {
+    for (const EdgeLookup& entry : lookup) {
+        if (entry.previousLine == previousLine &&
+            entry.previousCandidate == previousCandidate) {
+            return entry.stateId;
+        }
+    }
+    return -1;
+}
+
+Candidate candidateAt(
+        const std::vector<LineCandidates>& lines,
+        const std::pair<int, int>& node) {
+    return lines[static_cast<std::size_t>(node.first)]
+                .values[static_cast<std::size_t>(node.second)];
+}
 
 bool optimizePath(std::vector<LineCandidates>* lines,
                   Orientation orientation,
@@ -709,26 +984,36 @@ bool optimizePath(std::vector<LineCandidates>* lines,
     if (!lines || !result || lines->empty()) {
         return false;
     }
-    std::vector<std::vector<PathState>> states(lines->size());
+    std::vector<PathState> states;
+    std::vector<std::vector<std::vector<int>>> statesEndingAt(
+        lines->size());
+    std::vector<std::vector<std::vector<EdgeLookup>>> edgeLookup(
+        lines->size());
     for (std::size_t lineOffset = 0U;
          lineOffset < lines->size(); ++lineOffset) {
         LineCandidates& line = (*lines)[lineOffset];
-        states[lineOffset].resize(line.values.size());
+        statesEndingAt[lineOffset].resize(line.values.size());
+        edgeLookup[lineOffset].resize(line.values.size());
         for (std::size_t candidateIndex = 0U;
              candidateIndex < line.values.size(); ++candidateIndex) {
             Candidate& candidate = line.values[candidateIndex];
-            if (!candidate.accepted()) {
+            if (!candidate.usableForPath()) {
                 continue;
             }
-            PathState best;
-            const double nodeCost =
-                -options.pathCandidateReward * candidate.quality;
-            best.valid = true;
-            best.cost =
+
+            PathState start;
+            start.currentLine = static_cast<int>(lineOffset);
+            start.currentCandidate =
+                static_cast<int>(candidateIndex);
+            start.forwardCost =
                 static_cast<double>(lineOffset) *
                     options.pathGapExtendPenalty +
-                nodeCost;
-            best.pointCount = 1;
+                pathNodeCost(candidate, options);
+            start.pointCount = 1;
+            const int startId = static_cast<int>(states.size());
+            states.push_back(start);
+            statesEndingAt[lineOffset][candidateIndex].push_back(
+                startId);
 
             const std::size_t earliest =
                 lineOffset > static_cast<std::size_t>(
@@ -738,221 +1023,615 @@ bool optimizePath(std::vector<LineCandidates>* lines,
                 : 0U;
             for (std::size_t previousLine = earliest;
                  previousLine < lineOffset; ++previousLine) {
-                const int scanDelta =
-                    line.scanIndex -
-                    (*lines)[previousLine].scanIndex;
-                if (scanDelta <= 0) {
-                    continue;
-                }
-                const int gap = scanDelta - 1;
-                if (gap > options.pathMaximumGap) {
-                    continue;
-                }
                 for (std::size_t previousCandidate = 0U;
                      previousCandidate <
                          (*lines)[previousLine].values.size();
                      ++previousCandidate) {
-                    const PathState& previousState =
-                        states[previousLine][previousCandidate];
-                    if (!previousState.valid) {
+                    if (!(*lines)[previousLine]
+                             .values[previousCandidate]
+                             .usableForPath()) {
+                        continue;
+                    }
+                    double bestCost =
+                        std::numeric_limits<double>::infinity();
+                    int bestPreviousState = -1;
+                    double edgeSlope = 0.0;
+                    for (const int sourceId :
+                         statesEndingAt[previousLine]
+                                       [previousCandidate]) {
+                        double increment = 0.0;
+                        if (!transitionIncrement(
+                                *lines,
+                                states[static_cast<std::size_t>(
+                                    sourceId)],
+                                static_cast<int>(lineOffset),
+                                static_cast<int>(candidateIndex),
+                                orientation, options, &increment)) {
+                            continue;
+                        }
+                        const double cost =
+                            states[static_cast<std::size_t>(
+                                sourceId)].forwardCost +
+                            increment;
+                        if (cost < bestCost) {
+                            bestCost = cost;
+                            bestPreviousState = sourceId;
+                        }
+                    }
+                    if (bestPreviousState < 0) {
                         continue;
                     }
                     const Candidate& previous =
-                        (*lines)[previousLine].values[previousCandidate];
-                    const double signedSlope =
+                        (*lines)[previousLine]
+                            .values[previousCandidate];
+                    const int scanDelta =
+                        candidate.scanIndex - previous.scanIndex;
+                    edgeSlope =
                         (minorCoordinate(candidate, orientation) -
                          minorCoordinate(previous, orientation)) /
                         static_cast<double>(scanDelta);
-                    const double step = std::fabs(signedSlope);
-                    if (step > options.pathMaximumStepPx) {
-                        continue;
-                    }
-                    double transitionCost =
-                        options.pathPositionPenalty *
-                            huber(step, 1.0);
-                    if (previousState.hasSlope) {
-                        transitionCost +=
-                            options.pathCurvaturePenalty *
-                            huber(
-                                std::fabs(
-                                    signedSlope -
-                                    previousState.lastSlope),
-                                0.5);
-                    }
-                    if (gap > 0) {
-                        transitionCost +=
-                            options.pathGapOpenPenalty +
-                            options.pathGapExtendPenalty *
-                                static_cast<double>(gap);
-                    }
-                    const double cost =
-                        previousState.cost + transitionCost + nodeCost;
-                    if (cost < best.cost) {
-                        best.valid = true;
-                        best.cost = cost;
-                        best.previousLine =
-                            static_cast<int>(previousLine);
-                        best.previousCandidate =
-                            static_cast<int>(previousCandidate);
-                        best.lastSlope = signedSlope;
-                        best.hasSlope = true;
-                        best.pointCount =
-                            previousState.pointCount + 1;
-                    }
+
+                    PathState edge;
+                    edge.currentLine =
+                        static_cast<int>(lineOffset);
+                    edge.currentCandidate =
+                        static_cast<int>(candidateIndex);
+                    edge.previousLine =
+                        static_cast<int>(previousLine);
+                    edge.previousCandidate =
+                        static_cast<int>(previousCandidate);
+                    edge.bestPreviousState = bestPreviousState;
+                    edge.forwardCost = bestCost;
+                    edge.lastSlope = edgeSlope;
+                    edge.hasSlope = true;
+                    edge.pointCount =
+                        states[static_cast<std::size_t>(
+                            bestPreviousState)].pointCount + 1;
+                    const int edgeId =
+                        static_cast<int>(states.size());
+                    states.push_back(edge);
+                    statesEndingAt[lineOffset][candidateIndex]
+                        .push_back(edgeId);
+                    EdgeLookup lookup;
+                    lookup.previousLine =
+                        static_cast<int>(previousLine);
+                    lookup.previousCandidate =
+                        static_cast<int>(previousCandidate);
+                    lookup.stateId = edgeId;
+                    edgeLookup[lineOffset][candidateIndex]
+                        .push_back(lookup);
                 }
             }
-            states[lineOffset][candidateIndex] = best;
         }
     }
 
-    struct Ending {
-        double cost;
-        int line;
-        int candidate;
-        int pointCount;
-    };
-    std::vector<Ending> endings;
     const double allGapCost =
         static_cast<double>(lines->size()) *
         options.pathGapExtendPenalty;
-    endings.push_back(Ending{
-        allGapCost, -1, -1, 0});
-    for (std::size_t lineOffset = 0U;
-         lineOffset < lines->size(); ++lineOffset) {
+    double bestCost = allGapCost;
+    int bestEndingState = -1;
+    int bestPointCount = 0;
+    for (std::size_t stateIndex = 0U;
+         stateIndex < states.size(); ++stateIndex) {
+        const PathState& state = states[stateIndex];
         const double trailing =
-            static_cast<double>(lines->size() - lineOffset - 1U) *
+            static_cast<double>(
+                lines->size() -
+                static_cast<std::size_t>(state.currentLine) - 1U) *
             options.pathGapExtendPenalty;
-        for (std::size_t candidateIndex = 0U;
-             candidateIndex < states[lineOffset].size();
-             ++candidateIndex) {
-            const PathState& state =
-                states[lineOffset][candidateIndex];
-            if (!state.valid) {
-                continue;
-            }
-            endings.push_back(Ending{
-                state.cost + trailing,
-                static_cast<int>(lineOffset),
-                static_cast<int>(candidateIndex),
-                state.pointCount});
+        const double total = state.forwardCost + trailing;
+        if (total < bestCost ||
+            (total == bestCost &&
+             state.pointCount > bestPointCount)) {
+            bestCost = total;
+            bestEndingState = static_cast<int>(stateIndex);
+            bestPointCount = state.pointCount;
         }
     }
-    std::sort(
-        endings.begin(), endings.end(),
-        [](const Ending& first, const Ending& second) {
-            if (first.cost != second.cost) {
-                return first.cost < second.cost;
-            }
-            return first.pointCount > second.pointCount;
-        });
-    if (endings.empty() || endings.front().line < 0) {
+    if (bestEndingState < 0) {
         result->error =
             "quality path optimizer selected only GAP states";
         result->diagnostics.bestPathCost = allGapCost;
         return false;
     }
-    const Ending bestEnding = endings.front();
-    const auto traceback =
-        [&states](const Ending& ending) {
-            std::vector<std::pair<int, int>> reversed;
-            int line = ending.line;
-            int candidateIndex = ending.candidate;
-            while (line >= 0 && candidateIndex >= 0) {
-                reversed.push_back(
-                    std::make_pair(line, candidateIndex));
-                const PathState& state =
-                    states[static_cast<std::size_t>(line)]
-                          [static_cast<std::size_t>(candidateIndex)];
-                const int previousLine = state.previousLine;
-                const int previousCandidate =
-                    state.previousCandidate;
-                line = previousLine;
-                candidateIndex = previousCandidate;
+
+    // Backward cost on the same second-order edge graph. Re-enumerating
+    // outgoing transitions avoids storing a very large adjacency list.
+    for (std::vector<PathState>::reverse_iterator stateIt =
+             states.rbegin();
+         stateIt != states.rend(); ++stateIt) {
+        PathState& state = *stateIt;
+        state.backwardCost =
+            static_cast<double>(
+                lines->size() -
+                static_cast<std::size_t>(state.currentLine) - 1U) *
+            options.pathGapExtendPenalty;
+        const std::size_t latest = std::min(
+            lines->size(),
+            static_cast<std::size_t>(state.currentLine) +
+                static_cast<std::size_t>(
+                    options.pathMaximumGap + 2));
+        for (std::size_t nextLine =
+                 static_cast<std::size_t>(state.currentLine + 1);
+             nextLine < latest; ++nextLine) {
+            for (std::size_t nextCandidate = 0U;
+                 nextCandidate <
+                     (*lines)[nextLine].values.size();
+                 ++nextCandidate) {
+                const int nextState = findEdgeState(
+                    edgeLookup[nextLine][nextCandidate],
+                    state.currentLine, state.currentCandidate);
+                if (nextState < 0) {
+                    continue;
+                }
+                double increment = 0.0;
+                if (!transitionIncrement(
+                        *lines, state,
+                        static_cast<int>(nextLine),
+                        static_cast<int>(nextCandidate),
+                        orientation, options, &increment)) {
+                    continue;
+                }
+                const double suffix =
+                    increment +
+                    states[static_cast<std::size_t>(
+                        nextState)].backwardCost;
+                if (suffix < state.backwardCost) {
+                    state.backwardCost = suffix;
+                    state.bestNextState = nextState;
+                }
             }
-            std::reverse(reversed.begin(), reversed.end());
-            return reversed;
-        };
-    const std::vector<std::pair<int, int>> reversed =
-        traceback(bestEnding);
+        }
+    }
+
+    const std::vector<std::pair<int, int>> bestPath =
+        tracePrefix(states, bestEndingState);
+    result->provisionalSelected.reserve(bestPath.size());
+    for (const std::pair<int, int>& node : bestPath) {
+        result->provisionalSelected.push_back(
+            candidateAt(*lines, node));
+    }
+
+    std::map<int, int> bestCandidateByLine;
+    for (const std::pair<int, int>& node : bestPath) {
+        bestCandidateByLine[node.first] = node.second;
+    }
+    std::vector<LocalAlternative> alternatives;
     double secondCost =
         std::numeric_limits<double>::infinity();
-    // End states that merely truncate the same path are not a competing
-    // physical stripe. Select the first alternative whose candidate sequence
-    // differs on at least 10% of the shorter path.
-    for (std::size_t endingIndex = 1U;
-         endingIndex < endings.size(); ++endingIndex) {
-        if (endings[endingIndex].line < 0) {
-            continue;
-        }
-        const std::vector<std::pair<int, int>> alternative =
-            traceback(endings[endingIndex]);
-        if (alternative.empty()) {
-            continue;
-        }
-        std::size_t same = 0U;
-        std::size_t firstIndex = 0U;
-        std::size_t secondIndex = 0U;
-        while (firstIndex < reversed.size() &&
-               secondIndex < alternative.size()) {
-            if (reversed[firstIndex] == alternative[secondIndex]) {
-                ++same;
-                ++firstIndex;
-                ++secondIndex;
-            } else if (reversed[firstIndex] <
-                       alternative[secondIndex]) {
-                ++firstIndex;
-            } else {
-                ++secondIndex;
+    double minimumRawMargin =
+        std::numeric_limits<double>::infinity();
+    double minimumLocalMargin =
+        std::numeric_limits<double>::infinity();
+    for (const std::pair<int, int>& bestNode : bestPath) {
+        const Candidate& selected =
+            (*lines)[static_cast<std::size_t>(bestNode.first)]
+                .values[static_cast<std::size_t>(bestNode.second)];
+        PathScanlineDiagnostic diagnostic;
+        diagnostic.scanIndex = selected.scanIndex;
+        diagnostic.hasSelected = true;
+        diagnostic.selectedPixel = selected.pixel;
+
+        int alternateState = -1;
+        double alternateTotal =
+            std::numeric_limits<double>::infinity();
+        const std::vector<LineCandidates>::const_reference line =
+            (*lines)[static_cast<std::size_t>(bestNode.first)];
+        for (std::size_t candidateIndex = 0U;
+             candidateIndex < line.values.size(); ++candidateIndex) {
+            if (static_cast<int>(candidateIndex) ==
+                    bestNode.second ||
+                !line.values[candidateIndex].usableForPath()) {
+                continue;
+            }
+            const double separation = std::fabs(
+                minorCoordinate(
+                    line.values[candidateIndex], orientation) -
+                minorCoordinate(selected, orientation));
+            if (separation <
+                options.pathAmbiguityMinimumSeparationPx) {
+                continue;
+            }
+            for (const int stateId :
+                 statesEndingAt[static_cast<std::size_t>(
+                     bestNode.first)][candidateIndex]) {
+                const PathState& state =
+                    states[static_cast<std::size_t>(stateId)];
+                const double total =
+                    state.forwardCost + state.backwardCost;
+                if (total < alternateTotal) {
+                    alternateTotal = total;
+                    alternateState = stateId;
+                }
             }
         }
-        const std::size_t shorter = std::min(
-            reversed.size(), alternative.size());
-        const double sameFraction = shorter > 0U
-            ? static_cast<double>(same) /
-                  static_cast<double>(shorter)
-            : 1.0;
-        if (sameFraction <= 0.90) {
-            secondCost = endings[endingIndex].cost;
-            break;
+        if (alternateState >= 0) {
+            const PathState& alternate =
+                states[static_cast<std::size_t>(alternateState)];
+            const Candidate& alternateCandidate =
+                (*lines)[static_cast<std::size_t>(
+                    alternate.currentLine)]
+                    .values[static_cast<std::size_t>(
+                        alternate.currentCandidate)];
+            const std::vector<std::pair<int, int>> alternatePath =
+                traceComplete(states, alternateState);
+            const int differenceCount = std::max(
+                1, pathDifferenceCount(bestPath, alternatePath));
+            const double rawMargin = std::max(
+                0.0, alternateTotal - bestCost);
+            const double localMargin =
+                rawMargin / static_cast<double>(differenceCount);
+            diagnostic.hasAlternate = true;
+            diagnostic.alternatePixel = alternateCandidate.pixel;
+            diagnostic.separationPx = std::fabs(
+                minorCoordinate(alternateCandidate, orientation) -
+                minorCoordinate(selected, orientation));
+            diagnostic.localCostMargin = localMargin;
+            secondCost = std::min(secondCost, alternateTotal);
+            minimumRawMargin =
+                std::min(minimumRawMargin, rawMargin);
+            minimumLocalMargin =
+                std::min(minimumLocalMargin, localMargin);
+            if (localMargin <=
+                    options.pathAmbiguityMarginPerPoint +
+                        kEpsilon) {
+                LocalAlternative evidence;
+                evidence.diagnosticIndex =
+                    result->pathDiagnostics.size();
+                evidence.alternateState = alternateState;
+                evidence.totalCost = alternateTotal;
+                evidence.differenceCount = differenceCount;
+                alternatives.push_back(evidence);
+            }
         }
+        result->pathDiagnostics.push_back(diagnostic);
     }
-    result->diagnostics.bestPathCost = bestEnding.cost;
+
+    result->diagnostics.bestPathCost = bestCost;
     result->diagnostics.secondPathCost = secondCost;
-    result->diagnostics.pathCostMargin =
-        std::isfinite(secondCost)
-        ? secondCost - bestEnding.cost
-        : std::numeric_limits<double>::infinity();
+    result->diagnostics.pathCostMargin = minimumRawMargin;
     result->diagnostics.pathCostMarginPerPoint =
-        result->diagnostics.pathCostMargin /
-        static_cast<double>(std::max(1, bestEnding.pointCount));
+        minimumLocalMargin;
 
-    result->selected.reserve(reversed.size());
-    for (const std::pair<int, int>& index : reversed) {
-        result->selected.push_back(
-            (*lines)[static_cast<std::size_t>(index.first)]
-                .values[static_cast<std::size_t>(index.second)]);
-    }
-
-    const bool ambiguous =
-        std::isfinite(
-            result->diagnostics.pathCostMarginPerPoint) &&
-        result->diagnostics.pathCostMarginPerPoint <
-            options.pathAmbiguityMarginPerPoint;
-    if (ambiguous) {
-        for (Candidate& candidate : result->selected) {
-            candidate.rejectFlags |= REJECT_PATH_AMBIGUOUS;
+    // Merge consecutive low-margin evidence into divergence/reconvergence
+    // intervals, then pad them before publishing any points.
+    std::vector<std::vector<IntervalHypothesis>>
+        intervalHypotheses;
+    std::size_t evidenceBegin = 0U;
+    while (evidenceBegin < alternatives.size()) {
+        std::size_t evidenceEnd = evidenceBegin;
+        int previousScan =
+            result->pathDiagnostics[
+                alternatives[evidenceBegin].diagnosticIndex]
+                .scanIndex;
+        while (evidenceEnd + 1U < alternatives.size()) {
+            const int nextScan =
+                result->pathDiagnostics[
+                    alternatives[evidenceEnd + 1U]
+                        .diagnosticIndex].scanIndex;
+            if (nextScan - previousScan >
+                std::max(
+                    1,
+                    options.pathAmbiguityPaddingScanlines + 1)) {
+                break;
+            }
+            ++evidenceEnd;
+            previousScan = nextScan;
         }
-        result->diagnostics.ambiguousPathPointCount =
-            result->selected.size();
+
+        std::size_t representative = evidenceBegin;
+        double intervalMinimumMargin =
+            std::numeric_limits<double>::infinity();
+        double intervalMaximumSeparation = 0.0;
+        for (std::size_t index = evidenceBegin;
+             index <= evidenceEnd; ++index) {
+            const PathScanlineDiagnostic& diagnostic =
+                result->pathDiagnostics[
+                    alternatives[index].diagnosticIndex];
+            intervalMinimumMargin = std::min(
+                intervalMinimumMargin,
+                diagnostic.localCostMargin);
+            intervalMaximumSeparation = std::max(
+                intervalMaximumSeparation,
+                diagnostic.separationPx);
+            if (diagnostic.localCostMargin <
+                result->pathDiagnostics[
+                    alternatives[representative]
+                        .diagnosticIndex].localCostMargin) {
+                representative = index;
+            }
+        }
+
+        const std::vector<std::pair<int, int>> alternatePath =
+            traceComplete(
+                states,
+                alternatives[representative].alternateState);
+        int coreFirstLine = 0;
+        int coreLastLine =
+            static_cast<int>(lines->size()) - 1;
+        int leftAnchorLine = -1;
+        int rightAnchorLine = -1;
+        findDivergenceBoundaries(
+            bestPath, alternatePath,
+            states[static_cast<std::size_t>(
+                alternatives[representative].alternateState)]
+                .currentLine,
+            static_cast<int>(lines->size()),
+            &coreFirstLine, &coreLastLine,
+            &leftAnchorLine, &rightAnchorLine);
+
+        MultipathInterval interval;
+        interval.intervalId =
+            static_cast<int>(result->multipathIntervals.size());
+        interval.minimumLocalCostMargin =
+            intervalMinimumMargin;
+        interval.maximumSeparationPx =
+            intervalMaximumSeparation;
+        interval.coreFirstScanIndex =
+            (*lines)[static_cast<std::size_t>(
+                coreFirstLine)].scanIndex;
+        interval.coreLastScanIndex =
+            (*lines)[static_cast<std::size_t>(
+                coreLastLine)].scanIndex;
+        interval.leftBoundaryOpen = leftAnchorLine < 0;
+        interval.rightBoundaryOpen = rightAnchorLine < 0;
+        interval.leftAnchorScanIndex = leftAnchorLine >= 0
+            ? (*lines)[static_cast<std::size_t>(
+                  leftAnchorLine)].scanIndex
+            : -1;
+        interval.rightAnchorScanIndex = rightAnchorLine >= 0
+            ? (*lines)[static_cast<std::size_t>(
+                  rightAnchorLine)].scanIndex
+            : -1;
+        interval.firstScanIndex = interval.leftBoundaryOpen
+            ? lines->front().scanIndex
+            : std::min(
+                  interval.leftAnchorScanIndex,
+                  std::max(
+                      lines->front().scanIndex,
+                      interval.coreFirstScanIndex -
+                          options
+                              .pathAmbiguityPaddingScanlines));
+        interval.lastScanIndex = interval.rightBoundaryOpen
+            ? lines->back().scanIndex
+            : std::max(
+                  interval.rightAnchorScanIndex,
+                  std::min(
+                      lines->back().scanIndex,
+                      interval.coreLastScanIndex +
+                          options
+                              .pathAmbiguityPaddingScanlines));
+
+        IntervalHypothesis hypothesis;
+        hypothesis.pathCost =
+            alternatives[representative].totalCost;
+        hypothesis.path = alternatePath;
+        result->multipathIntervals.push_back(interval);
+        intervalHypotheses.push_back(
+            std::vector<IntervalHypothesis>(1U, hypothesis));
+        evidenceBegin = evidenceEnd + 1U;
     }
-    return !result->selected.empty();
+
+    if (!result->multipathIntervals.empty()) {
+        std::vector<MultipathInterval> mergedIntervals;
+        std::vector<std::vector<IntervalHypothesis>>
+            mergedHypotheses;
+        std::vector<std::size_t> intervalOrder(
+            result->multipathIntervals.size());
+        std::iota(
+            intervalOrder.begin(), intervalOrder.end(), 0U);
+        std::sort(
+            intervalOrder.begin(), intervalOrder.end(),
+            [result](std::size_t first, std::size_t second) {
+                const MultipathInterval& firstInterval =
+                    result->multipathIntervals[first];
+                const MultipathInterval& secondInterval =
+                    result->multipathIntervals[second];
+                if (firstInterval.firstScanIndex !=
+                    secondInterval.firstScanIndex) {
+                    return firstInterval.firstScanIndex <
+                           secondInterval.firstScanIndex;
+                }
+                return firstInterval.lastScanIndex <
+                       secondInterval.lastScanIndex;
+            });
+        const int mergeDistance = std::max(
+            1, 2 * options.pathAmbiguityPaddingScanlines + 1);
+        for (const std::size_t index : intervalOrder) {
+            const MultipathInterval& next =
+                result->multipathIntervals[index];
+            if (mergedIntervals.empty() ||
+                next.firstScanIndex >
+                    mergedIntervals.back().lastScanIndex +
+                        mergeDistance) {
+                mergedIntervals.push_back(next);
+                mergedHypotheses.push_back(
+                    intervalHypotheses[index]);
+                continue;
+            }
+
+            MultipathInterval& merged =
+                mergedIntervals.back();
+            merged.firstScanIndex = std::min(
+                merged.firstScanIndex, next.firstScanIndex);
+            merged.lastScanIndex = std::max(
+                merged.lastScanIndex, next.lastScanIndex);
+            merged.coreFirstScanIndex = std::min(
+                merged.coreFirstScanIndex,
+                next.coreFirstScanIndex);
+            merged.coreLastScanIndex = std::max(
+                merged.coreLastScanIndex,
+                next.coreLastScanIndex);
+            merged.minimumLocalCostMargin = std::min(
+                merged.minimumLocalCostMargin,
+                next.minimumLocalCostMargin);
+            merged.maximumSeparationPx = std::max(
+                merged.maximumSeparationPx,
+                next.maximumSeparationPx);
+            if (next.lastScanIndex >=
+                merged.lastScanIndex) {
+                merged.rightAnchorScanIndex =
+                    next.rightAnchorScanIndex;
+                merged.rightBoundaryOpen =
+                    next.rightBoundaryOpen;
+            }
+            mergedHypotheses.back().insert(
+                mergedHypotheses.back().end(),
+                intervalHypotheses[index].begin(),
+                intervalHypotheses[index].end());
+        }
+        result->multipathIntervals.swap(mergedIntervals);
+        intervalHypotheses.swap(mergedHypotheses);
+
+        for (std::size_t intervalIndex = 0U;
+             intervalIndex <
+                 result->multipathIntervals.size();
+             ++intervalIndex) {
+            MultipathInterval& interval =
+                result->multipathIntervals[intervalIndex];
+            interval.intervalId =
+                static_cast<int>(intervalIndex);
+            interval.branches.clear();
+
+            const auto appendBranch =
+                [&interval, lines](
+                    const std::vector<std::pair<int, int>>& path,
+                    double pathCost) {
+                    MultipathBranch branch;
+                    branch.branchId =
+                        static_cast<int>(
+                            interval.branches.size());
+                    branch.pathCost = pathCost;
+                    for (const std::pair<int, int>& node : path) {
+                        Candidate candidate =
+                            candidateAt(*lines, node);
+                        if (candidate.scanIndex <
+                                interval.firstScanIndex ||
+                            candidate.scanIndex >
+                                interval.lastScanIndex) {
+                            continue;
+                        }
+                        candidate.rejectFlags |=
+                            REJECT_PATH_AMBIGUOUS |
+                            REJECT_AMBIGUOUS_MULTIPATH;
+                        candidate.ambiguityIntervalId =
+                            interval.intervalId;
+                        candidate.ambiguityBranchId =
+                            branch.branchId;
+                        branch.candidates.push_back(candidate);
+                    }
+                    if (branch.candidates.empty()) {
+                        return;
+                    }
+                    for (const MultipathBranch& existing :
+                         interval.branches) {
+                        if (existing.candidates.size() !=
+                            branch.candidates.size()) {
+                            continue;
+                        }
+                        bool same = true;
+                        for (std::size_t candidateIndex = 0U;
+                             candidateIndex <
+                                 branch.candidates.size();
+                             ++candidateIndex) {
+                            if (existing.candidates[candidateIndex]
+                                    .scanIndex !=
+                                    branch.candidates[candidateIndex]
+                                        .scanIndex ||
+                                existing.candidates[candidateIndex]
+                                    .peakIndex !=
+                                    branch.candidates[candidateIndex]
+                                        .peakIndex) {
+                                same = false;
+                                break;
+                            }
+                        }
+                        if (same) {
+                            return;
+                        }
+                    }
+                    interval.branches.push_back(branch);
+                };
+            appendBranch(bestPath, bestCost);
+            for (const IntervalHypothesis& hypothesis :
+                 intervalHypotheses[intervalIndex]) {
+                appendBranch(
+                    hypothesis.path, hypothesis.pathCost);
+            }
+        }
+    }
+
+    for (PathScanlineDiagnostic& diagnostic :
+         result->pathDiagnostics) {
+        for (MultipathInterval& interval :
+             result->multipathIntervals) {
+            if (diagnostic.scanIndex >= interval.firstScanIndex &&
+                diagnostic.scanIndex <= interval.lastScanIndex) {
+                diagnostic.ambiguityIntervalId =
+                    interval.intervalId;
+                if (diagnostic.hasAlternate) {
+                    interval.maximumSeparationPx = std::max(
+                        interval.maximumSeparationPx,
+                        diagnostic.separationPx);
+                }
+                break;
+            }
+        }
+    }
+    for (Candidate& candidate : result->provisionalSelected) {
+        for (const MultipathInterval& interval :
+             result->multipathIntervals) {
+            if (candidate.scanIndex >= interval.firstScanIndex &&
+                candidate.scanIndex <= interval.lastScanIndex) {
+                candidate.rejectFlags |=
+                    REJECT_PATH_AMBIGUOUS |
+                    REJECT_AMBIGUOUS_MULTIPATH;
+                candidate.ambiguityIntervalId =
+                    interval.intervalId;
+                candidate.ambiguityBranchId = 0;
+                break;
+            }
+        }
+        if (candidate.ambiguityIntervalId >= 0) {
+            continue;
+        }
+        Candidate publishable = candidate;
+        publishable.rejectFlags &=
+            ~static_cast<std::uint32_t>(
+                REJECT_MULTI_PEAK_AMBIGUOUS);
+        publishable.ambiguityIntervalId = -1;
+        publishable.ambiguityBranchId = -1;
+        if (publishable.accepted()) {
+            result->selected.push_back(publishable);
+        }
+    }
+    result->diagnostics.ambiguousPathPointCount =
+        result->provisionalSelected.size() -
+        result->selected.size();
+    std::size_t protectedScanlineCount = 0U;
+    for (const LineCandidates& line : *lines) {
+        if (std::any_of(
+                result->multipathIntervals.begin(),
+                result->multipathIntervals.end(),
+                [&line](const MultipathInterval& interval) {
+                    return line.scanIndex >= interval.firstScanIndex &&
+                           line.scanIndex <= interval.lastScanIndex;
+                })) {
+            ++protectedScanlineCount;
+        }
+    }
+    result->diagnostics.multipathAmbiguousScanlineCount =
+        protectedScanlineCount;
+    result->diagnostics.multipathIntervalCount =
+        result->multipathIntervals.size();
+    return !result->provisionalSelected.empty();
 }
 
-bool lineHasAcceptedCandidate(const LineCandidates& line) {
+bool lineHasUsableCandidate(const LineCandidates& line) {
     return std::any_of(
         line.values.begin(), line.values.end(),
         [](const Candidate& candidate) {
-            return candidate.accepted();
+            return candidate.usableForPath();
         });
 }
 
@@ -965,34 +1644,34 @@ bool optimizePathSegments(const std::vector<LineCandidates>& lines,
     }
     std::vector<std::pair<std::size_t, std::size_t>> spans;
     std::size_t spanBegin = 0U;
-    std::size_t lastAccepted = 0U;
+    std::size_t lastUsable = 0U;
     bool insideSpan = false;
     for (std::size_t index = 0U; index < lines.size(); ++index) {
-        if (!lineHasAcceptedCandidate(lines[index])) {
+        if (!lineHasUsableCandidate(lines[index])) {
             continue;
         }
         if (!insideSpan) {
             spanBegin = index;
-            lastAccepted = index;
+            lastUsable = index;
             insideSpan = true;
             continue;
         }
         const int scanGap =
             lines[index].scanIndex -
-            lines[lastAccepted].scanIndex - 1;
+            lines[lastUsable].scanIndex - 1;
         if (scanGap > options.pathMaximumGap) {
             spans.push_back(
-                std::make_pair(spanBegin, lastAccepted));
+                std::make_pair(spanBegin, lastUsable));
             spanBegin = index;
         }
-        lastAccepted = index;
+        lastUsable = index;
     }
     if (insideSpan) {
-        spans.push_back(std::make_pair(spanBegin, lastAccepted));
+        spans.push_back(std::make_pair(spanBegin, lastUsable));
     }
     if (spans.empty()) {
         result->error =
-            "no scanline contains an accepted stripe candidate";
+            "no scanline contains a path-usable stripe candidate";
         return false;
     }
 
@@ -1004,6 +1683,8 @@ bool optimizePathSegments(const std::vector<LineCandidates>& lines,
     double minimumMarginPerPoint =
         std::numeric_limits<double>::infinity();
     std::size_t ambiguousPointCount = 0U;
+    std::size_t multipathScanlineCount = 0U;
+    std::size_t multipathIntervalCount = 0U;
     std::size_t successfulSegments = 0U;
     for (const std::pair<std::size_t, std::size_t>& span : spans) {
         std::vector<LineCandidates> segment(
@@ -1016,10 +1697,46 @@ bool optimizePathSegments(const std::vector<LineCandidates>& lines,
             continue;
         }
         ++successfulSegments;
+        const int intervalOffset =
+            static_cast<int>(result->multipathIntervals.size());
+        for (Candidate& candidate :
+             segmentResult.provisionalSelected) {
+            if (candidate.ambiguityIntervalId >= 0) {
+                candidate.ambiguityIntervalId += intervalOffset;
+            }
+        }
+        for (PathScanlineDiagnostic& diagnostic :
+             segmentResult.pathDiagnostics) {
+            if (diagnostic.ambiguityIntervalId >= 0) {
+                diagnostic.ambiguityIntervalId += intervalOffset;
+            }
+        }
+        for (MultipathInterval& interval :
+             segmentResult.multipathIntervals) {
+            interval.intervalId += intervalOffset;
+            for (MultipathBranch& branch : interval.branches) {
+                for (Candidate& candidate : branch.candidates) {
+                    candidate.ambiguityIntervalId =
+                        interval.intervalId;
+                }
+            }
+        }
+        result->provisionalSelected.insert(
+            result->provisionalSelected.end(),
+            segmentResult.provisionalSelected.begin(),
+            segmentResult.provisionalSelected.end());
         result->selected.insert(
             result->selected.end(),
             segmentResult.selected.begin(),
             segmentResult.selected.end());
+        result->pathDiagnostics.insert(
+            result->pathDiagnostics.end(),
+            segmentResult.pathDiagnostics.begin(),
+            segmentResult.pathDiagnostics.end());
+        result->multipathIntervals.insert(
+            result->multipathIntervals.end(),
+            segmentResult.multipathIntervals.begin(),
+            segmentResult.multipathIntervals.end());
         bestCostSum +=
             segmentResult.diagnostics.bestPathCost;
         if (std::isfinite(
@@ -1037,12 +1754,27 @@ bool optimizePathSegments(const std::vector<LineCandidates>& lines,
             segmentResult.diagnostics.pathCostMarginPerPoint);
         ambiguousPointCount +=
             segmentResult.diagnostics.ambiguousPathPointCount;
+        multipathScanlineCount +=
+            segmentResult.diagnostics
+                .multipathAmbiguousScanlineCount;
+        multipathIntervalCount +=
+            segmentResult.diagnostics.multipathIntervalCount;
     }
-    if (successfulSegments == 0U || result->selected.empty()) {
+    if (successfulSegments == 0U ||
+        result->provisionalSelected.empty()) {
         result->error =
             "no quality path segment survived optimization";
         return false;
     }
+    std::sort(
+        result->provisionalSelected.begin(),
+        result->provisionalSelected.end(),
+        [](const Candidate& first, const Candidate& second) {
+            if (first.scanIndex != second.scanIndex) {
+                return first.scanIndex < second.scanIndex;
+            }
+            return first.peakIndex < second.peakIndex;
+        });
     std::sort(
         result->selected.begin(), result->selected.end(),
         [](const Candidate& first, const Candidate& second) {
@@ -1062,7 +1794,59 @@ bool optimizePathSegments(const std::vector<LineCandidates>& lines,
         minimumMarginPerPoint;
     result->diagnostics.ambiguousPathPointCount =
         ambiguousPointCount;
+    result->diagnostics.multipathAmbiguousScanlineCount =
+        multipathScanlineCount;
+    result->diagnostics.multipathIntervalCount =
+        multipathIntervalCount;
     return true;
+}
+
+void propagateMultipathAnnotations(Result* result) {
+    if (!result) {
+        return;
+    }
+    struct Annotation {
+        std::uint32_t flags{0U};
+        int intervalId{-1};
+        int branchId{-1};
+    };
+    std::map<std::pair<int, int>, Annotation> annotations;
+    for (const MultipathInterval& interval :
+         result->multipathIntervals) {
+        for (const MultipathBranch& branch : interval.branches) {
+            for (const Candidate& candidate : branch.candidates) {
+                Annotation& annotation = annotations[
+                    std::make_pair(
+                        candidate.scanIndex,
+                        candidate.peakIndex)];
+                annotation.flags |=
+                    REJECT_PATH_AMBIGUOUS |
+                    REJECT_AMBIGUOUS_MULTIPATH;
+                if (annotation.intervalId < 0) {
+                    annotation.intervalId = interval.intervalId;
+                    annotation.branchId = branch.branchId;
+                } else if (annotation.intervalId !=
+                               interval.intervalId ||
+                           annotation.branchId !=
+                               branch.branchId) {
+                    annotation.branchId = -1;
+                }
+            }
+        }
+    }
+    for (Candidate& candidate : result->candidates) {
+        const std::map<std::pair<int, int>, Annotation>::const_iterator
+            found = annotations.find(std::make_pair(
+                candidate.scanIndex, candidate.peakIndex));
+        if (found == annotations.end()) {
+            continue;
+        }
+        candidate.rejectFlags |= found->second.flags;
+        candidate.ambiguityIntervalId =
+            found->second.intervalId;
+        candidate.ambiguityBranchId =
+            found->second.branchId;
+    }
 }
 
 double resultPreference(const Result& result) {
@@ -1178,7 +1962,12 @@ bool extractOne(const cv::Mat& response,
         }
         return false;
     }
+    propagateMultipathAnnotations(result);
 
+    result->diagnostics.provisionalSelectedPointCount =
+        result->provisionalSelected.size();
+    result->diagnostics.publishableSelectedPointCount =
+        result->selected.size();
     result->diagnostics.selectedPointCount =
         result->selected.size();
     result->diagnostics.selectedGapCount =
@@ -1251,7 +2040,12 @@ Options::Options()
       pathGapExtendPenalty(1.0),
       pathMaximumStepPx(10.0),
       pathMaximumGap(12),
-      pathAmbiguityMarginPerPoint(0.01) {}
+      pathAmbiguityMarginPerPoint(2.0),
+      peakMergeMinimumDistancePx(1.25),
+      peakMergeFwhmScale(0.45),
+      pathAmbiguityMinimumSeparationPx(3.0),
+      pathAmbiguityPaddingScanlines(2),
+      pathMaximumPredictionResidualPx(4.0) {}
 
 bool Options::validate(const cv::Size& imageSize,
                        std::string* error) const {
@@ -1302,7 +2096,16 @@ bool Options::validate(const cv::Size& imageSize,
         pathMaximumStepPx <= 0.0 ||
         pathMaximumGap < 0 ||
         !std::isfinite(pathAmbiguityMarginPerPoint) ||
-        pathAmbiguityMarginPerPoint < 0.0) {
+        pathAmbiguityMarginPerPoint < 0.0 ||
+        !std::isfinite(peakMergeMinimumDistancePx) ||
+        peakMergeMinimumDistancePx < 0.0 ||
+        !std::isfinite(peakMergeFwhmScale) ||
+        peakMergeFwhmScale < 0.0 ||
+        !std::isfinite(pathAmbiguityMinimumSeparationPx) ||
+        pathAmbiguityMinimumSeparationPx <= 0.0 ||
+        pathAmbiguityPaddingScanlines < 0 ||
+        !std::isfinite(pathMaximumPredictionResidualPx) ||
+        pathMaximumPredictionResidualPx <= 0.0) {
         setError("stripe centerline options are invalid", error);
         return false;
     }
@@ -1332,20 +2135,63 @@ Candidate::Candidate()
       centerSigmaPx(0.0),
       centerMethod(CenterMethod::BackgroundSubtractedCentroid),
       taylorOffsetPx(0.0), smoothedFirstDerivative(0.0),
-      smoothedSecondDerivative(0.0), rejectFlags(REJECT_NONE) {}
+      smoothedSecondDerivative(0.0), rejectFlags(REJECT_NONE),
+      ambiguityIntervalId(-1), ambiguityBranchId(-1) {}
+
+bool Candidate::usableForPath() const {
+    const std::uint32_t fatalMask =
+        REJECT_LOW_PROMINENCE |
+        REJECT_WIDTH_OUT_OF_RANGE |
+        REJECT_SATURATED_WIDE_PLATEAU |
+        REJECT_SATURATED_ASYMMETRIC |
+        REJECT_PROFILE_ASYMMETRIC |
+        REJECT_FIT_RESIDUAL_HIGH |
+        REJECT_QUALITY_LOW |
+        REJECT_OUTSIDE_ROI |
+        REJECT_OUTSIDE_VALIDITY_MASK |
+        REJECT_PATH_JUMP |
+        REJECT_PATH_AMBIGUOUS |
+        REJECT_AMBIGUOUS_MULTIPATH;
+    return (rejectFlags & fatalMask) == 0U;
+}
 
 bool Candidate::accepted() const {
     return rejectFlags == REJECT_NONE;
 }
+
+PathScanlineDiagnostic::PathScanlineDiagnostic()
+    : scanIndex(-1), hasSelected(false), selectedPixel(0.0, 0.0),
+      hasAlternate(false), alternatePixel(0.0, 0.0),
+      separationPx(0.0),
+      localCostMargin(std::numeric_limits<double>::infinity()),
+      ambiguityIntervalId(-1) {}
+
+MultipathBranch::MultipathBranch()
+    : branchId(-1),
+      pathCost(std::numeric_limits<double>::infinity()) {}
+
+MultipathInterval::MultipathInterval()
+    : intervalId(-1), firstScanIndex(-1), lastScanIndex(-1),
+      coreFirstScanIndex(-1), coreLastScanIndex(-1),
+      leftAnchorScanIndex(-1), rightAnchorScanIndex(-1),
+      leftBoundaryOpen(true), rightBoundaryOpen(true),
+      minimumLocalCostMargin(
+          std::numeric_limits<double>::infinity()),
+      maximumSeparationPx(0.0) {}
 
 Diagnostics::Diagnostics()
     : requestedOrientation(Orientation::Auto),
       selectedOrientation(Orientation::Auto),
       scanlineCount(0U), scanlinesWithCandidates(0U),
       totalCandidateCount(0U), acceptedCandidateCount(0U),
+      pathUsableCandidateCount(0U),
+      provisionalSelectedPointCount(0U),
+      publishableSelectedPointCount(0U),
       selectedPointCount(0U), selectedGapCount(0U),
       saturatedCandidateCount(0U), multiPeakScanlineCount(0U),
       ambiguousPathPointCount(0U),
+      multipathAmbiguousScanlineCount(0U),
+      multipathIntervalCount(0U),
       rejectedLowProminenceCount(0U), rejectedWidthCount(0U),
       rejectedSaturationCount(0U), rejectedMultiPeakCount(0U),
       rejectedAsymmetryCount(0U), rejectedFitCount(0U),
@@ -1466,7 +2312,7 @@ const char* centerMethodName(CenterMethod method) {
 }
 
 const char* algorithmVersion() {
-    return "quality-v2-local-mad-dp-gaussian-taylor";
+    return "quality-v3-edge-dp-local-multipath";
 }
 
 std::string rejectReasonNames(std::uint32_t flags) {
@@ -1489,7 +2335,9 @@ std::string rejectReasonNames(std::uint32_t flags) {
         {REJECT_OUTSIDE_VALIDITY_MASK,
          "OUTSIDE_VALIDITY_MASK"},
         {REJECT_PATH_JUMP, "PATH_JUMP"},
-        {REJECT_PATH_AMBIGUOUS, "PATH_AMBIGUOUS"}
+        {REJECT_PATH_AMBIGUOUS, "PATH_AMBIGUOUS"},
+        {REJECT_AMBIGUOUS_MULTIPATH,
+         "AMBIGUOUS_MULTIPATH"}
     };
     std::ostringstream output;
     bool first = true;

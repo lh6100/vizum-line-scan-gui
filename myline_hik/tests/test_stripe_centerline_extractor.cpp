@@ -171,6 +171,36 @@ bool anyCandidateHas(const hik_stripe::Result& result,
         });
 }
 
+bool anyProvisionalHas(const hik_stripe::Result& result,
+                       hik_stripe::RejectReason reason) {
+    return std::any_of(
+        result.provisionalSelected.begin(),
+        result.provisionalSelected.end(),
+        [reason](const hik_stripe::Candidate& candidate) {
+            return hik_stripe::hasRejectReason(candidate, reason);
+        });
+}
+
+bool branchIsOrderedAndTagged(
+        const hik_stripe::MultipathInterval& interval,
+        const hik_stripe::MultipathBranch& branch) {
+    int previousScan = std::numeric_limits<int>::min();
+    for (const hik_stripe::Candidate& candidate : branch.candidates) {
+        if (candidate.scanIndex <= previousScan ||
+            candidate.scanIndex < interval.firstScanIndex ||
+            candidate.scanIndex > interval.lastScanIndex ||
+            candidate.ambiguityIntervalId != interval.intervalId ||
+            candidate.ambiguityBranchId != branch.branchId ||
+            !hik_stripe::hasRejectReason(
+                candidate,
+                hik_stripe::REJECT_AMBIGUOUS_MULTIPATH)) {
+            return false;
+        }
+        previousScan = candidate.scanIndex;
+    }
+    return !branch.candidates.empty();
+}
+
 bool allSelectedFinite(const hik_stripe::Result& result) {
     return std::all_of(
         result.selected.begin(), result.selected.end(),
@@ -181,6 +211,16 @@ bool allSelectedFinite(const hik_stripe::Result& result) {
                    std::isfinite(candidate.taylorOffsetPx) &&
                    std::isfinite(candidate.smoothedFirstDerivative) &&
                    std::isfinite(candidate.smoothedSecondDerivative);
+        });
+}
+
+bool allSelectedPublishable(const hik_stripe::Result& result) {
+    return std::all_of(
+        result.selected.begin(), result.selected.end(),
+        [](const hik_stripe::Candidate& candidate) {
+            return candidate.accepted() &&
+                   candidate.ambiguityIntervalId < 0 &&
+                   candidate.ambiguityBranchId < 0;
         });
 }
 
@@ -329,6 +369,20 @@ void testEqualParallelPathsAreMarkedAmbiguous() {
                    anyCandidateHas(result, hik_stripe::REJECT_PATH_AMBIGUOUS) ||
                    result.selected.empty(),
                "equal parallel ridges must be reported or rejected as path ambiguity");
+    CHECK_TRUE(!result.multipathIntervals.empty(),
+               "equal full-length ridges must expose an explicit multipath interval");
+    if (!result.multipathIntervals.empty()) {
+        const hik_stripe::MultipathInterval& interval =
+            result.multipathIntervals.front();
+        CHECK_TRUE(interval.leftBoundaryOpen &&
+                       interval.rightBoundaryOpen &&
+                       interval.firstScanIndex == 0 &&
+                       interval.lastScanIndex ==
+                           frame.response.cols - 1,
+                   "a branch without common endpoints must be marked open and fail closed to both segment boundaries");
+        CHECK_TRUE(result.selected.empty(),
+                   "an open-ended equal multipath frame must publish no fabricated centerline");
+    }
 }
 
 void testSymmetricNarrowPlateauUsesItsMiddle() {
@@ -526,6 +580,294 @@ void testSoftwareRoiConstrainsEveryOutput() {
                "a brighter out-of-ROI ridge must not affect the selected centerline");
 }
 
+void testShortLocalForkIsRejectedAsAnExplicitInterval() {
+    SyntheticFrame frame(92, 200);
+    addHorizontalGaussian(&frame, 44.0, 100.0, 1.10);
+    const int forkBegin = 92;
+    const int forkEnd = 103;
+    for (int column = forkBegin; column <= forkEnd; ++column) {
+        const int distanceToEnd = std::min(
+            column - forkBegin, forkEnd - column);
+        const double branchCenter =
+            44.0 + 4.0 * static_cast<double>(distanceToEnd);
+        addHorizontalGaussian(
+            &frame, branchCenter, 100.0, 1.10,
+            column, column + 1);
+    }
+
+    hik_stripe::Options options =
+        horizontalOptions(frame.response.size());
+    options.pathMaximumStepPx = 6.0;
+    options.pathAmbiguityMarginPerPoint = 1.50;
+    options.pathAmbiguityMinimumSeparationPx = 5.0;
+    options.pathAmbiguityPaddingScanlines = 2;
+    const hik_stripe::Result result = extract(frame, options);
+
+    CHECK_TRUE(result.ok,
+               "a short local fork must complete extraction");
+    CHECK_TRUE(result.provisionalSelected.size() >= 180,
+               "the provisional path must preserve the long surrounding ridge");
+    CHECK_TRUE(result.multipathIntervals.size() == 1U,
+               "a fork occupying only 2-7% of a long path must produce one local ambiguity interval");
+    CHECK_TRUE(anyProvisionalHas(
+                   result,
+                   hik_stripe::REJECT_AMBIGUOUS_MULTIPATH),
+               "the provisional branch inside the interval must carry the hard multipath flag");
+    if (!result.multipathIntervals.empty()) {
+        const hik_stripe::MultipathInterval& interval =
+            result.multipathIntervals.front();
+        CHECK_TRUE(interval.coreFirstScanIndex >= forkBegin &&
+                       interval.coreLastScanIndex <= forkEnd,
+                   "the ambiguity core must cover the complete differing path component inside the synthetic fork");
+        CHECK_TRUE(!interval.leftBoundaryOpen &&
+                       !interval.rightBoundaryOpen &&
+                       interval.leftAnchorScanIndex ==
+                           interval.coreFirstScanIndex - 1 &&
+                       interval.rightAnchorScanIndex ==
+                           interval.coreLastScanIndex + 1,
+                   "a closed fork must expose the common best/alternate anchor at both ends");
+        CHECK_TRUE(interval.firstScanIndex <=
+                       interval.leftAnchorScanIndex &&
+                       interval.lastScanIndex >=
+                           interval.rightAnchorScanIndex &&
+                       interval.firstScanIndex <=
+                           interval.coreFirstScanIndex -
+                               options.pathAmbiguityPaddingScanlines &&
+                       interval.lastScanIndex >=
+                           interval.coreLastScanIndex +
+                               options.pathAmbiguityPaddingScanlines,
+                   "the hard-rejected interval must include both anchors and the configured protection padding");
+        CHECK_TRUE(interval.branches.size() >= 2,
+                   "an ambiguity interval must expose two complete path hypotheses");
+        for (const hik_stripe::MultipathBranch& branch :
+             interval.branches) {
+            CHECK_TRUE(branchIsOrderedAndTagged(interval, branch),
+                       "each 3D-validation branch must be ordered and carry stable interval/branch IDs");
+            CHECK_TRUE(
+                branch.candidates.front().scanIndex <=
+                    interval.leftAnchorScanIndex &&
+                branch.candidates.back().scanIndex >=
+                    interval.rightAnchorScanIndex,
+                "each exported branch must span both convergence anchors, not only the low-margin evidence rows");
+        }
+        CHECK_TRUE(selectedInScanRange(
+                       result,
+                       interval.firstScanIndex,
+                       interval.lastScanIndex) == 0,
+                   "publishable selected must hard-reject the entire padded ambiguity interval without interpolation");
+        CHECK_TRUE(
+            result.diagnostics.multipathAmbiguousScanlineCount ==
+                static_cast<std::size_t>(
+                    interval.lastScanIndex -
+                    interval.firstScanIndex + 1),
+            "multipath scanline diagnostics must count the complete hard "
+            "protection interval, not only low-margin evidence columns");
+    }
+    CHECK_TRUE(
+        result.diagnostics.provisionalSelectedPointCount ==
+            result.provisionalSelected.size() &&
+        result.diagnostics.publishableSelectedPointCount ==
+            result.selected.size() &&
+        result.diagnostics.selectedPointCount ==
+            result.selected.size(),
+        "provisional and publishable point counts must have unambiguous semantics");
+}
+
+void testNearbyForkFragmentsMergeAndRebuildBranches() {
+    SyntheticFrame frame(92, 140);
+    addHorizontalGaussian(&frame, 43.0, 100.0, 1.10);
+    const int forkBegins[] = {42, 56};
+    const int forkLength = 10;
+    for (const int forkBegin : forkBegins) {
+        for (int offset = 0; offset < forkLength; ++offset) {
+            const int distanceToEnd = std::min(
+                offset, forkLength - 1 - offset);
+            const double branchCenter =
+                43.0 + 4.0 * static_cast<double>(distanceToEnd);
+            addHorizontalGaussian(
+                &frame, branchCenter, 100.0, 1.10,
+                forkBegin + offset,
+                forkBegin + offset + 1);
+        }
+    }
+
+    hik_stripe::Options options =
+        horizontalOptions(frame.response.size());
+    options.pathMaximumStepPx = 6.0;
+    options.pathAmbiguityMarginPerPoint = 1.50;
+    options.pathAmbiguityMinimumSeparationPx = 5.0;
+    options.pathAmbiguityPaddingScanlines = 2;
+    const hik_stripe::Result result = extract(frame, options);
+
+    CHECK_TRUE(result.ok,
+               "two nearby local forks must complete extraction");
+    CHECK_TRUE(result.multipathIntervals.size() == 1U,
+               "overlapping/nearby protected fork ranges must merge into one interval");
+    if (result.multipathIntervals.size() == 1U) {
+        const hik_stripe::MultipathInterval& interval =
+            result.multipathIntervals.front();
+        CHECK_TRUE(interval.coreFirstScanIndex <
+                       forkBegins[0] + forkLength &&
+                       interval.coreLastScanIndex >=
+                           forkBegins[1],
+                   "the merged core must cover both fragmented divergence components and their connecting uncertainty");
+        CHECK_TRUE(interval.branches.size() >= 3U,
+                   "the merged interval must rebuild one primary plus the distinct local alternative hypotheses");
+        for (const hik_stripe::MultipathBranch& branch :
+             interval.branches) {
+            CHECK_TRUE(branchIsOrderedAndTagged(interval, branch),
+                       "every merged K-best branch must be a complete ordered provenance sequence");
+            CHECK_TRUE(
+                branch.candidates.front().scanIndex <=
+                    interval.leftAnchorScanIndex &&
+                branch.candidates.back().scanIndex >=
+                    interval.rightAnchorScanIndex,
+                "merged branch hypotheses must be rebuilt over the complete protected range");
+        }
+        CHECK_TRUE(selectedInScanRange(
+                       result,
+                       interval.firstScanIndex,
+                       interval.lastScanIndex) == 0U,
+                   "the union of nearby ambiguity fragments must be hard-rejected without holes");
+    }
+}
+
+void testSecondPeakThresholdIsSoftAndContinuous() {
+    const auto extractRatio =
+        [](double competingAmplitude) {
+            SyntheticFrame frame(86, 120);
+            addHorizontalGaussian(
+                &frame, 31.0, 100.0, 1.10);
+            addHorizontalGaussian(
+                &frame, 55.0, competingAmplitude, 1.10);
+            hik_stripe::Options options =
+                horizontalOptions(frame.response.size());
+            options.maximumSecondPeakRatio = 0.80;
+            options.pathAmbiguityMarginPerPoint = 0.0;
+            return extract(frame, options);
+        };
+
+    const hik_stripe::Result below = extractRatio(79.0);
+    const hik_stripe::Result above = extractRatio(81.0);
+    CHECK_TRUE(below.ok && above.ok,
+               "both sides of the 0.80 soft multipath threshold must remain solvable");
+    CHECK_TRUE(below.provisionalSelected.size() >= 108 &&
+                   above.provisionalSelected.size() >= 108,
+               "crossing 0.79/0.81 must not turn complete candidate rows into GAP");
+    CHECK_TRUE(below.selected.size() >= 108 &&
+                   above.selected.size() >= 108,
+               "a continuity-resolved stronger branch must remain publishable on both sides of the soft threshold");
+    CHECK_TRUE(allSelectedPublishable(below) &&
+                   allSelectedPublishable(above),
+               "formal selected must contain only publishable copies after lattice ambiguity is resolved");
+    CHECK_TRUE(!anyCandidateHas(
+                   below,
+                   hik_stripe::REJECT_MULTI_PEAK_AMBIGUOUS) &&
+                   anyCandidateHas(
+                       above,
+                       hik_stripe::REJECT_MULTI_PEAK_AMBIGUOUS),
+               "the 0.80 flag may change, but it must remain soft evidence for the lattice");
+    CHECK_TRUE(maximumCenterError(below, 31.0) <= 0.45 &&
+                   maximumCenterError(above, 31.0) <= 0.45,
+               "a small ratio change around 0.80 must not switch the selected physical branch");
+}
+
+void testDuplicateRidgePeaksAreMergedButSeparatedBranchesRemain() {
+    SyntheticFrame duplicate(82, 90);
+    for (int column = 0; column < duplicate.response.cols; ++column) {
+        const int rows[] = {37, 38, 39, 40, 41, 42, 43, 44};
+        const int values[] = {30, 80, 150, 205, 190, 202, 145, 65};
+        for (std::size_t index = 0U;
+             index < sizeof(rows) / sizeof(rows[0]); ++index) {
+            duplicate.response.at<unsigned char>(
+                rows[index], column) =
+                static_cast<unsigned char>(values[index]);
+            duplicate.raw.at<unsigned char>(
+                rows[index], column) =
+                static_cast<unsigned char>(
+                    std::min(249, values[index] + 20));
+        }
+    }
+    hik_stripe::Options duplicateOptions =
+        horizontalOptions(duplicate.response.size());
+    duplicateOptions.maximumSecondPeakRatio = 0.50;
+    duplicateOptions.maximumGradientAsymmetry = 1.0;
+    duplicateOptions.maximumFitResidual = 1.0;
+    duplicateOptions.maximumFwhmPx = 14.0;
+    const hik_stripe::Result merged =
+        extract(duplicate, duplicateOptions);
+
+    CHECK_TRUE(merged.ok && merged.selected.size() >= 81,
+               "two adjacent maxima from one physical ridge must merge into one publishable path");
+    CHECK_TRUE(merged.diagnostics.totalCandidateCount <= 95,
+               "same-ridge NMS must leave approximately one candidate per scanline");
+    CHECK_TRUE(!anyCandidateHas(
+                   merged,
+                   hik_stripe::REJECT_MULTI_PEAK_AMBIGUOUS),
+               "same-ridge duplicate maxima must not masquerade as a second physical branch");
+
+    SyntheticFrame separated(82, 90);
+    addHorizontalGaussian(
+        &separated, 30.0, 130.0, 1.10);
+    addHorizontalGaussian(
+        &separated, 50.0, 130.0, 1.10);
+    hik_stripe::Options separatedOptions =
+        horizontalOptions(separated.response.size());
+    separatedOptions.maximumSecondPeakRatio = 0.50;
+    separatedOptions.pathAmbiguityMarginPerPoint = 0.10;
+    const hik_stripe::Result branches =
+        extract(separated, separatedOptions);
+    CHECK_TRUE(branches.ok,
+               "two separated physical branches must still enter the lattice");
+    CHECK_TRUE(anyCandidateHas(
+                   branches,
+                   hik_stripe::REJECT_MULTI_PEAK_AMBIGUOUS),
+               "a genuine 20 px branch separation must retain multipath evidence");
+    CHECK_TRUE(!branches.multipathIntervals.empty() &&
+                   branches.selected.empty(),
+               "equal 20 px branches must be exposed as alternatives and hard-rejected from publishable output");
+    if (!branches.multipathIntervals.empty()) {
+        CHECK_TRUE(
+            branches.multipathIntervals.front()
+                    .maximumSeparationPx >= 18.0,
+            "the interval diagnostic must preserve the physical branch separation");
+    }
+}
+
+void testGapCannotAuthorizeAChangedBranch() {
+    SyntheticFrame frame(92, 100);
+    addHorizontalGaussian(
+        &frame, 25.0, 150.0, 1.10, 0, 46);
+    addHorizontalGaussian(
+        &frame, 40.0, 150.0, 1.10, 50, 100);
+
+    hik_stripe::Options options =
+        horizontalOptions(frame.response.size());
+    options.pathMaximumStepPx = 4.0;
+    options.pathMaximumGap = 5;
+    options.pathMaximumPredictionResidualPx = 3.0;
+    const hik_stripe::Result result = extract(frame, options);
+
+    CHECK_TRUE(result.ok,
+               "a branch-changing gap must fail closed without crashing extraction");
+    bool bridgedChangedBranch = false;
+    for (std::size_t index = 1U;
+         index < result.provisionalSelected.size(); ++index) {
+        const hik_stripe::Candidate& previous =
+            result.provisionalSelected[index - 1U];
+        const hik_stripe::Candidate& current =
+            result.provisionalSelected[index];
+        if (current.scanIndex - previous.scanIndex > 1 &&
+            std::fabs(current.pixel.y - previous.pixel.y) > 10.0) {
+            bridgedChangedBranch = true;
+        }
+    }
+    CHECK_TRUE(!bridgedChangedBranch,
+               "a missing interval must not dilute a 15 px branch switch into an acceptable average slope");
+    CHECK_TRUE(result.provisionalSelected.size() < 90,
+               "an unreachable changed branch must create a real break rather than one connected provisional path");
+}
+
 }  // namespace
 
 int main() {
@@ -541,6 +883,11 @@ int main() {
     testLargeJumpDoesNotCreateAConnectingRamp();
     testFixedHorizontalAndVerticalOrientations();
     testSoftwareRoiConstrainsEveryOutput();
+    testShortLocalForkIsRejectedAsAnExplicitInterval();
+    testNearbyForkFragmentsMergeAndRebuildBranches();
+    testSecondPeakThresholdIsSoftAndContinuous();
+    testDuplicateRidgePeaksAreMergedButSeparatedBranchesRemain();
+    testGapCannotAuthorizeAChangedBranch();
 
     if (gFailures != 0) {
         std::cerr << gFailures

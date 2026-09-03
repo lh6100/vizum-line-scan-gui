@@ -58,6 +58,14 @@ QString LineLaserDeviceProfile::scanSessionRoot(
     return resolvedPath(sourceDirectory, scanSessionRootRelativePath);
 }
 
+QString LineLaserDeviceProfile::adaptiveScanConfigPath(
+        const QString& sourceDirectory) const {
+    if (adaptiveScanConfigRelativePath.trimmed().isEmpty()) {
+        return QString();
+    }
+    return resolvedPath(sourceDirectory, adaptiveScanConfigRelativePath);
+}
+
 bool LineLaserDeviceProfile::isValid(QString* error) const {
     if (error) {
         error->clear();
@@ -104,7 +112,11 @@ bool LineLaserDeviceProfile::isValid(QString* error) const {
                QStringLiteral("标定 session 路径"), error) &&
            validateRelativePath(
                scanSessionRootRelativePath,
-               QStringLiteral("扫描 session 路径"), error);
+               QStringLiteral("扫描 session 路径"), error) &&
+           (adaptiveScanConfigRelativePath.trimmed().isEmpty() ||
+            validateRelativePath(
+                adaptiveScanConfigRelativePath,
+                QStringLiteral("自适应扫描配置路径"), error));
 }
 
 const std::vector<LineLaserDeviceProfile>& lineLaserDeviceProfiles() {
@@ -114,9 +126,9 @@ const std::vector<LineLaserDeviceProfile>& lineLaserDeviceProfiles() {
             QStringLiteral("450 nm｜130万相机｜12.5 mm"),
             450,
             11,
-            QString(),
-            QString(),
-            QString(),
+            QStringLiteral("192.168.1.46"),
+            QStringLiteral("MV-CS013-60GN"),
+            QStringLiteral("DB0403208"),
             QStringLiteral("hik_450_camera_optical_frame"),
             QStringLiteral("config/devices/scanner_450/hik_intrinsics.yaml"),
             QStringLiteral("config/devices/scanner_450/hik_laser_plane.yaml"),
@@ -124,6 +136,7 @@ const std::vector<LineLaserDeviceProfile>& lineLaserDeviceProfiles() {
             QStringLiteral("config/devices/scanner_450/synchronization.yaml"),
             QStringLiteral("data/calibration/scanner_450"),
             QStringLiteral("data/scans/scanner_450"),
+            QString(),
             LineLaserStripeOrientation::Auto,
             LineLaserCenterlinePolicy::Quality,
             LineLaserCenterlinePolicy::Quality,
@@ -138,12 +151,14 @@ const std::vector<LineLaserDeviceProfile>& lineLaserDeviceProfiles() {
             QStringLiteral("MV-CS016-10GM"),
             QStringLiteral("DA8784601"),
             QStringLiteral("hik_camera_optical_frame"),
-            QStringLiteral("config/hik_intrinsics.yaml"),
-            QStringLiteral("config/hik_laser_plane.yaml"),
-            QStringLiteral("config/hik_handeye.yaml"),
-            QStringLiteral("config/synchronization.yaml"),
+            QStringLiteral("config/devices/scanner_650/hik_intrinsics.yaml"),
+            QStringLiteral("config/devices/scanner_650/hik_laser_plane.yaml"),
+            QStringLiteral("config/devices/scanner_650/hik_handeye.yaml"),
+            QStringLiteral("config/devices/scanner_650/synchronization.yaml"),
             QStringLiteral("data/calibration/scanner_650"),
             QStringLiteral("data/scans/scanner_650"),
+            QStringLiteral(
+                "config/devices/scanner_650/adaptive_scan_650.yaml"),
             LineLaserStripeOrientation::Horizontal,
             LineLaserCenterlinePolicy::Legacy,
             LineLaserCenterlinePolicy::Shadow,

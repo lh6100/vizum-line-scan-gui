@@ -1,0 +1,10 @@
+string map_id
+uint64 map_version
+string calibration_package_id
+string robot_model_sha256
+string tool_model_sha256
+bool self_filter_valid
+---
+bool success
+welding_interfaces/ArtifactRef planning_scene
+string error

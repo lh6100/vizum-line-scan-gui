@@ -1,4 +1,32 @@
-# Vizum Line Scan GUI
+# FR5 + Hikrobot line-laser mapping
+
+This is the deployment repository for the FR5 line-laser scanner. The two
+maintained projects share the same calibrated scanner profiles:
+
+- `myline_hik/`: the proven Qt/C++ 60 FPS continuous mapper and calibration
+  tools;
+- `ros2_fr5/`: ROS 2 + MoveIt robot control, operator GUI, RViz and the same
+  legacy stripe reconstruction pipeline.
+
+Start with [docs/SETUP.md](docs/SETUP.md). It covers a clean-machine checkout,
+proprietary SDK placement, dependency checks, builds and the first mock/hardware
+launch. Run `./scripts/check_environment.sh` before building.
+
+Calibration YAML files are versioned. Generated clouds, images, rosbags, build
+trees, SSH keys and vendor SDK source trees are deliberately excluded. The ROS
+launch installs its own copy of the scanner 650 calibration and no longer
+depends on a developer-specific `/home/...` path.
+
+> Hardware motion is fail-closed. A successful build does not authorize motion;
+> validate the cell, TCP, payload, collision scene and E-stop before using
+> `CONFIRM_FR5_HARDWARE=YES`.
+
+---
+
+## Legacy Vizum camera GUI
+
+The repository also retains the original root-level Vizum VzNL GUI below for
+existing users. It is not required by `myline_hik` or `ros2_fr5`.
 
 Qt-based desktop GUI for Vizum VzNL SDK line-laser 3D reconstruction cameras. It wraps the SDK flow for device connection, dust-cover control, swing-motor line scan, and PLY point-cloud export.
 

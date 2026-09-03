@@ -458,4 +458,103 @@
       k_position="15"
       k_velocity="10" />
   </joint>
+
+  <!--
+    Project calibration frames (not present in the upstream Fairino URDF).
+
+    The fixed wrist3-to-flange offset was validated against controller-reported
+    flange poses over recorded FR5 joint states.  The camera origins below are
+    T_flange_camera from the scanner_650 and scanner_450 eye-in-hand
+    calibrations, with millimetres converted to metres and rotation matrices
+    converted to URDF fixed-axis roll/pitch/yaw radians.
+
+    Keep the model flange name distinct from fairino_flange_reported: the
+    latter is published directly from the controller at runtime.
+  -->
+  <link
+    name="fairino_flange_model" />
+  <joint
+    name="wrist3_to_fairino_flange_model"
+    type="fixed">
+    <origin
+      xyz="0 0 0.1"
+      rpy="0 0 0" />
+    <parent
+      link="wrist3_link" />
+    <child
+      link="fairino_flange_model" />
+  </joint>
+
+  <link
+    name="hik_camera_optical_frame" />
+  <joint
+    name="fairino_flange_model_to_hik_camera_optical"
+    type="fixed">
+    <origin
+      xyz="-0.0608482323161 -0.000382077753729 0.142143365159"
+      rpy="0.522159631925 0.006209883087 3.140900573284" />
+    <parent
+      link="fairino_flange_model" />
+    <child
+      link="hik_camera_optical_frame" />
+  </joint>
+
+  <!--
+    Conservative scanner_650 collision envelope.  The optical frame remains
+    the calibrated pinhole frame above; this link represents the physical
+    camera, laser, bracket and a small cable allowance for MoveIt collision
+    checking.  Replace the box with a validated convex CAD model before
+    production-speed operation.
+  -->
+  <link name="scanner_650_body">
+    <visual>
+      <origin xyz="0 0 0.08" rpy="0 0 0" />
+      <geometry>
+        <box size="0.18 0.16 0.20" />
+      </geometry>
+      <material name="scanner_650_blue">
+        <color rgba="0.08 0.30 0.75 0.55" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.08" rpy="0 0 0" />
+      <geometry>
+        <box size="0.18 0.16 0.20" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="fairino_flange_model_to_scanner_650_body" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="fairino_flange_model" />
+    <child link="scanner_650_body" />
+  </joint>
+
+  <!--
+    Virtual process TCP used by MoveIt.  Its origin is the calibrated laser
+    plane at camera z=550 mm and x=0:
+      y = -(nx*x + nz*z + d) / ny = 46.6476147 mm.
+    X is the nominal scan direction, Y follows the horizontal laser stripe,
+    and Z points from the camera towards the workpiece.  It is a planning
+    frame only and has no collision geometry of its own.
+  -->
+  <link name="scanner_650_scan_tcp" />
+  <joint name="hik_camera_optical_to_scanner_650_scan_tcp" type="fixed">
+    <origin xyz="0 0.0466476147 0.55" rpy="0 0 1.57079632679" />
+    <parent link="hik_camera_optical_frame" />
+    <child link="scanner_650_scan_tcp" />
+  </joint>
+
+  <link
+    name="hik_450_camera_optical_frame" />
+  <joint
+    name="fairino_flange_model_to_hik_450_camera_optical"
+    type="fixed">
+    <origin
+      xyz="0.0658967727891 -0.00975216317425 0.126228380771"
+      rpy="0.508947894454 -0.004857842133 3.134367571689" />
+    <parent
+      link="fairino_flange_model" />
+    <child
+      link="hik_450_camera_optical_frame" />
+  </joint>
 </robot>

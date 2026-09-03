@@ -5,6 +5,7 @@ import pytest
 from fr5_vizum_bringup.calibration_frames import (
     CalibrationConfigError,
     load_camera_calibration,
+    load_laser_plane_calibration,
     load_tool_calibration,
 )
 
@@ -118,3 +119,40 @@ def test_rejects_non_finite_tool_config(tmp_path):
 
     with pytest.raises(CalibrationConfigError, match="must be finite"):
         load_tool_calibration(str(config))
+
+
+@pytest.mark.parametrize(
+    "scanner, expected_frame",
+    [
+        ("scanner_650", "hik_camera_optical_frame"),
+        ("scanner_450", "hik_450_camera_optical_frame"),
+    ],
+)
+def test_loads_repository_laser_plane_in_camera_frustum(scanner, expected_frame):
+    config_dir = PROJECT_ROOT / "myline_hik/config/devices" / scanner
+    calibration = load_laser_plane_calibration(
+        str(config_dir / "hik_laser_plane.yaml"),
+        str(config_dir / "hik_intrinsics.yaml"),
+    )
+
+    assert calibration.camera_frame == expected_frame
+    assert calibration.z_range_m == pytest.approx((0.4, 0.7), abs=1.0e-12)
+    assert tuple(vertex[2] for vertex in calibration.vertices_m) == pytest.approx(
+        (0.4, 0.4, 0.7, 0.7), abs=1.0e-12
+    )
+    nx, ny, nz, d = calibration.coefficients_mm
+    for vertex_m in calibration.vertices_m:
+        x_mm, y_mm, z_mm = (component * 1000.0 for component in vertex_m)
+        assert nx * x_mm + ny * y_mm + nz * z_mm + d == pytest.approx(
+            0.0, abs=1.0e-9
+        )
+
+
+def test_rejects_laser_plane_with_wrong_camera_intrinsics():
+    devices = PROJECT_ROOT / "myline_hik/config/devices"
+
+    with pytest.raises(CalibrationConfigError, match="camera-frame mismatch"):
+        load_laser_plane_calibration(
+            str(devices / "scanner_650/hik_laser_plane.yaml"),
+            str(devices / "scanner_450/hik_intrinsics.yaml"),
+        )

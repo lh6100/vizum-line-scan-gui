@@ -24,7 +24,8 @@ enum class LineLaserState {
     Unknown,
     Off,
     Laser450,
-    Laser650
+    Laser650,
+    Both
 };
 Q_DECLARE_METATYPE(LineLaserState)
 
@@ -104,6 +105,7 @@ public slots:
     // Success is reported only after a matching daemon ACK and GPIO readback.
     void set450();
     void set650();
+    void setBoth();
     void off();
     void requestStatus();
 

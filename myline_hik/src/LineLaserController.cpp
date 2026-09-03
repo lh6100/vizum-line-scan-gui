@@ -46,6 +46,7 @@ QString protocolStateName(LineLaserState state) {
         case LineLaserState::Off: return QStringLiteral("off");
         case LineLaserState::Laser450: return QStringLiteral("laser450");
         case LineLaserState::Laser650: return QStringLiteral("laser650");
+        case LineLaserState::Both: return QStringLiteral("both");
         case LineLaserState::Unknown: break;
     }
     return QStringLiteral("unknown");
@@ -56,6 +57,7 @@ QString commandName(LineLaserState state) {
         case LineLaserState::Off: return QStringLiteral("off");
         case LineLaserState::Laser450: return QStringLiteral("set450");
         case LineLaserState::Laser650: return QStringLiteral("set650");
+        case LineLaserState::Both: return QStringLiteral("setBoth");
         case LineLaserState::Unknown: break;
     }
     return QStringLiteral("unknown");
@@ -70,6 +72,7 @@ LineLaserState parsedProtocolState(const QString& value) {
     if (value == QStringLiteral("off")) return LineLaserState::Off;
     if (value == QStringLiteral("laser450")) return LineLaserState::Laser450;
     if (value == QStringLiteral("laser650")) return LineLaserState::Laser650;
+    if (value == QStringLiteral("both")) return LineLaserState::Both;
     return LineLaserState::Unknown;
 }
 
@@ -555,11 +558,6 @@ private:
             return;
         }
 
-        if (status.ttl450High && status.ttl650High) {
-            failTransport(QStringLiteral(
-                "危险状态：板端报告两路 TTL 同时为 HIGH。"));
-            return;
-        }
         if (operation != QStringLiteral("goodbye") &&
             !status.leaseActive) {
             failTransport(QStringLiteral(
@@ -702,7 +700,9 @@ private:
             (status->state == LineLaserState::Laser450 &&
              (!status->ttl450High || status->ttl650High)) ||
             (status->state == LineLaserState::Laser650 &&
-             (status->ttl450High || !status->ttl650High))) {
+             (status->ttl450High || !status->ttl650High)) ||
+            (status->state == LineLaserState::Both &&
+             (!status->ttl450High || !status->ttl650High))) {
             *error = QStringLiteral("板端状态与 GPIO 读回自相矛盾。");
             return false;
         }
@@ -944,6 +944,16 @@ void LineLaserController::set650() {
         worker_,
         [worker = worker_]() {
             worker->requestState(LineLaserState::Laser650);
+        },
+        Qt::QueuedConnection);
+}
+
+void LineLaserController::setBoth() {
+    if (!worker_) return;
+    QMetaObject::invokeMethod(
+        worker_,
+        [worker = worker_]() {
+            worker->requestState(LineLaserState::Both);
         },
         Qt::QueuedConnection);
 }

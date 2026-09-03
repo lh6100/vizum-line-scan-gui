@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="fairino5_v6_robot">
+  <xacro:arg name="initial_positions_file" default="initial_positions.yaml"/>
+  <xacro:arg name="use_fake_hardware" default="true"/>
+  <xacro:arg name="robot_ip" default="192.168.1.200"/>
+  <xacro:arg name="servo_period_s" default="0.008"/>
+
+  <xacro:include filename="$(find fairino_description)/urdf/fairino5_v6.urdf"/>
+  <xacro:include filename="fairino5_v6_robot.ros2_control.xacro"/>
+
+  <xacro:fairino5_v6_robot_ros2_control
+      name="FairinoFR5System"
+      initial_positions_file="$(arg initial_positions_file)"
+      use_fake_hardware="$(arg use_fake_hardware)"
+      robot_ip="$(arg robot_ip)"
+      servo_period_s="$(arg servo_period_s)"/>
+</robot>

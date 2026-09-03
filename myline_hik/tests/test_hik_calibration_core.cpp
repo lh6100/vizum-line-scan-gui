@@ -112,23 +112,23 @@ void testDefaultBoardSpec() {
     std::string error;
     CHECK_TRUE(validateBoardSpec(board, &error),
                std::string("default board should be valid: ") + error);
-    CHECK_TRUE(board.squaresX == 5, "default squaresX must be exactly 5");
-    CHECK_TRUE(board.squaresY == 7, "default squaresY must be exactly 7");
-    CHECK_TRUE(nearlyEqual(board.squareLengthMm, 22.0, 0.0),
-               "default square length must be exactly 22 mm");
-    CHECK_TRUE(nearlyEqual(board.markerLengthMm, 16.0, 0.0),
-               "default marker length must be exactly 16 mm");
+    CHECK_TRUE(board.squaresX == 11, "default squaresX must be exactly 11");
+    CHECK_TRUE(board.squaresY == 8, "default squaresY must be exactly 8");
+    CHECK_TRUE(nearlyEqual(board.squareLengthMm, 24.0, 0.0),
+               "default square length must be exactly 24 mm");
+    CHECK_TRUE(nearlyEqual(board.markerLengthMm, 18.0, 0.0),
+               "default marker length must be exactly 18 mm");
     CHECK_TRUE(board.dictionaryId == cv::aruco::DICT_4X4_50,
                "default dictionary must be DICT_4X4_50");
     CHECK_TRUE(dictionaryName(board.dictionaryId) == "DICT_4X4_50",
                "dictionaryName must report DICT_4X4_50");
 
-    CHECK_TRUE(board.charucoCornerCount() == 24,
-               "5x7 ChArUco board must contain (5-1)*(7-1)=24 corners");
-    CHECK_TRUE(nearlyEqual(board.widthMm(), 110.0, 1e-12),
-               "5 squares * 22 mm must produce a 110 mm board width");
-    CHECK_TRUE(nearlyEqual(board.heightMm(), 154.0, 1e-12),
-               "7 squares * 22 mm must produce a 154 mm board height");
+    CHECK_TRUE(board.charucoCornerCount() == 70,
+               "11x8 ChArUco board must contain (11-1)*(8-1)=70 corners");
+    CHECK_TRUE(nearlyEqual(board.widthMm(), 264.0, 1e-12),
+               "11 squares * 24 mm must produce a 264 mm board width");
+    CHECK_TRUE(nearlyEqual(board.heightMm(), 192.0, 1e-12),
+               "8 squares * 24 mm must produce a 192 mm board height");
 }
 
 void testNeutralMetadataDefaults() {
@@ -413,6 +413,8 @@ void testYamlRoundTrips(const hik_calibration::LaserPlaneFitResult& planeFit) {
     intrinsicsMetadata.frameId = "hik_camera_optical_frame";
     intrinsicsMetadata.pixelFormat = "Mono8";
     intrinsicsMetadata.printedPatternSha256 = "board-sha256-test";
+    intrinsicsMetadata.validCameraZMinMm = 400.0;
+    intrinsicsMetadata.validCameraZMaxMm = 700.0;
     intrinsicsMetadata.generatedAt = "2026-07-16T15:00:00+08:00";
 
     std::string error;
@@ -455,6 +457,12 @@ void testYamlRoundTrips(const hik_calibration::LaserPlaneFitResult& planeFit) {
                            loadedMetadata.pixelFormat == intrinsicsMetadata.pixelFormat &&
                            loadedMetadata.printedPatternSha256 ==
                                intrinsicsMetadata.printedPatternSha256 &&
+                           nearlyEqual(loadedMetadata.validCameraZMinMm,
+                                       intrinsicsMetadata.validCameraZMinMm,
+                                       1e-10) &&
+                           nearlyEqual(loadedMetadata.validCameraZMaxMm,
+                                       intrinsicsMetadata.validCameraZMaxMm,
+                                       1e-10) &&
                            loadedMetadata.generatedAt == intrinsicsMetadata.generatedAt,
                        "intrinsics metadata changed during YAML round trip");
         }
@@ -488,6 +496,11 @@ void testYamlRoundTrips(const hik_calibration::LaserPlaneFitResult& planeFit) {
     planeMetadata.generatedAt = "2026-07-16T15:01:00+08:00";
     planeMetadata.validCameraZMinMm = 120.0;
     planeMetadata.validCameraZMaxMm = 650.0;
+    planeMetadata.validationMethod = "whole_pose_holdout_near_mid_far";
+    planeMetadata.validationPoseCount = 3;
+    planeMetadata.validationPointCount = 321;
+    planeMetadata.validationRmsMm = 0.12;
+    planeMetadata.validationP95Mm = 0.21;
 
     const BoardSpec board;
     error.clear();
@@ -542,7 +555,17 @@ void testYamlRoundTrips(const hik_calibration::LaserPlaneFitResult& planeFit) {
                            nearlyEqual(loadedMetadata.validCameraZMinMm,
                                        planeMetadata.validCameraZMinMm, 1e-10) &&
                            nearlyEqual(loadedMetadata.validCameraZMaxMm,
-                                       planeMetadata.validCameraZMaxMm, 1e-10),
+                                       planeMetadata.validCameraZMaxMm, 1e-10) &&
+                           loadedMetadata.validationMethod ==
+                               planeMetadata.validationMethod &&
+                           loadedMetadata.validationPoseCount ==
+                               planeMetadata.validationPoseCount &&
+                           loadedMetadata.validationPointCount ==
+                               planeMetadata.validationPointCount &&
+                           nearlyEqual(loadedMetadata.validationRmsMm,
+                                       planeMetadata.validationRmsMm, 1e-10) &&
+                           nearlyEqual(loadedMetadata.validationP95Mm,
+                                       planeMetadata.validationP95Mm, 1e-10),
                        "laser-plane metadata changed during YAML round trip");
         }
 
@@ -889,6 +912,134 @@ void testConstantLaserScanCore() {
                    qualityProfile.stripe.size() ==
                        qualityProfile.qualityStripe.size(),
                "quality mode must make the gated stripe the official output");
+
+    cv::Mat forkLaserOn(imageSize, CV_8UC1, cv::Scalar(30));
+    const auto addHorizontalGaussian =
+        [&forkLaserOn](double centerY,
+                       double amplitude,
+                       int firstColumn,
+                       int lastColumn) {
+            for (int column = std::max(0, firstColumn);
+                 column < std::min(forkLaserOn.cols, lastColumn);
+                 ++column) {
+                for (int row = 0; row < forkLaserOn.rows; ++row) {
+                    const double distance =
+                        (static_cast<double>(row) - centerY) / 1.10;
+                    const int signal = static_cast<int>(std::lround(
+                        amplitude *
+                        std::exp(-0.5 * distance * distance)));
+                    forkLaserOn.at<unsigned char>(row, column) =
+                        static_cast<unsigned char>(std::min(
+                            255,
+                            static_cast<int>(
+                                forkLaserOn.at<unsigned char>(
+                                    row, column)) +
+                                signal));
+                }
+            }
+        };
+    addHorizontalGaussian(45.0, 100.0, 0, imageSize.width);
+    const int forkFirst = 50;
+    const int forkLast = 69;
+    for (int column = forkFirst; column <= forkLast; ++column) {
+        const int offset = column - forkFirst;
+        const int distanceToEnd =
+            std::min(offset, forkLast - column);
+        addHorizontalGaussian(
+            45.0 + 4.0 * static_cast<double>(distanceToEnd),
+            100.0, column, column + 1);
+    }
+
+    SingleFrameProfileOptions forkShadowOptions = shadowOptions;
+    forkShadowOptions.reconstruction.stripe.minPointCount = 50;
+    forkShadowOptions.reconstruction.minReconstructedPoints = 50;
+    forkShadowOptions.reconstruction.stripe.quality.orientation =
+        hik_stripe::Orientation::Horizontal;
+    forkShadowOptions.reconstruction.stripe.quality.pathMaximumStepPx =
+        6.0;
+    forkShadowOptions.reconstruction.stripe.quality
+        .pathAmbiguityMarginPerPoint = 1.50;
+    forkShadowOptions.reconstruction.stripe.quality
+        .pathAmbiguityMinimumSeparationPx = 5.0;
+    forkShadowOptions.reconstruction.stripe.quality
+        .pathAmbiguityPaddingScanlines = 2;
+    StaticProfileResult forkShadow;
+    CHECK_TRUE(reconstructSingleFrameProfile(
+                   forkLaserOn, "constant_laser_shadow_fork",
+                   intrinsics, laserPlane, forkShadowOptions,
+                   &forkShadow),
+               std::string("shadow multipath profile failed: ") +
+                   forkShadow.error);
+    CHECK_TRUE(forkShadow.ok &&
+                   forkShadow.qualityAnalysisCompleted &&
+                   forkShadow.qualityAmbiguousBranches.size() >= 2U,
+               "shadow mode must retain explicit branch hypotheses for a "
+               "local split/rejoin");
+    CHECK_TRUE(!forkShadow.ambiguityMaskedLegacyPoints.empty() &&
+                   forkShadow.points.size() <
+                       forkShadow.legacyPoints.size(),
+               "shadow formal legacy output must hard-mask the complete "
+               "multipath protection interval");
+    if (!forkShadow.qualityAmbiguousBranches.empty()) {
+        const int protectedFirst =
+            forkShadow.qualityAmbiguousBranches.front()
+                .firstScanIndex;
+        const int protectedLast =
+            forkShadow.qualityAmbiguousBranches.front()
+                .lastScanIndex;
+        CHECK_TRUE(std::none_of(
+                       forkShadow.points.begin(),
+                       forkShadow.points.end(),
+                       [protectedFirst, protectedLast](
+                               const StaticProfilePoint& point) {
+                           const int scanIndex = static_cast<int>(
+                               std::lround(point.stripe.pixel.x));
+                           return scanIndex >= protectedFirst &&
+                                  scanIndex <= protectedLast;
+                       }),
+                   "shadow output must not interpolate, fill, or retain "
+                   "legacy points inside a protected ambiguity interval");
+        CHECK_TRUE(std::none_of(
+                       forkShadow.qualityPoints.begin(),
+                       forkShadow.qualityPoints.end(),
+                       [protectedFirst, protectedLast](
+                               const StaticProfilePoint& point) {
+                           const int scanIndex = static_cast<int>(
+                               std::lround(point.stripe.pixel.x));
+                           return scanIndex >= protectedFirst &&
+                                  scanIndex <= protectedLast;
+                       }),
+                   "quality publishable points must exclude the same "
+                   "protected ambiguity interval");
+    }
+
+    SingleFrameProfileOptions auditOnlyOptions = forkShadowOptions;
+    auditOnlyOptions.reconstruction.stripe.minPointCount = 115;
+    auditOnlyOptions.reconstruction.minReconstructedPoints = 115;
+    StaticProfileResult auditOnly;
+    CHECK_TRUE(reconstructSingleFrameProfile(
+                   forkLaserOn, "constant_laser_shadow_fork_audit_only",
+                   intrinsics, laserPlane, auditOnlyOptions,
+                   &auditOnly),
+               std::string("multipath audit-only profile failed: ") +
+                   auditOnly.error);
+    CHECK_TRUE(auditOnly.ok &&
+                   auditOnly.multipathAuditOnly &&
+                   !auditOnly.formalPublicationPassed &&
+                   auditOnly.stripe.empty() &&
+                   auditOnly.points.empty(),
+               "a multipath frame below the formal point-count gate must "
+               "succeed only as an audit record with no publishable fragment");
+    CHECK_TRUE(!auditOnly.legacyPoints.empty() &&
+                   !auditOnly.ambiguityMaskedLegacyPoints.empty() &&
+                   !auditOnly.publicationGateRejectedPoints.empty() &&
+                   auditOnly.publicationGateRejectedPoints.size() +
+                           auditOnly.ambiguityMaskedLegacyPoints.size() ==
+                       auditOnly.legacyPoints.size() &&
+                   auditOnly.qualityAmbiguousBranches.size() >= 2U,
+               "audit-only mode must retain the whole policy-selected "
+               "fragment, masked legacy observations, and every explicit "
+               "branch for rejected/base_link validation");
 
     cv::Mat horizontalLaserOn(imageSize, CV_8UC1);
     for (int row = 0; row < horizontalLaserOn.rows; ++row) {

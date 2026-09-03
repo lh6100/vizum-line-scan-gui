@@ -38,7 +38,8 @@ enum RejectReason : std::uint32_t {
     REJECT_OUTSIDE_ROI = 1U << 8U,
     REJECT_OUTSIDE_VALIDITY_MASK = 1U << 9U,
     REJECT_PATH_JUMP = 1U << 10U,
-    REJECT_PATH_AMBIGUOUS = 1U << 11U
+    REJECT_PATH_AMBIGUOUS = 1U << 11U,
+    REJECT_AMBIGUOUS_MULTIPATH = 1U << 12U
 };
 
 struct Options {
@@ -68,6 +69,11 @@ struct Options {
     double pathMaximumStepPx;
     int pathMaximumGap;
     double pathAmbiguityMarginPerPoint;
+    double peakMergeMinimumDistancePx;
+    double peakMergeFwhmScale;
+    double pathAmbiguityMinimumSeparationPx;
+    int pathAmbiguityPaddingScanlines;
+    double pathMaximumPredictionResidualPx;
 
     Options();
     bool validate(const cv::Size& imageSize, std::string* error = nullptr) const;
@@ -96,9 +102,57 @@ struct Candidate {
     double smoothedFirstDerivative;
     double smoothedSecondDerivative;
     std::uint32_t rejectFlags;
+    int ambiguityIntervalId;
+    int ambiguityBranchId;
 
     Candidate();
+    bool usableForPath() const;
     bool accepted() const;
+};
+
+struct PathScanlineDiagnostic {
+    int scanIndex;
+    bool hasSelected;
+    cv::Point2d selectedPixel;
+    bool hasAlternate;
+    cv::Point2d alternatePixel;
+    double separationPx;
+    double localCostMargin;
+    int ambiguityIntervalId;
+
+    PathScanlineDiagnostic();
+};
+
+struct MultipathBranch {
+    int branchId;
+    double pathCost;
+    std::vector<Candidate> candidates;
+
+    MultipathBranch();
+};
+
+struct MultipathInterval {
+    int intervalId;
+    // Inclusive hard-rejection/protection range.
+    int firstScanIndex;
+    int lastScanIndex;
+    // Inclusive range over which the representative hypotheses differ.
+    int coreFirstScanIndex;
+    int coreLastScanIndex;
+    // Common best/alternate candidates immediately outside the core. -1 plus
+    // an open flag means no common anchor exists on that side and the
+    // protection range is extended to the path-segment boundary.
+    int leftAnchorScanIndex;
+    int rightAnchorScanIndex;
+    bool leftBoundaryOpen;
+    bool rightBoundaryOpen;
+    double minimumLocalCostMargin;
+    double maximumSeparationPx;
+    // Ordered, mutually exclusive path hypotheses over first..last. Candidate
+    // copies carry this intervalId and their branchId for direct 3D rebuild.
+    std::vector<MultipathBranch> branches;
+
+    MultipathInterval();
 };
 
 struct Diagnostics {
@@ -109,11 +163,16 @@ struct Diagnostics {
     std::size_t scanlinesWithCandidates;
     std::size_t totalCandidateCount;
     std::size_t acceptedCandidateCount;
+    std::size_t pathUsableCandidateCount;
+    std::size_t provisionalSelectedPointCount;
+    std::size_t publishableSelectedPointCount;
     std::size_t selectedPointCount;
     std::size_t selectedGapCount;
     std::size_t saturatedCandidateCount;
     std::size_t multiPeakScanlineCount;
     std::size_t ambiguousPathPointCount;
+    std::size_t multipathAmbiguousScanlineCount;
+    std::size_t multipathIntervalCount;
     std::size_t rejectedLowProminenceCount;
     std::size_t rejectedWidthCount;
     std::size_t rejectedSaturationCount;
@@ -142,7 +201,15 @@ struct Result {
     std::string error;
     Orientation orientation;
     std::vector<Candidate> candidates;
+    // The globally optimal path before ambiguous multipath intervals are
+    // removed. It is diagnostic-only and must never be reconstructed as one
+    // physical stripe without inspecting multipathIntervals.
+    std::vector<Candidate> provisionalSelected;
+    // Backward-compatible name for the publishable path. Ambiguous intervals
+    // are removed and never interpolated.
     std::vector<Candidate> selected;
+    std::vector<PathScanlineDiagnostic> pathDiagnostics;
+    std::vector<MultipathInterval> multipathIntervals;
     Diagnostics diagnostics;
 
     Result();

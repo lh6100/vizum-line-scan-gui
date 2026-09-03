@@ -46,6 +46,9 @@ int runFakeSsh() {
             } else if (
                     request.find("\"state\":\"laser650\"") != std::string::npos) {
                 state = "laser650";
+            } else if (
+                    request.find("\"state\":\"both\"") != std::string::npos) {
+                state = "both";
             } else {
                 std::cout
                     << "{\"v\":1,\"id\":" << id
@@ -67,8 +70,8 @@ int runFakeSsh() {
             state = "off";
         }
 
-        const bool high450 = state == "laser450";
-        const bool high650 = state == "laser650";
+        const bool high450 = state == "laser450" || state == "both";
+        const bool high650 = state == "laser650" || state == "both";
         std::cout
             << "{\"v\":1,\"id\":" << id
             << ",\"ok\":true,\"status\":{"
@@ -115,7 +118,7 @@ private slots:
         QVERIFY(config.heartbeatIntervalMs < 1500);
     }
 
-    void asynchronousStateAndMutualExclusion() {
+    void asynchronousStateControl() {
         QTemporaryDir temporary;
         QVERIFY(temporary.isValid());
         const QString key = temporary.filePath(QStringLiteral("id_ed25519"));
@@ -183,18 +186,35 @@ private slots:
         QVERIFY(!status.ttl450High);
         QVERIFY(status.ttl650High);
 
-        const quint64 offToken = controller.requestOffTracked();
-        QVERIFY(offToken > 0);
+        controller.setBoth();
         QTRY_VERIFY_WITH_TIMEOUT(
             statusSpy.last().at(0).value<LineLaserStatus>().state ==
-                LineLaserState::Off &&
-            statusSpy.last().at(0).value<LineLaserStatus>()
-                    .acknowledgedOffCommandToken >= offToken,
+                LineLaserState::Both,
+            1000);
+        status = statusSpy.last().at(0).value<LineLaserStatus>();
+        QVERIFY(status.ttl450High);
+        QVERIFY(status.ttl650High);
+
+        const quint64 offToken = controller.requestOffTracked();
+        QVERIFY(offToken > 0);
+        const auto offWasAcknowledged = [&statusSpy, offToken]() {
+            for (const QList<QVariant>& arguments : statusSpy) {
+                const LineLaserStatus observed =
+                    arguments.at(0).value<LineLaserStatus>();
+                if (observed.state == LineLaserState::Off &&
+                    observed.acknowledgedOffCommandToken >= offToken) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(
+            offWasAcknowledged(),
             1000);
         status = statusSpy.last().at(0).value<LineLaserStatus>();
         QVERIFY(!status.ttl450High);
         QVERIFY(!status.ttl650High);
-        QVERIFY(commandSpy.count() >= 3);
+        QVERIFY(commandSpy.count() >= 4);
 
         controller.disconnectController();
         QTRY_VERIFY_WITH_TIMEOUT(

@@ -1,8 +1,11 @@
 #ifndef MYLINE_HIK_HIK_CALIBRATION_WINDOW_H
 #define MYLINE_HIK_HIK_CALIBRATION_WINDOW_H
 
+#include "AutomaticCalibrationCore.h"
+#include "Fr5PathEvaluator.h"
 #include "HikCalibrationCore.h"
 #include "HandEyeCalibrationCore.h"
+#include "LineLaserController.h"
 #include "LineLaserDeviceProfile.h"
 
 #include <QImage>
@@ -14,6 +17,7 @@
 #include <vector>
 
 class QCloseEvent;
+class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
@@ -32,6 +36,7 @@ class HikCalibrationWindow final : public QMainWindow {
 
 public:
     explicit HikCalibrationWindow(const LineLaserDeviceProfile& profile,
+                                  LineLaserController* laserController,
                                   FairinoRobotSession* robotSession,
                                   QWidget* parent = nullptr);
     ~HikCalibrationWindow() override;
@@ -58,6 +63,7 @@ private slots:
     void disconnectCamera();
     void captureManualFrame();
     void captureIntrinsicSample();
+    void captureAutomaticLaserPair();
     void captureLaserOff();
     void captureLaserOn();
     void cancelPendingLaserPair();
@@ -70,6 +76,8 @@ private slots:
     void disconnectRobot();
     void readRobotPose();
     void captureHandEyeSample();
+    void startAutomaticCalibration();
+    void stopAutomaticCalibration();
     void deleteSelectedHandEyeSamples();
     void clearHandEyeSamples();
     void solveHandEye();
@@ -102,8 +110,19 @@ private slots:
     void onRobotLog(QString message);
     void onRobotError(int requestId, QString message);
     void onRobotClientError(int clientId, QString message);
+    void onRobotMotionFinished(int requestId,
+                               bool targetReached,
+                               bool motionStoppedConfirmed,
+                               QString description);
+    void onAutomaticPathEvaluated(
+        int requestId,
+        int actionId,
+        hik_adaptive::RobotPathEvaluation evaluation);
+    void onAutomaticPathBatchFinished(int requestId,
+                                      bool completed,
+                                      QString description);
 
-    void swapBoardAxes();
+    void restoreStandardBoardSpec();
     void importIntrinsicImages();
     void deleteSelectedIntrinsicSamples();
     void clearIntrinsicSamples();
@@ -119,6 +138,17 @@ private slots:
     void solveLaserPlane();
     void saveLaserCandidate();
     void saveApprovedLaserPlane();
+    void connectLaserController();
+    void enableProfileLaser();
+    void enableBothLasers();
+    void disableAllLasers();
+    void onLaserConnectionStateChanged(LineLaserConnectionState state,
+                                       QString detail);
+    void onLaserStatusChanged(LineLaserStatus status);
+    void onLaserCommandFinished(QString command,
+                                bool success,
+                                QString detail);
+    void onLaserFault(QString detail);
 
 private:
     enum class CapturePurpose {
@@ -129,7 +159,9 @@ private:
         LaserOn,
         ProfileOff,
         ProfileOn,
-        HandEye
+        HandEye,
+        AutomaticSeed,
+        AutomaticSample
     };
 
     enum class LaserCaptureState {
@@ -142,6 +174,29 @@ private:
         WaitingBeforePose,
         WaitingCameraFrame,
         WaitingAfterPose
+    };
+
+    enum class LaserSwitchCaptureState {
+        Idle,
+        WaitingForAck,
+        Settling
+    };
+
+    enum class AutomaticState {
+        Idle,
+        WaitingSeedPose,
+        WaitingSeedFrame,
+        Preflighting,
+        Moving,
+        Settling,
+        WaitingBeforePose,
+        WaitingSampleFrame,
+        WaitingAfterPose,
+        ReturningHome,
+        Stopping,
+        Solving,
+        Completed,
+        Failed
     };
 
     struct IntrinsicSample {
@@ -202,6 +257,7 @@ private:
         hik_calibration::HandEyeSample sample;
         QString imagePath;
         double flangeValues[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        double boardDepthMm{0.0};
         int cornerCount{0};
         double robotTranslationDeltaMm{0.0};
         double robotRotationDeltaDeg{0.0};
@@ -220,13 +276,38 @@ private:
         qint64 cameraHostTimestampRaw{0};
     };
 
+    struct AutomaticSampleEntry {
+        int targetIndex{-1};
+        bool holdout{false};
+        QString sampleId;
+        QString imagePath;
+        hik_calibration::CharucoDetectionResult detection;
+        RobotPoseReading before;
+        RobotPoseReading after;
+        qint64 cameraHostTimestampRaw{0};
+        double robotTranslationDeltaMm{0.0};
+        double robotRotationDeltaDeg{0.0};
+        bool accepted{false};
+        QString reason;
+    };
+
+    struct PendingAutomaticImage {
+        bool valid{false};
+        QString sampleId;
+        QString imagePath;
+        hik_calibration::CharucoDetectionResult detection;
+        qint64 cameraHostTimestampRaw{0};
+    };
+
     void buildUi();
     QWidget* buildCameraBar();
     QWidget* buildBoardBar();
+    QWidget* buildLaserControlBar();
     QWidget* buildIntrinsicPage();
     QWidget* buildLaserPage();
     QWidget* buildProfilePage();
     QWidget* buildHandEyePage();
+    QWidget* buildAutomaticCalibrationPage();
     QWidget* buildPreviewPanel();
     void setupCameraWorker();
     void shutdownCameraWorker();
@@ -256,11 +337,24 @@ private:
     void updateAllUiStates();
     void updateCameraUi();
     void updateBoardUi();
+    void updateLaserControlUi();
     void updateIntrinsicUi();
     void updateLaserUi();
     void updateProfileUi();
     void updateHandEyeUi();
+    void updateAutomaticCalibrationUi();
+    bool automaticRunActive() const;
     void resetPendingCapture();
+    LineLaserState profileLaserState() const;
+    bool laserStatusMatches(LineLaserState expected,
+                            QString* error = nullptr) const;
+    bool capturePurposeRequiresLaserControl(CapturePurpose purpose) const;
+    LineLaserState requiredLaserState(CapturePurpose purpose) const;
+    void beginLaserControlledCapture(CapturePurpose purpose);
+    void continueCaptureAfterLaserReady(CapturePurpose purpose);
+    void cancelPendingLaserSwitch(const QString& reason);
+    void requestSafeLaserOff(const QString& reason);
+    void startHandEyeSampleAfterLaserOff();
     QString expectedCameraModelFromUi() const;
     QString expectedCameraSerialFromUi() const;
     bool currentCameraMatchesProfile(QString* error = nullptr) const;
@@ -367,6 +461,23 @@ private:
     hik_calibration::HandEyeYamlMetadata handEyeMetadata() const;
     bool writeHandEyeYaml(const QString& path, QString* error) const;
 
+    bool loadAutomaticSeedCalibration(QString* error);
+    void processAutomaticSeedImage(const cv::Mat& grayImage,
+                                   const QString& imagePath);
+    void beginAutomaticPreflight();
+    void beginAutomaticMove();
+    void captureAutomaticTargetAfterSettle();
+    void processAutomaticSampleImage(const cv::Mat& grayImage,
+                                     const QString& imagePath,
+                                     qint64 cameraHostTimestampRaw);
+    void finishAutomaticSample(const RobotPoseReading& after);
+    void moveToNextAutomaticTarget();
+    void returnAutomaticHome();
+    void solveAutomaticDataset();
+    void finishAutomaticRun(bool success, const QString& message);
+    void refreshAutomaticTable();
+    bool writeDualCameraExtrinsicsFromFormalHandEye(QString* error) const;
+
     bool promoteFileAtomically(const QString& source,
                                const QString& destination,
                                QString* error) const;
@@ -387,9 +498,10 @@ private:
     bool cameraConnected_{false};
     bool cameraBusy_{false};
     bool shuttingDown_{false};
+    LineLaserController* const laserController_;
     FairinoRobotSession* const robotSession_;
     int robotClientId_{0};
-    bool profileTabActive_{true};
+    bool profileTabActive_{false};
     bool robotConnected_{false};
     bool robotBusy_{false};
     int pendingRobotRequestId_{-1};
@@ -410,6 +522,19 @@ private:
     QString intrinsicDatasetCameraModel_;
     QString intrinsicDatasetCameraSerial_;
 
+    LineLaserConnectionState laserConnectionState_{
+        LineLaserConnectionState::Disconnected};
+    LineLaserStatus laserStatus_;
+    quint64 laserStatusEventSequence_{0};
+    quint64 laserTransportGeneration_{0};
+    LaserSwitchCaptureState laserSwitchCaptureState_{
+        LaserSwitchCaptureState::Idle};
+    CapturePurpose pendingLaserSwitchPurpose_{CapturePurpose::None};
+    LineLaserState pendingLaserRequiredState_{LineLaserState::Unknown};
+    quint64 pendingLaserStatusBaseline_{0};
+    quint64 pendingLaserOffToken_{0};
+    quint64 laserSwitchGeneration_{0};
+
     const LineLaserDeviceProfile profile_;
     QString sourceDir_;
     QString sessionDir_;
@@ -417,6 +542,11 @@ private:
     QString laserSessionDir_;
     QString profileSessionDir_;
     QString handEyeSessionDir_;
+    QString automaticSessionDir_;
+    QString automaticRunId_;
+    QString automaticPlanManifestPath_;
+    QString automaticSampleManifestPath_;
+    QString automaticSummaryPath_;
     QString captureManifestPath_;
     QString profileManifestPath_;
     QString handEyeManifestPath_;
@@ -433,12 +563,20 @@ private:
     QPushButton* disconnectButton_{nullptr};
     QPushButton* singleFrameButton_{nullptr};
 
+    QPushButton* connectLaserButton_{nullptr};
+    QPushButton* enableProfileLaserButton_{nullptr};
+    QPushButton* enableBothLasersButton_{nullptr};
+    QPushButton* disableAllLasersButton_{nullptr};
+    QPushButton* refreshLaserStatusButton_{nullptr};
+    QSpinBox* laserSettleSpin_{nullptr};
+    QLabel* laserStatusLabel_{nullptr};
+
     QSpinBox* squaresXSpin_{nullptr};
     QSpinBox* squaresYSpin_{nullptr};
     QDoubleSpinBox* squareLengthSpin_{nullptr};
     QDoubleSpinBox* markerLengthSpin_{nullptr};
     QComboBox* dictionaryCombo_{nullptr};
-    QPushButton* swapBoardButton_{nullptr};
+    QPushButton* restoreBoardButton_{nullptr};
     QLabel* boardLockLabel_{nullptr};
 
     QTabWidget* calibrationTabs_{nullptr};
@@ -459,6 +597,7 @@ private:
     QLabel* laserIntrinsicsStatusLabel_{nullptr};
     QPushButton* captureLaserOffButton_{nullptr};
     QPushButton* captureLaserOnButton_{nullptr};
+    QPushButton* captureAutomaticLaserPairButton_{nullptr};
     QPushButton* cancelLaserPairButton_{nullptr};
     QLabel* laserPairStateLabel_{nullptr};
     QPushButton* importLaserPairsButton_{nullptr};
@@ -502,6 +641,20 @@ private:
     QLabel* handEyeResultLabel_{nullptr};
     QTableWidget* handEyeTable_{nullptr};
 
+    QPushButton* startAutomaticButton_{nullptr};
+    QPushButton* stopAutomaticButton_{nullptr};
+    QLineEdit* automaticRobotIpEdit_{nullptr};
+    QPushButton* automaticConnectRobotButton_{nullptr};
+    QLabel* automaticRobotStatusLabel_{nullptr};
+    QCheckBox* automaticDryRunCheck_{nullptr};
+    QCheckBox* automaticSafetyConfirmCheck_{nullptr};
+    QDoubleSpinBox* automaticSpeedSpin_{nullptr};
+    QDoubleSpinBox* automaticAccelerationSpin_{nullptr};
+    QSpinBox* automaticSettleSpin_{nullptr};
+    QLabel* automaticStatusLabel_{nullptr};
+    QLabel* automaticValidationLabel_{nullptr};
+    QTableWidget* automaticTable_{nullptr};
+
     ImageView* imageView_{nullptr};
     QLabel* imageInfoLabel_{nullptr};
     QPlainTextEdit* logView_{nullptr};
@@ -522,8 +675,13 @@ private:
     bool hasActiveLaserIntrinsics_{false};
     LaserCaptureState laserCaptureState_{LaserCaptureState::AwaitingOff};
     PendingLaserOff pendingLaserOff_;
+    bool automaticLaserPairPending_{false};
     std::vector<LaserPairSample> laserPairs_;
     hik_calibration::LaserPlaneFitResult laserPlaneResult_;
+    hik_calibration::ErrorMetrics laserHoldoutDistanceMm_;
+    int laserHoldoutPoseCount_{0};
+    int laserHoldoutPointCount_{0};
+    bool laserHoldoutValid_{false};
     bool hasLaserPlaneResult_{false};
     QString lastLaserCandidatePath_;
 
@@ -553,6 +711,24 @@ private:
     hik_calibration::HandEyeCalibrationResult handEyeResult_;
     bool hasHandEyeResult_{false};
     QString lastHandEyeCandidatePath_;
+
+    AutomaticState automaticState_{AutomaticState::Idle};
+    hik_scan::HandEyeFile automaticSeedHandEye_;
+    hik_calibration::AutomaticCalibrationPlan automaticPlan_;
+    std::vector<AutomaticSampleEntry> automaticSamples_;
+    std::vector<bool> automaticPathChecks_;
+    int automaticPathEvaluationRequestId_{-1};
+    int automaticMotionRequestId_{-1};
+    int automaticTargetCursor_{-1};
+    int automaticEvaluatedPathCount_{0};
+    bool automaticPreflightPassed_{false};
+    bool automaticAbortRequested_{false};
+    RobotPoseReading automaticSeedRobotPose_;
+    RobotPoseReading automaticBeforePose_;
+    PendingAutomaticImage pendingAutomaticImage_;
+    QString pendingAutomaticSampleId_;
+    QString automaticFailureAfterReturn_;
+    hik_calibration::AutomaticCalibrationValidation automaticValidation_;
 };
 
 #endif // MYLINE_HIK_HIK_CALIBRATION_WINDOW_H

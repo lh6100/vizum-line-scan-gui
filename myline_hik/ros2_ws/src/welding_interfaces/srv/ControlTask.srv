@@ -1,0 +1,12 @@
+uint8 PAUSE=1
+uint8 RESUME=2
+uint8 ABORT=3
+
+string session_id
+string task_id
+uint8 command
+uint8 expected_state
+---
+bool accepted
+welding_interfaces/TaskState state
+string error

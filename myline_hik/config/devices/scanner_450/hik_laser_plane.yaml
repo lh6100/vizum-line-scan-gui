@@ -1,0 +1,56 @@
+schema_version: 1
+calibration_type: "line_laser_plane"
+camera_frame: "hik_450_camera_optical_frame"
+coordinate_convention: "x_right_y_down_z_forward"
+length_unit: "mm"
+
+plane:
+  equation: "nx*x + ny*y + nz*z + d = 0"
+  coefficients: [0.11930617317308299, -0.98158288883999467, 0.14920143893181817, -57.054157066899364]
+  normal_norm: 1
+  sign_convention: "d_nonpositive"
+
+intrinsics:
+  file: "config/devices/scanner_450/hik_intrinsics.yaml"
+  sha256: "5d85e0418eddd7c0de826a90a7c32ad88bca2b82fa9ea9c20c6605e97c3561ac"
+
+board:
+  type: "charuco"
+  squares_x: 11
+  squares_y: 8
+  square_length_mm: 24
+  marker_length_mm: 18
+  dictionary: "DICT_4X4_50"
+  board_width_mm: 264
+  board_height_mm: 192
+  opencv_pattern: "legacy_pre_4_6"
+  printed_pattern_sha256: ""
+
+fit:
+  method: "balanced_cross_pose_ransac_weighted_svd"
+  pose_count: 20
+  point_count: 6979
+  inlier_count: 6745
+  inlier_ratio: 0.96647084109471271
+  inlier_mean_mm: 0.070170630419777336
+  inlier_rms_mm: 0.091685942051401986
+  inlier_p95_mm: 0.19396638977939482
+  inlier_max_mm: 0.29964752773469883
+
+validation:
+  method: "whole_pose_holdout_near_mid_far"
+  holdout_pose_count: 3
+  holdout_point_count: 866
+  holdout_rms_mm: 0.094198266739477135
+  holdout_p95_mm: 0.19514241610553817
+
+validity:
+  camera_z_min_mm: 400
+  camera_z_max_mm: 700
+
+dataset:
+  manifest_file: "data/calibration/scanner_450/session_20260804_134420_798/capture_manifest.csv"
+  manifest_sha256: "d7fccc8f7e617e9ba5cd359223d4d1603ddc2ba37050edf6da1f3c822976fe9e"
+
+opencv_version: "4.5.4"
+generated_at: "2026-08-04T06:16:44.499Z"

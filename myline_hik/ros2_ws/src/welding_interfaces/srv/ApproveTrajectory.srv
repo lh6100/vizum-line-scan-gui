@@ -1,0 +1,10 @@
+string session_id
+string plan_id
+string trajectory_digest
+string operator_id
+welding_interfaces/PlanDependencies dependencies
+---
+bool success
+string approval_id
+string manifest_path
+string error

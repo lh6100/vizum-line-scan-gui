@@ -22,11 +22,9 @@ class FakeGpio:
     def set_state(self, state):
         if self.closed:
             raise OSError("fake GPIO is closed")
-        self.high_450 = state == daemon.STATE_450
-        self.high_650 = state == daemon.STATE_650
+        self.high_450 = state in (daemon.STATE_450, daemon.STATE_BOTH)
+        self.high_650 = state in (daemon.STATE_650, daemon.STATE_BOTH)
         self.history.append((self.high_450, self.high_650))
-        if self.high_450 and self.high_650:
-            raise AssertionError("mutual exclusion was violated")
 
     def values(self):
         return self.high_450, self.high_650
@@ -47,7 +45,7 @@ class ServiceTest(unittest.TestCase):
         if not self.gpio.closed:
             self.service.shutdown()
 
-    def test_mutual_exclusion_and_mapping_state(self):
+    def test_individual_dual_and_mapping_states(self):
         self.service.acquire("a", "test-client")
         status = self.service.set_state("a", daemon.STATE_450)
         self.assertTrue(status["ttl450_high"])
@@ -58,7 +56,13 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(
             self.gpio.history[-3:],
             [(True, False), (False, False), (False, True)])
-        self.assertNotIn((True, True), self.gpio.history)
+        status = self.service.set_state("a", daemon.STATE_BOTH)
+        self.assertEqual(status["state"], daemon.STATE_BOTH)
+        self.assertTrue(status["ttl450_high"])
+        self.assertTrue(status["ttl650_high"])
+        self.assertEqual(
+            self.gpio.history[-2:],
+            [(False, False), (True, True)])
         self.assertEqual(
             status["pin_map"]["laser450"]["physical_pin"], 11)
         self.assertEqual(
@@ -94,7 +98,7 @@ class ServiceTest(unittest.TestCase):
         response = daemon.process_request(
             self.service,
             "owner",
-            {"v": 1, "id": 4, "op": "set", "state": "both"})
+            {"v": 1, "id": 4, "op": "set", "state": "invalid"})
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], "INVALID_STATE")
         self.assertEqual(self.gpio.values(), (False, False))
@@ -152,6 +156,20 @@ class ProtocolHandlerTest(unittest.TestCase):
         self.assertTrue(responses[1]["ok"])
         self.assertTrue(responses[1]["status"]["ttl450_high"])
         # Handler.finish() models gateway EOF and must revoke the lease.
+        self.assertEqual(self.gpio.values(), (False, False))
+        self.assertFalse(self.service.status()["lease_active"])
+
+    def test_handler_accepts_dual_laser_state(self):
+        responses = self._run_handler([
+            {"v": 1, "id": 1, "op": "hello", "client": "test"},
+            {"v": 1, "id": 2, "op": "set", "state": "both"},
+        ])
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(responses[1]["ok"])
+        self.assertEqual(responses[1]["status"]["state"], daemon.STATE_BOTH)
+        self.assertTrue(responses[1]["status"]["ttl450_high"])
+        self.assertTrue(responses[1]["status"]["ttl650_high"])
+        # The explicit dual state is still covered by the fail-safe EOF path.
         self.assertEqual(self.gpio.values(), (False, False))
         self.assertFalse(self.service.status()["lease_active"])
 

@@ -1,0 +1,82 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: 相机坐标网格
+      Enabled: true
+      Cell Size: 0.1
+      Plane: XY
+    - Class: rviz_default_plugins/Image
+      Name: 左目原图（160万）
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /welding_robot/camera_650/image_raw
+      Normalize Range: true
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: 右目原图（130万）
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /welding_robot/camera_450/image_raw
+      Normalize Range: true
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: 双目深度彩色图
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /welding_robot/stereo/depth_preview
+      Normalize Range: true
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 双目实时点云
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /welding_robot/stereo/points
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Decay Time: 1
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 35; 35; 38
+    Fixed Frame: camera_650_optical_frame
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2.0
+      Pitch: 0.35
+      Yaw: 0.4
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 1.0
+Window Geometry:
+  Width: 1500
+  Height: 900

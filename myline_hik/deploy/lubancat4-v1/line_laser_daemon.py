@@ -5,9 +5,9 @@ The daemon is the sole owner of physical Pin 11 / GPIO15 (450 nm) and
 physical Pin 7 / GPIO16 (650 nm).  It exposes a deliberately small,
 newline-delimited JSON protocol on a Unix domain socket.
 
-No request can enable both lasers.  A control lease and connection-scoped
-ownership ensure that a dead client, broken SSH connection, or missed
-heartbeat turns both outputs off.
+The protocol supports each laser independently and an explicit dual-laser
+state.  A control lease and connection-scoped ownership ensure that a dead
+client, broken SSH connection, or missed heartbeat turns both outputs off.
 """
 
 import argparse
@@ -30,7 +30,8 @@ MAX_FRAME_BYTES = 4096
 STATE_OFF = "off"
 STATE_450 = "laser450"
 STATE_650 = "laser650"
-VALID_STATES = frozenset((STATE_OFF, STATE_450, STATE_650))
+STATE_BOTH = "both"
+VALID_STATES = frozenset((STATE_OFF, STATE_450, STATE_650, STATE_BOTH))
 
 
 class LaserError(Exception):
@@ -96,15 +97,17 @@ class CharacterDeviceGpio:
         if state not in VALID_STATES:
             raise ValueError("invalid laser state: {}".format(state))
         values = bytearray(self.GPIOHANDLE_DATA_SIZE)
-        values[0] = 1 if state == STATE_450 else 0
-        values[1] = 1 if state == STATE_650 else 0
+        values[0] = 1 if state in (STATE_450, STATE_BOTH) else 0
+        values[1] = 1 if state in (STATE_650, STATE_BOTH) else 0
         fcntl.ioctl(
             self._handle_fd,
             self.GPIOHANDLE_SET_LINE_VALUES_IOCTL,
             values,
             True)
         actual_450, actual_650 = self.values()
-        expected = (state == STATE_450, state == STATE_650)
+        expected = (
+            state in (STATE_450, STATE_BOTH),
+            state in (STATE_650, STATE_BOTH))
         if (actual_450, actual_650) != expected:
             raise OSError(
                 "GPIO readback mismatch: expected={} actual={}".format(
@@ -225,15 +228,13 @@ class LaserService:
         with self._lock:
             self._require_owner_locked(session_id)
             try:
-                # Enforce break-before-make when changing wavelength. Each
-                # write still updates both lines in one ioctl, so the only
-                # intermediate state is explicitly (LOW, LOW).
+                # Enforce break-before-make whenever changing between two
+                # non-OFF states. Each write updates both lines in one ioctl,
+                # so the intermediate state is explicitly (LOW, LOW).
                 actual_before = self._backend.values()
-                expected = (state == STATE_450, state == STATE_650)
-                if actual_before[0] and actual_before[1]:
-                    self._backend.set_state(STATE_OFF)
-                    raise OSError(
-                        "unsafe pre-existing readback: both outputs are HIGH")
+                expected = (
+                    state in (STATE_450, STATE_BOTH),
+                    state in (STATE_650, STATE_BOTH))
                 if (state != STATE_OFF and
                         actual_before != (False, False) and
                         actual_before != expected):
@@ -243,7 +244,7 @@ class LaserService:
                             "break-before-make LOW readback failed")
                 self._backend.set_state(state)
                 actual = self._backend.values()
-                if actual != expected or (actual[0] and actual[1]):
+                if actual != expected:
                     raise OSError(
                         "state readback mismatch: expected={} actual={}".format(
                             expected, actual))
@@ -301,13 +302,12 @@ class LaserService:
             high_450, high_650 = False, False
             self._last_error = "GPIO readback failed: {}".format(exc)
             self._fatal_error = self._last_error
-        if high_450 and high_650:
-            self._last_error = "unsafe GPIO readback: both outputs are HIGH"
-            self._fatal_error = self._last_error
         actual_state = STATE_OFF
-        if high_450 and not high_650:
+        if high_450 and high_650:
+            actual_state = STATE_BOTH
+        elif high_450:
             actual_state = STATE_450
-        elif high_650 and not high_450:
+        elif high_650:
             actual_state = STATE_650
         remaining_ms = 0
         if self._owner is not None:

@@ -1,0 +1,150 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /MotionPlanning1
+        - /Scanner 6501
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.1
+      Plane: XY
+      Plane Cell Count: 20
+      Value: true
+    - Class: moveit_rviz_plugin/MotionPlanning
+      Name: MotionPlanning
+      Enabled: true
+      Planning Scene Topic: monitored_planning_scene
+      Robot Description: robot_description
+      Planning Request:
+        Planning Group: fairino5_v6_group
+      Planned Path:
+        Loop Animation: false
+        State Display Time: 0.05 s
+        Trajectory Topic: display_planned_path
+      Scene Geometry:
+        Scene Alpha: 1
+      Scene Robot:
+        Robot Alpha: 0.65
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Name: Scanner TCP
+      Enabled: true
+      Length: 0.12
+      Radius: 0.008
+      Reference Frame: scanner_650_scan_tcp
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Name: Camera optical frame
+      Enabled: true
+      Length: 0.10
+      Radius: 0.006
+      Reference Frame: hik_camera_optical_frame
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Scanner 650 calibration
+      Enabled: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /scanner_650/markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Workspace coarse scan
+      Enabled: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /scanner_650/workspace_coarse_scan_markers
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Current laser profile
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scanner_650/profile_cloud
+      Style: Points
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 255; 64; 32
+      Decay Time: 0.25
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Accumulated scan cloud
+      Enabled: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /scanner_650/scan_cloud
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: RGB8
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: Scanner image
+      Enabled: false
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scanner_650/image_raw
+      Normalize Range: true
+      Value: false
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.22
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Frames:
+        All Enabled: true
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 38; 38; 42
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2.0
+      Focal Point:
+        X: 0.1
+        Y: 0.0
+        Z: 0.45
+      Name: Current View
+      Pitch: 0.55
+      Target Frame: base_link
+      Value: Orbit (rviz)
+      Yaw: 0.8
+Window Geometry:
+  Height: 960
+  Width: 1500

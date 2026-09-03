@@ -1,0 +1,13 @@
+std_msgs/Header header
+uint64 sequence
+geometry_msgs/Pose flange_pose
+float64[6] joints_deg
+float64 actual_linear_speed_mm_s
+float64 actual_angular_speed_deg_s
+bool valid
+bool enabled
+bool in_motion
+bool protective_stop
+bool emergency_stop
+string controller_state
+string fault

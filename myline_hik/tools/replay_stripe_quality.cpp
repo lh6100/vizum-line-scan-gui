@@ -36,6 +36,9 @@ struct CommandLine {
     int backgroundWidth{31};
     int backgroundHeight{3};
     int minimumRawIntensity{60};
+    double ambiguityMarginPerPoint{-1.0};
+    double ambiguityMinimumSeparationPx{-1.0};
+    int ambiguityPaddingScanlines{-1};
     bool writeOverlays{true};
 };
 
@@ -58,7 +61,7 @@ struct RejectDescriptor {
     const char* csvName;
 };
 
-const std::array<RejectDescriptor, 12> kRejectDescriptors{{
+const std::array<RejectDescriptor, 13> kRejectDescriptors{{
     {hik_stripe::REJECT_LOW_PROMINENCE, "reject_low_prominence"},
     {hik_stripe::REJECT_WIDTH_OUT_OF_RANGE, "reject_width"},
     {hik_stripe::REJECT_SATURATED_WIDE_PLATEAU, "reject_saturated_wide"},
@@ -70,7 +73,9 @@ const std::array<RejectDescriptor, 12> kRejectDescriptors{{
     {hik_stripe::REJECT_OUTSIDE_ROI, "reject_outside_roi"},
     {hik_stripe::REJECT_OUTSIDE_VALIDITY_MASK, "reject_mask"},
     {hik_stripe::REJECT_PATH_JUMP, "reject_path_jump"},
-    {hik_stripe::REJECT_PATH_AMBIGUOUS, "reject_path_ambiguous"}
+    {hik_stripe::REJECT_PATH_AMBIGUOUS, "reject_path_ambiguous"},
+    {hik_stripe::REJECT_AMBIGUOUS_MULTIPATH,
+     "reject_ambiguous_multipath"}
 }};
 
 void printUsage(const char* executable) {
@@ -84,6 +89,9 @@ void printUsage(const char* executable) {
         << "  --background-width <odd>        Default: 31\n"
         << "  --background-height <odd>       Default: 3\n"
         << "  --minimum-raw <0..255>           Default: 60\n"
+        << "  --ambiguity-margin <cost/point>  Override local multipath margin\n"
+        << "  --ambiguity-min-separation <px>  Override branch separation gate\n"
+        << "  --ambiguity-padding <scanlines>  Override interval protection band\n"
         << "  --no-overlay                    Do not write diagnostic PNG overlays\n"
         << "\nThe input PNG files are opened read-only. All generated files are placed\n"
         << "under the explicitly supplied output directory.\n";
@@ -97,6 +105,23 @@ bool parseInteger(const std::string& text, int* value) {
     try {
         const int parsed = std::stoi(text, &consumed);
         if (consumed != text.size()) {
+            return false;
+        }
+        *value = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parseDouble(const std::string& text, double* value) {
+    if (!value || text.empty()) {
+        return false;
+    }
+    std::size_t consumed = 0U;
+    try {
+        const double parsed = std::stod(text, &consumed);
+        if (consumed != text.size() || !std::isfinite(parsed)) {
             return false;
         }
         *value = parsed;
@@ -232,6 +257,39 @@ bool parseCommandLine(int argc,
                 !parseInteger(value, &command->minimumRawIntensity)) {
                 if (error && error->empty()) {
                     *error = "invalid --minimum-raw";
+                }
+                return false;
+            }
+        } else if (argument == "--ambiguity-margin") {
+            if (!requireValue("--ambiguity-margin", &value) ||
+                !parseDouble(value, &command->ambiguityMarginPerPoint) ||
+                command->ambiguityMarginPerPoint < 0.0) {
+                if (error && error->empty()) {
+                    *error = "invalid --ambiguity-margin";
+                }
+                return false;
+            }
+        } else if (argument == "--ambiguity-min-separation") {
+            if (!requireValue(
+                    "--ambiguity-min-separation", &value) ||
+                !parseDouble(
+                    value,
+                    &command->ambiguityMinimumSeparationPx) ||
+                command->ambiguityMinimumSeparationPx <= 0.0) {
+                if (error && error->empty()) {
+                    *error =
+                        "invalid --ambiguity-min-separation";
+                }
+                return false;
+            }
+        } else if (argument == "--ambiguity-padding") {
+            if (!requireValue("--ambiguity-padding", &value) ||
+                !parseInteger(
+                    value,
+                    &command->ambiguityPaddingScanlines) ||
+                command->ambiguityPaddingScanlines < 0) {
+                if (error && error->empty()) {
+                    *error = "invalid --ambiguity-padding";
                 }
                 return false;
             }
@@ -530,7 +588,11 @@ bool writeCandidateCsv(
         }
         return false;
     }
-    output << "scan_index,peak_index,pixel_x,pixel_y,selected,"
+    output << "scan_index,peak_index,pixel_x,pixel_y,path_usable,"
+              "provisional_selected,publishable_selected,"
+              "ambiguity_interval_id,ambiguity_branch_id,"
+              "branch_memberships,has_alternate,alternate_pixel_x,"
+              "alternate_pixel_y,branch_separation_px,local_cost_margin,"
               "raw_peak,response_peak,local_baseline,local_noise_mad,"
               "prominence,snr,fwhm_px,saturated_fraction,"
               "saturated_plateau_width_px,second_peak_ratio,"
@@ -539,21 +601,77 @@ bool writeCandidateCsv(
               "smoothed_second_derivative,"
               "reject_flags,reject_reasons,legacy_center,absolute_offset_px\n";
 
-    std::map<std::pair<int, int>, std::uint32_t> selected;
+    using CandidateKey = std::pair<int, int>;
+    std::map<CandidateKey, hik_stripe::Candidate> provisional;
+    for (const hik_stripe::Candidate& point :
+         result.provisionalSelected) {
+        provisional[std::make_pair(
+            point.scanIndex, point.peakIndex)] = point;
+    }
+    std::map<CandidateKey, hik_stripe::Candidate> selected;
     for (const hik_stripe::Candidate& point : result.selected) {
         selected[std::make_pair(point.scanIndex, point.peakIndex)] =
-            point.rejectFlags;
+            point;
+    }
+    std::map<int, hik_stripe::PathScanlineDiagnostic> pathDiagnostics;
+    for (const hik_stripe::PathScanlineDiagnostic& diagnostic :
+         result.pathDiagnostics) {
+        pathDiagnostics[diagnostic.scanIndex] = diagnostic;
+    }
+    std::map<CandidateKey, std::vector<std::pair<int, int>>>
+        branchMemberships;
+    for (const hik_stripe::MultipathInterval& interval :
+         result.multipathIntervals) {
+        for (const hik_stripe::MultipathBranch& branch :
+             interval.branches) {
+            for (const hik_stripe::Candidate& candidate :
+                 branch.candidates) {
+                branchMemberships[std::make_pair(
+                    candidate.scanIndex,
+                    candidate.peakIndex)].push_back(
+                        std::make_pair(
+                            interval.intervalId,
+                            branch.branchId));
+            }
+        }
     }
     output << std::setprecision(12);
     for (const hik_stripe::Candidate& candidate : result.candidates) {
-        const std::pair<int, int> candidateKey =
+        const CandidateKey candidateKey =
             std::make_pair(candidate.scanIndex, candidate.peakIndex);
-        const std::map<std::pair<int, int>, std::uint32_t>::const_iterator
+        const std::map<CandidateKey, hik_stripe::Candidate>::const_iterator
+            provisionalEntry = provisional.find(candidateKey);
+        const std::map<CandidateKey, hik_stripe::Candidate>::const_iterator
             selectedEntry = selected.find(candidateKey);
         const std::uint32_t effectiveFlags =
             candidate.rejectFlags |
+            (provisionalEntry == provisional.end()
+                 ? 0U : provisionalEntry->second.rejectFlags) |
             (selectedEntry == selected.end()
-                 ? 0U : selectedEntry->second);
+                 ? 0U : selectedEntry->second.rejectFlags);
+        const hik_stripe::Candidate* classified =
+            provisionalEntry != provisional.end()
+            ? &provisionalEntry->second
+            : &candidate;
+        const std::map<int, hik_stripe::PathScanlineDiagnostic>::
+            const_iterator diagnostic =
+                pathDiagnostics.find(candidate.scanIndex);
+        std::ostringstream memberships;
+        const std::map<CandidateKey,
+                       std::vector<std::pair<int, int>>>::const_iterator
+            membershipEntry = branchMemberships.find(candidateKey);
+        if (membershipEntry != branchMemberships.end()) {
+            for (std::size_t index = 0U;
+                 index < membershipEntry->second.size(); ++index) {
+                if (index > 0U) {
+                    memberships << '|';
+                }
+                memberships
+                    << membershipEntry->second[index].first
+                    << ':'
+                    << membershipEntry->second[index].second;
+            }
+        }
         const std::map<int, double>::const_iterator old =
             oldCenters.find(candidate.scanIndex);
         const double coordinate =
@@ -562,7 +680,27 @@ bool writeCandidateCsv(
                << candidate.peakIndex << ','
                << candidate.pixel.x << ','
                << candidate.pixel.y << ','
+               << (candidate.usableForPath() ? 1 : 0) << ','
+               << (provisionalEntry != provisional.end() ? 1 : 0)
+               << ','
                << (selectedEntry != selected.end() ? 1 : 0)
+               << ',' << classified->ambiguityIntervalId
+               << ',' << classified->ambiguityBranchId
+               << ',' << csvQuote(memberships.str())
+               << ','
+               << (diagnostic != pathDiagnostics.end() &&
+                           diagnostic->second.hasAlternate
+                       ? 1 : 0);
+        if (diagnostic != pathDiagnostics.end() &&
+            diagnostic->second.hasAlternate) {
+            output << ',' << diagnostic->second.alternatePixel.x
+                   << ',' << diagnostic->second.alternatePixel.y
+                   << ',' << diagnostic->second.separationPx
+                   << ',' << diagnostic->second.localCostMargin;
+        } else {
+            output << ",,,,";
+        }
+        output
                << ',' << candidate.rawPeak
                << ',' << candidate.responsePeak
                << ',' << candidate.localBaseline
@@ -602,6 +740,70 @@ bool writeCandidateCsv(
     return true;
 }
 
+bool writeMultipathCsv(
+        const fs::path& path,
+        const hik_stripe::Result& result,
+        std::string* error) {
+    std::ofstream output(path);
+    if (!output) {
+        if (error) {
+            *error = "cannot create multipath CSV: " + path.string();
+        }
+        return false;
+    }
+    output
+        << "interval_id,first_scan_index,last_scan_index,"
+           "core_first_scan_index,core_last_scan_index,"
+           "left_anchor_scan_index,right_anchor_scan_index,"
+           "left_boundary_open,right_boundary_open,"
+           "minimum_local_cost_margin,maximum_separation_px,"
+           "branch_id,branch_path_cost,branch_candidate_count,"
+           "branch_first_scan_index,branch_last_scan_index\n";
+    output << std::setprecision(12);
+    for (const hik_stripe::MultipathInterval& interval :
+         result.multipathIntervals) {
+        for (const hik_stripe::MultipathBranch& branch :
+             interval.branches) {
+            int branchFirst = -1;
+            int branchLast = -1;
+            for (const hik_stripe::Candidate& candidate :
+                 branch.candidates) {
+                if (branchFirst < 0 ||
+                    candidate.scanIndex < branchFirst) {
+                    branchFirst = candidate.scanIndex;
+                }
+                branchLast = std::max(
+                    branchLast, candidate.scanIndex);
+            }
+            output << interval.intervalId << ','
+                   << interval.firstScanIndex << ','
+                   << interval.lastScanIndex << ','
+                   << interval.coreFirstScanIndex << ','
+                   << interval.coreLastScanIndex << ','
+                   << interval.leftAnchorScanIndex << ','
+                   << interval.rightAnchorScanIndex << ','
+                   << (interval.leftBoundaryOpen ? 1 : 0) << ','
+                   << (interval.rightBoundaryOpen ? 1 : 0) << ','
+                   << interval.minimumLocalCostMargin << ','
+                   << interval.maximumSeparationPx << ','
+                   << branch.branchId << ','
+                   << branch.pathCost << ','
+                   << branch.candidates.size() << ','
+                   << branchFirst << ','
+                   << branchLast << '\n';
+        }
+    }
+    if (!output) {
+        if (error) {
+            *error =
+                "failed while writing multipath CSV: " +
+                path.string();
+        }
+        return false;
+    }
+    return true;
+}
+
 void drawCross(cv::Mat* image,
                const cv::Point2d& point,
                const cv::Scalar& color,
@@ -627,7 +829,7 @@ bool writeOverlay(const fs::path& path,
     cv::Mat overlay;
     cv::cvtColor(raw, overlay, cv::COLOR_GRAY2BGR);
     for (const hik_stripe::Candidate& candidate : quality.candidates) {
-        if (!candidate.accepted()) {
+        if (!candidate.usableForPath()) {
             drawCross(&overlay, candidate.pixel, cv::Scalar(0, 0, 190), 1, 1);
         }
     }
@@ -637,10 +839,50 @@ bool writeOverlay(const fs::path& path,
     for (const hik_stripe::Candidate& point : quality.selected) {
         drawCross(&overlay, point.pixel, cv::Scalar(0, 220, 255), 2, 1);
     }
+    for (const hik_stripe::MultipathInterval& interval :
+         quality.multipathIntervals) {
+        cv::Rect band;
+        if (quality.orientation == hik_stripe::Orientation::Horizontal) {
+            band = cv::Rect(
+                interval.firstScanIndex,
+                quality.diagnostics.appliedRoi.y,
+                interval.lastScanIndex -
+                    interval.firstScanIndex + 1,
+                quality.diagnostics.appliedRoi.height);
+        } else {
+            band = cv::Rect(
+                quality.diagnostics.appliedRoi.x,
+                interval.firstScanIndex,
+                quality.diagnostics.appliedRoi.width,
+                interval.lastScanIndex -
+                    interval.firstScanIndex + 1);
+        }
+        band &= cv::Rect(0, 0, overlay.cols, overlay.rows);
+        if (!band.empty()) {
+            cv::Mat tinted = overlay.clone();
+            cv::rectangle(
+                tinted, band, cv::Scalar(180, 0, 180),
+                cv::FILLED);
+            cv::addWeighted(
+                tinted, 0.18, overlay, 0.82, 0.0, overlay);
+            cv::rectangle(
+                overlay, band, cv::Scalar(255, 0, 255),
+                1, cv::LINE_AA);
+        }
+        for (const hik_stripe::MultipathBranch& branch :
+             interval.branches) {
+            for (const hik_stripe::Candidate& point :
+                 branch.candidates) {
+                drawCross(
+                    &overlay, point.pixel,
+                    cv::Scalar(255, 0, 255), 2, 1);
+            }
+        }
+    }
     cv::rectangle(overlay, quality.diagnostics.appliedRoi,
                   cv::Scalar(255, 120, 0), 1, cv::LINE_AA);
     const std::string legend =
-        "legacy=green quality=yellow rejected=red";
+        "legacy=green publishable=yellow multipath=magenta fatal=red";
     cv::putText(overlay, legend, cv::Point(12, 24),
                 cv::FONT_HERSHEY_SIMPLEX, 0.55,
                 cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
@@ -700,11 +942,18 @@ int main(int argc, char** argv) {
     }
     summary
         << "input,width,height,orientation,legacy_points,quality_points,"
+           "provisional_points,publishable_points,"
            "matched_points,offset_signed_mean_px,offset_p50_px,"
            "offset_p95_px,offset_max_px,offset_robust_matched_points,"
            "offset_gross_mismatch_points,offset_signed_median_px,"
            "offset_robust_signed_mean_px,offset_robust_gate_px,"
-           "total_candidates,rejected_candidates,saturated_candidate_ratio,"
+           "total_candidates,path_usable_candidates,"
+           "fatal_rejected_candidates,multipath_interval_count,"
+           "multipath_ambiguous_scanlines,"
+           "multipath_branch_candidate_count,"
+           "minimum_multipath_local_margin,"
+           "maximum_multipath_separation_px,"
+           "saturated_candidate_ratio,"
            "multi_peak_scanline_ratio,selected_saturated_ratio,selected_gaps,"
            "mean_selected_quality,mean_selected_fwhm_px,mean_selected_snr,"
            "mean_selected_gradient_asymmetry,mean_selected_fit_residual,"
@@ -734,6 +983,18 @@ int main(int argc, char** argv) {
         qualityOptions.orientation = command.orientation;
         qualityOptions.roi = command.roiSet
             ? command.roi : cv::Rect(0, 0, raw.cols, raw.rows);
+        if (command.ambiguityMarginPerPoint >= 0.0) {
+            qualityOptions.pathAmbiguityMarginPerPoint =
+                command.ambiguityMarginPerPoint;
+        }
+        if (command.ambiguityMinimumSeparationPx > 0.0) {
+            qualityOptions.pathAmbiguityMinimumSeparationPx =
+                command.ambiguityMinimumSeparationPx;
+        }
+        if (command.ambiguityPaddingScanlines >= 0) {
+            qualityOptions.pathAmbiguityPaddingScanlines =
+                command.ambiguityPaddingScanlines;
+        }
         hik_stripe::Result quality;
         const bool qualityOk = hik_stripe::extractCenterline(
             response, raw, qualityOptions, &quality);
@@ -782,10 +1043,10 @@ int main(int argc, char** argv) {
                   static_cast<long double>(offsets.size()));
 
         std::array<std::size_t, kRejectDescriptors.size()> rejectCounts{};
-        std::size_t rejectedCandidates = 0;
+        std::size_t fatalRejectedCandidates = 0U;
         for (const hik_stripe::Candidate& candidate : quality.candidates) {
-            if (!candidate.accepted()) {
-                ++rejectedCandidates;
+            if (!candidate.usableForPath()) {
+                ++fatalRejectedCandidates;
             }
             for (std::size_t reasonIndex = 0;
                  reasonIndex < kRejectDescriptors.size(); ++reasonIndex) {
@@ -795,16 +1056,37 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        for (const hik_stripe::Candidate& selected : quality.selected) {
+        for (const hik_stripe::Candidate& selected :
+             quality.provisionalSelected) {
             for (std::size_t reasonIndex = 0;
                  reasonIndex < kRejectDescriptors.size(); ++reasonIndex) {
                 const hik_stripe::RejectReason flag =
                     kRejectDescriptors[reasonIndex].flag;
                 if ((flag == hik_stripe::REJECT_PATH_JUMP ||
-                     flag == hik_stripe::REJECT_PATH_AMBIGUOUS) &&
+                     flag == hik_stripe::REJECT_PATH_AMBIGUOUS ||
+                     flag ==
+                         hik_stripe::REJECT_AMBIGUOUS_MULTIPATH) &&
                     hik_stripe::hasRejectReason(selected, flag)) {
                     ++rejectCounts[reasonIndex];
                 }
+            }
+        }
+        std::size_t multipathBranchCandidateCount = 0U;
+        double minimumMultipathMargin =
+            std::numeric_limits<double>::infinity();
+        double maximumMultipathSeparation = 0.0;
+        for (const hik_stripe::MultipathInterval& interval :
+             quality.multipathIntervals) {
+            minimumMultipathMargin = std::min(
+                minimumMultipathMargin,
+                interval.minimumLocalCostMargin);
+            maximumMultipathSeparation = std::max(
+                maximumMultipathSeparation,
+                interval.maximumSeparationPx);
+            for (const hik_stripe::MultipathBranch& branch :
+                 interval.branches) {
+                multipathBranchCandidateCount +=
+                    branch.candidates.size();
             }
         }
 
@@ -815,6 +1097,15 @@ int main(int argc, char** argv) {
             command.output / "csv" / (prefix.str() + "_quality.csv");
         if (!writeCandidateCsv(
                 candidatePath, quality, oldCenters, &error)) {
+            std::cerr << "Warning: " << error << '\n';
+            ++failedCount;
+            continue;
+        }
+        const fs::path multipathPath =
+            command.output / "csv" /
+            (prefix.str() + "_multipath.csv");
+        if (!writeMultipathCsv(
+                multipathPath, quality, &error)) {
             std::cerr << "Warning: " << error << '\n';
             ++failedCount;
             continue;
@@ -849,6 +1140,8 @@ int main(int argc, char** argv) {
                 << ',' << hik_stripe::orientationName(comparisonOrientation)
                 << ',' << legacy.size()
                 << ',' << quality.selected.size()
+                << ',' << quality.provisionalSelected.size()
+                << ',' << quality.selected.size()
                 << ',' << offsets.size()
                 << ',' << finiteOrEmpty(signedMeanOffset)
                 << ',' << finiteOrEmpty(offsetStats.p50)
@@ -860,7 +1153,14 @@ int main(int argc, char** argv) {
                 << ',' << finiteOrEmpty(robustStats.robustSignedMean)
                 << ',' << finiteOrEmpty(robustStats.gate)
                 << ',' << quality.candidates.size()
-                << ',' << rejectedCandidates
+                << ',' << quality.diagnostics.pathUsableCandidateCount
+                << ',' << fatalRejectedCandidates
+                << ',' << quality.multipathIntervals.size()
+                << ',' << quality.diagnostics
+                               .multipathAmbiguousScanlineCount
+                << ',' << multipathBranchCandidateCount
+                << ',' << finiteOrEmpty(minimumMultipathMargin)
+                << ',' << maximumMultipathSeparation
                 << ',' << saturatedCandidateRatio
                 << ',' << multiPeakRatio
                 << ',' << quality.diagnostics.selectedSaturatedRatio

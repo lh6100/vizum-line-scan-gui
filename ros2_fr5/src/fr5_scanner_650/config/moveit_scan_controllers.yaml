@@ -1,0 +1,19 @@
+# MoveIt executes RViz plans through the scanner interlock relay.  The relay
+# forwards the unchanged JointTrajectory to the real ros2_control controller.
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - scanner_650_controller
+
+  scanner_650_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - j1
+      - j2
+      - j3
+      - j4
+      - j5
+      - j6

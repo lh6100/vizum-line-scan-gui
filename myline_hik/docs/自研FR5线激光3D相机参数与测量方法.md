@@ -2,7 +2,7 @@
 
 > 编写日期：2026-07-23
 >
-> 工程目录：`/home/zhulong/lh/vizum-line-scan-gui/myline_hik`
+> 工程目录：`/path/to/vizum-line-scan-gui/myline_hik`
 >
 > 代码基线：`main`，提交 `9b3ae82`，并包含当前工作区尚未提交的标定改动
 >

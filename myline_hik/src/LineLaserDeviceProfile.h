@@ -32,6 +32,9 @@ struct LineLaserDeviceProfile {
     QString synchronizationConfigRelativePath;
     QString calibrationSessionRootRelativePath;
     QString scanSessionRootRelativePath;
+    // Optional profile-specific planner configuration. An empty path means
+    // that the device does not provide adaptive scan planning.
+    QString adaptiveScanConfigRelativePath;
     LineLaserStripeOrientation stripeOrientation{
         LineLaserStripeOrientation::Auto};
     LineLaserCenterlinePolicy calibrationCenterlinePolicy{
@@ -52,6 +55,7 @@ struct LineLaserDeviceProfile {
         const QString& sourceDirectory) const;
     QString calibrationSessionRoot(const QString& sourceDirectory) const;
     QString scanSessionRoot(const QString& sourceDirectory) const;
+    QString adaptiveScanConfigPath(const QString& sourceDirectory) const;
     bool isValid(QString* error = nullptr) const;
 };
 

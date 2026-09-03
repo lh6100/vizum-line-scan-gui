@@ -1,0 +1,249 @@
+hik_single_camera:
+  ros__parameters:
+    camera_ip: "192.168.7.45"
+    expected_model: "MV-CS016-10GM"
+    expected_serial: "DA8784601"
+    frame_id: "hik_camera_optical_frame"
+    image_topic: "/scanner_650/image_raw"
+    camera_info_topic: "/scanner_650/camera_info"
+    # Injected by scanner_650_moveit.launch.py from the installed calibration.
+    intrinsics_path: ""
+    exposure_us: 1825.0
+    gain_db: 0.0
+    frames_per_second: 60.0
+    image_pool_capacity: 32
+    # MVS callback only copies into the legacy image pool and enqueues a
+    # shared buffer.  ROS message copying/DDS publication runs independently.
+    ros_publish_queue_capacity: 16
+    # Keep the service node available while leaving connection under operator control.
+    auto_connect: false
+    connection_timeout_s: 8.0
+    connection_service_name: "/scanner_650/set_camera_connected"
+    # Map the camera's GigE device ticks into CLOCK_MONOTONIC_RAW using the
+    # robust lower-envelope fit already used by the GUI continuous scanner.
+    # Image headers carry the exposure midpoint, not the SDK callback time.
+    camera_timestamp_reference: "exposure_start"
+    camera_fixed_time_offset_us: 0.0
+    camera_transport_delay_us: 0.0  # callback fallback only
+    camera_clock_mapping_window: 600
+    camera_mapping_max_residual_us: 2000.0
+    # Fail closed during the roughly first 30 frames of mapping warm-up, or if
+    # the device clock becomes unstable. Such frames must not enter the cloud.
+    require_device_timestamp_mapping: true
+
+line_laser_reconstruction:
+  ros__parameters:
+    image_topic: "/scanner_650/image_raw"
+    profile_topic: "/scanner_650/profile_cloud"
+    scan_topic: "/scanner_650/scan_cloud"
+    marker_topic: "/scanner_650/markers"
+    camera_frame: "hik_camera_optical_frame"
+    output_frame: "base_link"
+    # Injected by scanner_650_moveit.launch.py from the installed calibration.
+    intrinsics_path: ""
+    laser_plane_path: ""
+    # Camera optical-frame +Z reconstruction gate. Points outside this range
+    # are discarded before transforming into base_link.
+    camera_z_min_mm: 100.0
+    camera_z_max_mm: 1000.0
+    # Match scanner_650's proven myline_hik continuous-mapping profile.  Shadow
+    # runs the quality/multipath analyzer and can remove large stripe intervals;
+    # keep it opt-in until it has been validated on the current workpiece.
+    centerline_mode: "legacy"
+    voxel_size_m: 0.0005
+    maximum_voxels: 2000000
+    publish_every_n_profiles: 6
+    # Publishing an ever-growing cloud at camera rate overloads DDS/RViz.
+    scan_publish_period_s: 0.5
+    # Reconstruction must not run inside the DDS image callback: a bounded
+    # two-worker queue preserves the 60 FPS camera stream, as in myline_hik.
+    reconstruction_queue_capacity: 64
+    reconstruction_worker_threads: 2
+    # One accumulation interval is one scan.  Never silently merge the next
+    # motion with voxels left by an earlier scan, and drain its queued tail
+    # before reporting that accumulation has stopped.
+    clear_cloud_on_accumulation_start: true
+    accumulation_drain_timeout_s: 5.0
+    # The image header is the mapped exposure midpoint. An exact-time TF query
+    # then interpolates the 125 Hz controller joint-state transforms; it never
+    # falls back to the latest pose when an enclosing time bracket is absent.
+    tf_lookup_timeout_s: 0.10
+    maximum_image_age_s: 1.0
+    accumulate_on_start: false
+    # Injected by the launch file; this basename is safe for direct node runs.
+    output_ply: "ros2_scan_cloud.ply"
+    # The live PointCloud2 rgb field and saved PLY use the same base_link-Z
+    # Turbo values.  PLY follows the proven legacy scanner layout: binary
+    # little-endian, XYZ in millimetres, then RGB/confidence/response.
+    # Robust limits keep isolated height outliers from flattening the range.
+    height_color_lower_percentile: 1.0
+    height_color_upper_percentile: 99.0
+
+line_laser_control:
+  ros__parameters:
+    host: "192.168.1.12"
+    port: 22
+    user: "laserctl"
+    # Injected by the launch file from VIZUM_CONFIG_DIR (or XDG_CONFIG_HOME).
+    private_key_path: ""
+    known_hosts_path: ""
+    auto_connect: false
+    command_timeout_s: 3.0
+    connection_timeout_s: 8.0
+    service_name: "/scanner_650/set_laser"
+    connection_service_name: "/scanner_650/set_laser_connected"
+
+# Explicitly measured tabletop collision geometry in base_link. The supplied
+# Z is the top surface; the loader positions the box centre half a thickness
+# below it. Loading is opt-in at launch and does not by itself assert that the
+# operator has validated the complete collision scene.
+table_collision_scene:
+  ros__parameters:
+    object_id: "scanner_650_table"
+    frame_id: "base_link"
+    apply_planning_scene_service: "/apply_planning_scene"
+    surface_z_m: -0.100
+    center_x_m: 0.200
+    center_y_m: 0.200
+    size_x_m: 0.300
+    size_y_m: 0.200
+    thickness_m: 0.010
+    service_wait_timeout_s: 30.0
+
+scan_motion_commander:
+  ros__parameters:
+    planning_group: "fairino5_v6_group"
+    end_effector_link: "scanner_650_scan_tcp"
+    planning_pipeline: "pilz_industrial_motion_planner"
+    planner_id: "LIN"
+    planning_time_s: 10.0
+    accumulation_service: "/scanner_650/set_accumulation"
+    laser_service: "/scanner_650/set_laser"
+    controller_action: "/fairino5_controller/follow_joint_trajectory"
+
+workspace_coarse_scan_planner:
+  ros__parameters:
+    planning_group: "fairino5_v6_group"
+    end_effector_link: "scanner_650_scan_tcp"
+    base_frame: "base_link"
+    planning_pipeline: "pilz_industrial_motion_planner"
+    planning_time_s: 10.0
+
+    # Radial-fan mode keeps the taught camera pitch/roll, requires TCP +Z to
+    # point down, and uses horizontal TCP +X as the sector centre/forward
+    # direction. It alternates inner->outer and outer->inner LIN scans while
+    # TCP +Y continues to follow the calibrated laser line.
+    # Use "vertical_front" only for a camera looking horizontally outward.
+    scan_surface_mode: "tabletop_radial_fan"
+    azimuth_min_deg: -60.0
+    azimuth_max_deg: 60.0
+    # Use the planning-time TCP position as the fan apex. In this mode radial
+    # values are travel distances from that taught point, not base_link radii.
+    # Every line therefore measures from travel=0 to its independently
+    # discovered safe IK/collision/joint/singularity/reach boundary.
+    fan_origin_at_initial_tcp: true
+    use_current_tcp_radius_as_inner: false  # legacy base-centred fan only
+    radial_min_m: 0.0
+    # Search cap only; it is automatically shortened per direction.
+    radial_max_m: 0.72
+    # Legacy fixed-radius arc mode only.
+    radial_spacing_m: 0.125
+    # Always use at most three radial lines: minimum angle, TCP +X relative
+    # 0°, and maximum angle. The configured sector must contain 0°.
+    # Retained only for compatibility with older base-centred fan settings.
+    angular_lane_spacing_m: 0.22
+    minimum_radial_scan_length_m: 0.10
+
+    # Keep all process-TCP motion on the horizontal table plane taught by the
+    # initial TCP Z. A negative Z is valid when the tabletop is below base_link.
+    # height_* are fallback values only when use_initial_tcp_height is false.
+    use_initial_tcp_height: true
+    height_min_m: 0.475
+    height_max_m: 0.475
+    height_spacing_m: 0.225
+    lead_in_m: 0.04
+    lead_out_m: 0.04
+    nominal_laser_line_width_m: 0.45
+
+    # Used by legacy tabletop_downward/vertical_front arc modes only.
+    maximum_measurement_arc_span_deg: 45.0
+
+    # Used only by vertical_front. tabletop_downward preserves and yaw-rotates
+    # the complete operator-taught TCP orientation.
+    optical_roll_deg: 180.0
+
+    # The scanner_650 TCP is fixed in the URDF at the validated z=550 mm
+    # section of the 400..700 mm calibration range.
+    working_distance_m: 0.55
+    camera_to_tcp_tangent_m: 0.0466476147
+
+    # Conservative physical-head envelope before exact MoveIt filtering.
+    base_exclusion_radius_m: 0.35
+    maximum_arm_reach_m: 0.922
+    reach_fraction: 0.85
+    shoulder_height_m: 0.152
+
+    # Continuous chained IK/collision/Jacobian checks.
+    maximum_cartesian_sample_step_m: 0.02
+    maximum_angular_sample_step_deg: 5.0
+    minimum_joint_margin_deg: 10.0
+    minimum_normalized_singular_value: 0.05
+    jacobian_characteristic_length_m: 0.10
+    j1_absolute_limit_deg: 85.0
+    maximum_joint_step_deg: 20.0
+    elbow_joint_name: "j3"
+    preserve_elbow_sign: true
+    elbow_sign_deadband_deg: 2.0
+    ik_timeout_s: 0.02
+    maximum_lane_count: 128
+    maximum_samples_per_lane: 4096
+
+    # Commission at 10 mm/s. Increase scan_speed_m_s stepwise to at most
+    # 0.05 only after low-speed real-hardware validation.
+    scan_speed_m_s: 0.01
+    transition_speed_m_s: 0.01
+    pilz_max_translational_speed_m_s: 0.05
+    acceleration_scaling: 0.30
+
+    # At every trajectory boundary, wait for three stable joint samples.
+    # A start mismatch over 0.01 rad but no more than 0.02 rad is corrected
+    # with a laser-OFF, safety-validated Pilz PTP motion. Larger mismatches,
+    # or a correction that remains outside 0.01 rad, stop the scan.
+    joint_settle_timeout_s: 3.0
+    joint_settle_sample_period_s: 0.10
+    joint_settle_delta_rad: 0.001
+    joint_settle_required_samples: 3
+    trajectory_start_tolerance_rad: 0.01
+    trajectory_start_correction_limit_rad: 0.02
+
+    # After all scan lanes finish, compare the settled real joints and TCP
+    # with the planning-time start. If motion is needed, generate one direct
+    # laser-OFF Pilz PTP return from the real endpoint to the saved start. Both
+    # the preview path and the freshly generated runtime path must pass the
+    # continuous joint/collision/singularity checks. PTP uses independent joint
+    # scaling factors: transition_speed_m_s remains a Cartesian LIN speed and
+    # must never be reinterpreted as the return PTP joint-speed percentage.
+    return_to_start_after_scan: true
+    return_velocity_scaling: 0.10
+    return_acceleration_scaling: 0.10
+    return_joint_tolerance_rad: 0.002
+    return_position_tolerance_m: 0.001
+    return_orientation_tolerance_deg: 0.2
+
+    accumulation_service: "/scanner_650/set_accumulation"
+    laser_service: "/scanner_650/set_laser"
+    controller_action: "/fairino5_controller/follow_joint_trajectory"
+    # Injected by the launch file from VIZUM_DATA_DIR (or XDG_DATA_HOME).
+    checkpoint_path: "workspace_coarse_checkpoint.yaml"
+
+    # Fail closed: execution also needs allow_execution=true at launch. Set
+    # collision_scene_validated only after loading and checking the robot,
+    # scanner, cable, fixture, workpiece and safety-zone collision scene.
+    collision_scene_validated: false
+    require_environment_collision_objects: true
+
+    # A quality/coverage module or operator can update this base_link AABB,
+    # then call /scanner_650/plan_workspace_local_rescan.
+    local_rescan_roi_min: [-0.10, -0.10, 0.20]
+    local_rescan_roi_max: [0.10, 0.10, 0.40]
+    local_rescan_roi_padding_m: 0.225

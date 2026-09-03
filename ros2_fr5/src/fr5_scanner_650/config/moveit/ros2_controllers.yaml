@@ -1,0 +1,27 @@
+controller_manager:
+  ros__parameters:
+    # Match the Fairino ServoJ period (8 ms).
+    update_rate: 125
+    fairino5_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+fairino5_controller:
+  ros__parameters:
+    joints: [j1, j2, j3, j4, j5, j6]
+    command_interfaces: [position]
+    state_interfaces: [position]
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    open_loop_control: false
+    constraints:
+      stopped_velocity_tolerance: 0.02
+      goal_time: 1.0
+      j1: {trajectory: 0.10, goal: 0.03}
+      j2: {trajectory: 0.10, goal: 0.03}
+      j3: {trajectory: 0.10, goal: 0.03}
+      j4: {trajectory: 0.12, goal: 0.04}
+      j5: {trajectory: 0.12, goal: 0.04}
+      j6: {trajectory: 0.12, goal: 0.04}

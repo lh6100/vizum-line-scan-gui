@@ -29,11 +29,19 @@ int main(int argc, char* argv[]) {
     const QCommandLineOption smokeTestOption(
         QStringLiteral("smoke-test"),
         QStringLiteral("创建界面后立即退出；不连接任何硬件。"));
+    const QCommandLineOption useDeviceCalibrationAsIsOption(
+        QStringLiteral("use-device-calibration-as-is"),
+        QStringLiteral(
+            "原样使用 profile 设备目录中的手眼数值；仅允许手眼声明的内参哈希"
+            "不一致，其他标定、身份和坐标系检查不放宽。"));
     parser.addOption(scanSpeedOption);
     parser.addOption(profileOption);
     parser.addOption(smokeTestOption);
+    parser.addOption(useDeviceCalibrationAsIsOption);
     parser.process(application);
     const bool smokeTest = parser.isSet(smokeTestOption);
+    const bool useDeviceCalibrationAsIs =
+        parser.isSet(useDeviceCalibrationAsIsOption);
 
     double scanSpeedOverride = -1.0;
     if (parser.isSet(scanSpeedOption)) {
@@ -72,7 +80,7 @@ int main(int argc, char* argv[]) {
         LineLaserController laserController;
         HikConstantLaserScanWindow window(
             *profile, &laserController, &robotSession,
-            nullptr, scanSpeedOverride);
+            nullptr, scanSpeedOverride, useDeviceCalibrationAsIs);
         QObject::connect(&application, &QCoreApplication::aboutToQuit,
                          &laserController, &LineLaserController::off);
         window.show();
@@ -102,7 +110,7 @@ int main(int argc, char* argv[]) {
         }
         auto* window = new HikConstantLaserScanWindow(
             profile, &laserController, &robotSession,
-            &tabs, scanSpeedOverride);
+            &tabs, scanSpeedOverride, useDeviceCalibrationAsIs);
         const int tabIndex = tabs.addTab(window, profile.displayName);
         tabs.setTabToolTip(tabIndex,
             QStringLiteral("profile=%1｜%2 nm｜TTL Pin %3")

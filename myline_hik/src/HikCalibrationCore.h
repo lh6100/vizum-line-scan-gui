@@ -374,6 +374,8 @@ struct IntrinsicsYamlMetadata {
     std::string pixelFormat;
     std::string printedPatternSha256;
     std::string generatedAt;
+    double validCameraZMinMm;
+    double validCameraZMaxMm;
 
     IntrinsicsYamlMetadata();
 };
@@ -388,6 +390,11 @@ struct LaserPlaneYamlMetadata {
     std::string generatedAt;
     double validCameraZMinMm;
     double validCameraZMaxMm;
+    std::string validationMethod;
+    int validationPoseCount;
+    int validationPointCount;
+    double validationRmsMm;
+    double validationP95Mm;
 
     LaserPlaneYamlMetadata();
 };
@@ -429,8 +436,28 @@ struct StaticProfilePoint {
     StaticProfilePoint();
 };
 
+// One complete 3-D interpretation of an AMBIGUOUS_MULTIPATH interval.  Branch
+// identifiers are only unique inside intervalId; callers must preserve both
+// identifiers until temporal base_link validation has finished.
+struct StaticProfileAmbiguousBranch {
+    int intervalId;
+    int branchId;
+    int firstScanIndex;
+    int lastScanIndex;
+    std::vector<StripePoint> stripe;
+    std::vector<StaticProfilePoint> points;
+
+    StaticProfileAmbiguousBranch();
+};
+
 struct StaticProfileResult {
     bool ok;
+    // True only when the formal stripe/point output meets the configured
+    // per-profile publication count gate. A profile may still be ok with
+    // multipathAuditOnly=true so its withheld branches can reach base_link
+    // rejected/V validation without publishing a sparse formal fragment.
+    bool formalPublicationPassed;
+    bool multipathAuditOnly;
     std::string error;
     std::string sampleId;
     cv::Mat differenceImage;
@@ -439,8 +466,27 @@ struct StaticProfileResult {
     std::vector<StripePoint> stripe;
     std::vector<StaticProfilePoint> legacyPoints;
     std::vector<StaticProfilePoint> qualityPoints;
+    // Hard-rejected quality candidates that can still be triangulated are
+    // retained as spatial evidence for the adaptive quality map. They never
+    // enter the formal or quality-accepted clouds.
+    std::vector<StripePoint> qualityRejectedCandidateStripe;
+    std::vector<StaticProfilePoint> qualityRejectedCandidatePoints;
     std::vector<StaticProfilePoint> points;
+    // Shadow mode keeps legacyStripe/legacyPoints as the untouched calibrated
+    // baseline, but removes these interval-protected observations from the
+    // formal stripe/points output.
+    std::vector<StripePoint> ambiguityMaskedLegacyStripe;
+    std::vector<StaticProfilePoint> ambiguityMaskedLegacyPoints;
+    // If the complete profile fails the configured formal publication count
+    // gate, these are the otherwise selected policy points withheld together
+    // with it. They are diagnostic/rejected evidence only.
+    std::vector<StaticProfilePoint> publicationGateRejectedPoints;
+    // Withheld alternatives are diagnostics only until the temporal V-groove
+    // validator proves exactly one branch. They must never be flattened into
+    // qualityPoints because that would lose their mutual exclusivity.
+    std::vector<StaticProfileAmbiguousBranch> qualityAmbiguousBranches;
     bool legacyExtractionPassed;
+    bool qualityAnalysisCompleted;
     bool qualityExtractionPassed;
     std::string legacyExtractionError;
     std::string qualityExtractionError;

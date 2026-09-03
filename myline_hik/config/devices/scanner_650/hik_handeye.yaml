@@ -1,0 +1,118 @@
+schema_version: 1
+calibration_type: eye_in_hand
+mode: camera_to_flange
+transform_convention: "T_parent_child maps child coordinates into parent coordinates"
+parent_frame: "fairino_flange_reported"
+child_frame: "hik_camera_optical_frame"
+base_frame: "base_link"
+translation_unit: mm
+rotation_unit: dimensionless
+T_flange_camera: [-0.999980479255, -0.00369703454749, -0.00503716630829, -60.8482323161, 0.000692066906456, -0.866741727474, 0.498756753236, -0.382077753729, -0.00620984317513, 0.498743531076, 0.866727366625, 142.143365159, 0, 0, 0, 1]
+solver:
+  selected_opencv_method: "PARK"
+  input_samples: 21
+  accepted_samples: 20
+  rejected_samples: 1
+  translation_span_mm: 418.563113332
+  rotation_span_deg: 67.3819236586
+  secondary_rotation_spread_deg: 8.3463476928
+quality:
+  base_board_translation_rms_mm: 0.887907210568
+  base_board_translation_p95_mm: 1.28219514804
+  base_board_translation_max_mm: 1.68323624821
+  base_board_rotation_rms_deg: 0.158480437895
+  base_board_rotation_p95_deg: 0.254948806356
+  base_board_rotation_max_deg: 0.260797658714
+camera:
+  model: "MV-CS016-10GM"
+  serial: "DA8784601"
+sources:
+  intrinsics_file: "config/devices/scanner_650/hik_intrinsics.yaml"
+  intrinsics_sha256: "7a73017a375be0d6b859d7c03664322e8434a2f332da4a13715b9b3bc373c199"
+  dataset_manifest: "data/calibration/scanner_650/session_20260804_134420_924/handeye/handeye_manifest.csv"
+  dataset_manifest_sha256: "7040fa60607ee762d3cfa32a51b38c4dbcd8915c86be45910609c2c38caa8578"
+generated_at: "2026-08-04T06:40:05.881Z"
+samples:
+  - id: "handeye_20260804_143450_381"
+    accepted: false
+    reason: "robust base-board consistency outlier"
+  - id: "handeye_20260804_143502_227"
+    accepted: true
+    base_board_translation_residual_mm: 0.553184294085
+    base_board_rotation_residual_deg: 0.254640972022
+  - id: "handeye_20260804_143512_520"
+    accepted: true
+    base_board_translation_residual_mm: 1.68323624821
+    base_board_rotation_residual_deg: 0.171843743132
+  - id: "handeye_20260804_143519_558"
+    accepted: true
+    base_board_translation_residual_mm: 1.01397712024
+    base_board_rotation_residual_deg: 0.195027853964
+  - id: "handeye_20260804_143531_044"
+    accepted: true
+    base_board_translation_residual_mm: 0.411804900726
+    base_board_rotation_residual_deg: 0.120284527177
+  - id: "handeye_20260804_143544_146"
+    accepted: true
+    base_board_translation_residual_mm: 1.26108772172
+    base_board_rotation_residual_deg: 0.107601250325
+  - id: "handeye_20260804_143608_944"
+    accepted: true
+    base_board_translation_residual_mm: 0.542802366598
+    base_board_rotation_residual_deg: 0.158301864028
+  - id: "handeye_20260804_143617_533"
+    accepted: true
+    base_board_translation_residual_mm: 0.662407078442
+    base_board_rotation_residual_deg: 0.187534361117
+  - id: "handeye_20260804_143624_799"
+    accepted: true
+    base_board_translation_residual_mm: 0.934714844679
+    base_board_rotation_residual_deg: 0.181056976639
+  - id: "handeye_20260804_143641_697"
+    accepted: true
+    base_board_translation_residual_mm: 0.901506438036
+    base_board_rotation_residual_deg: 0.103279889763
+  - id: "handeye_20260804_143647_113"
+    accepted: true
+    base_board_translation_residual_mm: 1.20239789191
+    base_board_rotation_residual_deg: 0.090421991334
+  - id: "handeye_20260804_143659_939"
+    accepted: true
+    base_board_translation_residual_mm: 0.446000373378
+    base_board_rotation_residual_deg: 0.108862481419
+  - id: "handeye_20260804_143705_121"
+    accepted: true
+    base_board_translation_residual_mm: 0.547511344198
+    base_board_rotation_residual_deg: 0.20350777678
+  - id: "handeye_20260804_143711_450"
+    accepted: true
+    base_board_translation_residual_mm: 0.644772630221
+    base_board_rotation_residual_deg: 0.22213694469
+  - id: "handeye_20260804_143732_626"
+    accepted: true
+    base_board_translation_residual_mm: 0.864260235686
+    base_board_rotation_residual_deg: 0.135562702653
+  - id: "handeye_20260804_143844_534"
+    accepted: true
+    base_board_translation_residual_mm: 0.726605062115
+    base_board_rotation_residual_deg: 0.135568748135
+  - id: "handeye_20260804_143911_391"
+    accepted: true
+    base_board_translation_residual_mm: 0.849472479836
+    base_board_rotation_residual_deg: 0.0629234581827
+  - id: "handeye_20260804_143920_082"
+    accepted: true
+    base_board_translation_residual_mm: 0.706661793852
+    base_board_rotation_residual_deg: 0.0409950892853
+  - id: "handeye_20260804_143928_128"
+    accepted: true
+    base_board_translation_residual_mm: 0.906447267152
+    base_board_rotation_residual_deg: 0.128176702013
+  - id: "handeye_20260804_143944_945"
+    accepted: true
+    base_board_translation_residual_mm: 0.963835034717
+    base_board_rotation_residual_deg: 0.260797658714
+  - id: "handeye_20260804_143954_804"
+    accepted: true
+    base_board_translation_residual_mm: 0.902059686744
+    base_board_rotation_residual_deg: 0.050608847119

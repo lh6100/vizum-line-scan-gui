@@ -1,0 +1,53 @@
+schema_version: 1
+calibration_type: "camera_intrinsics"
+image_width: 1224
+image_height: 1024
+camera_name: "scanner_450"
+
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [1884.7761492467585, 0, 620.53808204264374, 0, 1885.0298203397228, 518.12837199508192, 0, 0, 1]
+
+distortion_model: "plumb_bob"
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.38757713007982086, 0.28662406106012228, -0.00091369277528871779, 0.0013837359948469725, -0.027290159345511749]
+
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [1884.7761492467585, 0, 620.53808204264374, 0, 0, 1885.0298203397228, 518.12837199508192, 0, 0, 0, 1, 0]
+
+metadata:
+  camera_model: "MV-CS013-60GN"
+  camera_serial: "DB0403208"
+  frame_id: "hik_450_camera_optical_frame"
+  pixel_format: "Mono8"
+  opencv_version: "4.5.4"
+  board:
+    type: "charuco"
+    squares_x: 11
+    squares_y: 8
+    square_length_mm: 24
+    marker_length_mm: 18
+    dictionary: "DICT_4X4_50"
+    board_width_mm: 264
+    board_height_mm: 192
+    opencv_pattern: "legacy_pre_4_6"
+    printed_pattern_sha256: ""
+  result:
+    input_views: 53
+    accepted_views: 50
+    rejected_views: 3
+    reprojection_rms_px: 0.16516810498166701
+  validity:
+    camera_z_min_mm: 400
+    camera_z_max_mm: 700
+  generated_at: "2026-08-04T05:59:29.489Z"

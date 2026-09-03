@@ -1,0 +1,22 @@
+schema_version: 1
+calibration_type: stereo_rig
+transform_convention: "X_right = R_right_left * X_left + T_right_left_mm"
+translation_unit: mm
+left_camera_serial: "DA8784601"
+right_camera_serial: "DB0403208"
+left_frame: "hik_camera_optical_frame"
+right_frame: "hik_450_camera_optical_frame"
+R_right_left: [0.999848593868264, 0.00503412568545524, 0.0166567379230707, -0.00483471084064615, 0.999916420738868, -0.0119907092308687, -0.0167157085025481, 0.0119083632525608, 0.999789365803569]
+T_right_left_mm: [123.628738819593, -1.37901030708233, 20.3044692303949]
+baseline_mm: 125.292610325902
+relative_rotation_deg: 1.20951938586023
+quality:
+  input_pairs: 15
+  accepted_pairs: 15
+  rejected_pairs: 0
+  stereo_rms_px: 0.268774621442483
+  epipolar_rms_px: 0.42230223107612
+sources:
+  left_intrinsics: "config/devices/scanner_650/hik_intrinsics.yaml"
+  right_intrinsics: "config/devices/scanner_450/hik_intrinsics.yaml"
+generated_at: "2026-08-13T08:31:13.342Z"

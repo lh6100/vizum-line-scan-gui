@@ -1,0 +1,96 @@
+diff --git a/fairino_hardware_v3_9_4/include/fairino_hardware/fairino_hardware_interface.hpp b/fairino_hardware_v3_9_4/include/fairino_hardware/fairino_hardware_interface.hpp
+index cd06d65..7b26859 100644
+--- a/fairino_hardware_v3_9_4/include/fairino_hardware/fairino_hardware_interface.hpp
++++ b/fairino_hardware_v3_9_4/include/fairino_hardware/fairino_hardware_interface.hpp
+@@ -63,0 +64 @@ private:
++  double _servo_period_s = 0.008;
+diff --git a/fairino_hardware_v3_9_4/src/fairino_hardware_interface.cpp b/fairino_hardware_v3_9_4/src/fairino_hardware_interface.cpp
+index ca2d84f..39f82c9 100644
+--- a/fairino_hardware_v3_9_4/src/fairino_hardware_interface.cpp
++++ b/fairino_hardware_v3_9_4/src/fairino_hardware_interface.cpp
+@@ -2,0 +3,4 @@
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++
+@@ -63,0 +68,23 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_init(const hardw
++    const auto ip_it = info_.hardware_parameters.find("robot_ip");
++    if (ip_it != info_.hardware_parameters.end() && !ip_it->second.empty()) {
++        _controller_ip = ip_it->second;
++    }
++    const auto period_it = info_.hardware_parameters.find("servo_period_s");
++    if (period_it != info_.hardware_parameters.end()) {
++        try {
++            _servo_period_s = std::stod(period_it->second);
++        } catch (const std::exception&) {
++            RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
++                         "servo_period_s is not a number: '%s'", period_it->second.c_str());
++            return hardware_interface::CallbackReturn::ERROR;
++        }
++    }
++    if (!std::isfinite(_servo_period_s) || _servo_period_s < 0.004 ||
++        _servo_period_s > 0.020) {
++        RCLCPP_FATAL(rclcpp::get_logger("FairinoHardwareInterface"),
++                     "servo_period_s %.6f is outside [0.004, 0.020]", _servo_period_s);
++        return hardware_interface::CallbackReturn::ERROR;
++    }
++    RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"),
++                "Configured Fairino controller ip=%s, ServoJ period=%.6f s",
++                _controller_ip.c_str(), _servo_period_s);
+@@ -106,0 +134 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
++    (void)previous_state;
+@@ -137,0 +166,8 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_activate(const r
++            _jnt_position_state[j] = _jnt_position_command[j];
++        }
++        returncode = _ptr_robot->ServoMoveStart();
++        if (returncode != 0) {
++            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
++                         "ServoMoveStart failed, error=%d", returncode);
++            _ptr_robot->CloseRPC();
++            return hardware_interface::CallbackReturn::ERROR;
+@@ -152,0 +189 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const
++    (void)previous_state;
+@@ -154,3 +191,8 @@ hardware_interface::CallbackReturn FairinoHardwareInterface::on_deactivate(const
+-    _ptr_robot->StopMotion();//停止机器人
+-    _ptr_robot->CloseRPC();//销毁实例，连接断开
+-    _ptr_robot.release();
++    if (_ptr_robot) {
++        _ptr_robot->StopMotion();//停止机器人
++        _ptr_robot->ServoMoveEnd();//退出 ServoJ 流式运动
++        _ptr_robot->CloseRPC();//连接断开
++        // Fairino 3.9.4 owns detached SDK threads. Keep the object alive until
++        // process teardown after CloseRPC instead of racing its destructor.
++        (void)_ptr_robot.release();
++    }
+@@ -164,0 +207,5 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
++    (void)time;
++    (void)period;
++    if (!_ptr_robot) {
++        return hardware_interface::return_type::ERROR;
++    }
+@@ -173 +220,3 @@ hardware_interface::return_type FairinoHardwareInterface::read(const rclcpp::Tim
+-        hardware_interface::return_type::ERROR;
++        RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
++                     "GetActualJointPosDegree failed, error=%d", returncode);
++        return hardware_interface::return_type::ERROR;
+@@ -183,0 +233,5 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
++    (void)time;
++    (void)period;
++    if (!_ptr_robot) {
++        return hardware_interface::return_type::ERROR;
++    }
+@@ -185 +239 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
+-        if (std::any_of(&_jnt_position_command[0], &_jnt_position_command[5],\
++        if (std::any_of(&_jnt_position_command[0], &_jnt_position_command[6],\
+@@ -196 +250,2 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
+-        int returncode = _ptr_robot->ServoJ(&cmd,&extcmd,0,0,0.008,0,0);
++        int returncode = _ptr_robot->ServoJ(
++            &cmd, &extcmd, 0, 0, static_cast<float>(_servo_period_s), 0, 0);
+@@ -198 +253,3 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
+-            RCLCPP_INFO(rclcpp::get_logger("FairinoHardwareInterface"), "ServoJ指令下发错误,错误码:%d",returncode);
++            RCLCPP_ERROR(rclcpp::get_logger("FairinoHardwareInterface"),
++                         "ServoJ指令下发错误,错误码:%d",returncode);
++            return hardware_interface::return_type::ERROR;
+@@ -201 +258 @@ hardware_interface::return_type FairinoHardwareInterface::write(const rclcpp::Ti
+-        if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[5],\
++        if (std::any_of(&_jnt_torque_command[0], &_jnt_torque_command[6],\

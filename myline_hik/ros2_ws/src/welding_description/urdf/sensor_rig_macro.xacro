@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Nominal mechanical geometry. Replace xyz/rpy arguments with measured CAD
+       values before collision approval; optical calibration remains versioned
+       separately and may never be copied from these nominal values. -->
+  <xacro:macro name="welding_sensor_rig" params="
+      parent
+      camera_650_xyz:='0.065 0.055 0.080' camera_650_rpy:='0 0 0'
+      camera_450_xyz:='0.065 -0.055 0.080' camera_450_rpy:='0 0 0'
+      torch_xyz:='0 0 0.115' torch_rpy:='0 0 0'">
+
+    <link name="welding_tool_carrier">
+      <visual><geometry><box size="0.16 0.16 0.05"/></geometry><material name="carrier_gray"><color rgba="0.25 0.25 0.28 1"/></material></visual>
+      <collision><geometry><box size="0.18 0.18 0.065"/></geometry></collision>
+      <inertial><mass value="2.0"/><origin xyz="0 0 0"/><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+    </link>
+    <joint name="welding_tool_carrier_joint" type="fixed">
+      <parent link="${parent}"/><child link="welding_tool_carrier"/><origin xyz="0 0 0.045" rpy="0 0 0"/>
+    </joint>
+
+    <xacro:macro name="camera_body" params="name xyz rpy color">
+      <link name="${name}_body">
+        <visual><geometry><box size="0.052 0.052 0.072"/></geometry><material name="${name}_color"><color rgba="${color}"/></material></visual>
+        <collision><geometry><box size="0.062 0.062 0.082"/></geometry></collision>
+        <inertial><mass value="0.45"/><origin xyz="0 0 0"/><inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0004"/></inertial>
+      </link>
+      <joint name="${name}_mount_joint" type="fixed">
+        <parent link="${parent}"/><child link="${name}_body"/><origin xyz="${xyz}" rpy="${rpy}"/>
+      </joint>
+      <link name="${name}_nominal_optical_frame"/>
+      <joint name="${name}_optical_joint" type="fixed">
+        <parent link="${name}_body"/><child link="${name}_nominal_optical_frame"/>
+        <origin xyz="0 0 0.036" rpy="-1.57079632679 0 -1.57079632679"/>
+      </joint>
+    </xacro:macro>
+    <xacro:camera_body name="camera_650" xyz="${camera_650_xyz}" rpy="${camera_650_rpy}" color="0.1 0.3 0.8 1"/>
+    <xacro:camera_body name="camera_450" xyz="${camera_450_xyz}" rpy="${camera_450_rpy}" color="0.1 0.7 0.8 1"/>
+
+    <link name="welding_torch">
+      <visual><origin xyz="0 0 0.08"/><geometry><cylinder radius="0.018" length="0.16"/></geometry><material name="torch_bronze"><color rgba="0.55 0.3 0.1 1"/></material></visual>
+      <collision><origin xyz="0 0 0.08"/><geometry><cylinder radius="0.028" length="0.18"/></geometry></collision>
+      <inertial><mass value="1.0"/><origin xyz="0 0 0.08"/><inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.0003"/></inertial>
+    </link>
+    <joint name="welding_torch_joint" type="fixed">
+      <parent link="${parent}"/><child link="welding_torch"/><origin xyz="${torch_xyz}" rpy="${torch_rpy}"/>
+    </joint>
+    <link name="torch_tcp"/>
+    <joint name="torch_tcp_joint" type="fixed">
+      <parent link="welding_torch"/><child link="torch_tcp"/><origin xyz="0 0 0.17" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+</robot>

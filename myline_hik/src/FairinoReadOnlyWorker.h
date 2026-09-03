@@ -2,6 +2,7 @@
 #define MYLINE_HIK_FAIRINO_READ_ONLY_WORKER_H
 
 #include "HikSynchronizationCore.h"
+#include "Fr5PathEvaluator.h"
 
 #include <QObject>
 #include <QString>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 Q_DECLARE_METATYPE(hik_sync::RobotSample)
 
@@ -48,7 +50,15 @@ public slots:
                             double speedMmS,
                             double accelerationMmS2,
                             int timeoutMs);
+    void executeAdaptiveTrajectory(
+        int requestId,
+        std::vector<hik_adaptive::ScanSegment> segments,
+        int timeoutMs);
     void stopMotion(int requestId);
+    void evaluateKinematicPaths(
+        int requestId,
+        std::vector<hik_fr5::PathEvaluationRequest> requests,
+        hik_fr5::PathEvaluationOptions options);
 
 signals:
     void connectionChanged(bool connected, QString description);
@@ -70,6 +80,17 @@ signals:
                         bool targetReached,
                         bool motionStoppedConfirmed,
                         QString description);
+    void motionTimingMeasured(int requestId,
+                              qint64 elapsedMs,
+                              bool targetReached);
+    void kinematicPathEvaluated(
+        int requestId,
+        int actionId,
+        hik_adaptive::RobotPathEvaluation evaluation);
+    void kinematicPathBatchFinished(
+        int requestId,
+        bool completed,
+        QString description);
 
 private slots:
     void pollMotionDone();

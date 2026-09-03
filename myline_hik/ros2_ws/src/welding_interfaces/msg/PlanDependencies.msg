@@ -1,0 +1,10 @@
+string calibration_package_id
+string calibration_package_sha256
+string planning_scene_id
+uint64 planning_scene_version
+string planning_scene_sha256
+string robot_model_sha256
+string srdf_sha256
+string tool_model_sha256
+string workpiece_frame_version
+string planner_config_sha256

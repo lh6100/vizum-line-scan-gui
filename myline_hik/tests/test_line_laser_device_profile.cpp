@@ -53,10 +53,10 @@ int main() {
     check(scanner650->displayName.contains(QStringLiteral("160万相机")) &&
               scanner650->displayName.contains(QStringLiteral("6 mm")),
           "scanner_650 optical hardware label is wrong");
-    check(scanner450->defaultCameraIp.isEmpty() &&
-              scanner450->expectedCameraModel.isEmpty() &&
-              scanner450->expectedCameraSerial.isEmpty(),
-          "scanner_450 unknown camera identity must remain user-configurable");
+    check(scanner450->defaultCameraIp == QStringLiteral("192.168.1.46") &&
+              scanner450->expectedCameraModel == QStringLiteral("MV-CS013-60GN") &&
+              scanner450->expectedCameraSerial == QStringLiteral("DB0403208"),
+          "scanner_450 calibrated camera identity changed");
     check(scanner650->defaultCameraIp == QStringLiteral("192.168.7.45") &&
               scanner650->expectedCameraModel == QStringLiteral("MV-CS016-10GM") &&
               scanner650->expectedCameraSerial == QStringLiteral("DA8784601"),
@@ -71,8 +71,8 @@ int main() {
                   LineLaserCenterlinePolicy::Quality &&
               scanner450->scanCenterlinePolicy ==
                   LineLaserCenterlinePolicy::Quality,
-          "uncalibrated scanner_450 must use the quality extractor while "
-          "keeping orientation auto until calibration confirms it");
+          "scanner_450 formal calibration and scan chain must keep the "
+          "calibrated quality/auto centerline definition");
     check(scanner650->stripeOrientation ==
               LineLaserStripeOrientation::Horizontal &&
               scanner650->calibrationCenterlinePolicy ==
@@ -89,16 +89,19 @@ int main() {
         QStringLiteral("/tmp/myline_hik_profile_test_root"));
     check(scanner650->intrinsicsConfigPath(sourceRoot) ==
               QDir(sourceRoot).absoluteFilePath(
-                  QStringLiteral("config/hik_intrinsics.yaml")),
-          "scanner_650 must continue using the calibrated intrinsic path");
+                  QStringLiteral(
+                      "config/devices/scanner_650/hik_intrinsics.yaml")),
+          "scanner_650 must use its device-scoped intrinsic path");
     check(scanner650->laserPlaneConfigPath(sourceRoot) ==
               QDir(sourceRoot).absoluteFilePath(
-                  QStringLiteral("config/hik_laser_plane.yaml")),
-          "scanner_650 must continue using the calibrated laser-plane path");
+                  QStringLiteral(
+                      "config/devices/scanner_650/hik_laser_plane.yaml")),
+          "scanner_650 must use its device-scoped laser-plane path");
     check(scanner650->handEyeConfigPath(sourceRoot) ==
               QDir(sourceRoot).absoluteFilePath(
-                  QStringLiteral("config/hik_handeye.yaml")),
-          "scanner_650 must continue using the calibrated hand-eye path");
+                  QStringLiteral(
+                      "config/devices/scanner_650/hik_handeye.yaml")),
+          "scanner_650 must use its device-scoped hand-eye path");
     check(scanner450->intrinsicsConfigPath(sourceRoot).contains(
               QStringLiteral("/config/devices/scanner_450/")),
           "scanner_450 intrinsics must stay inside its own config directory");
@@ -113,7 +116,7 @@ int main() {
                   "/config/devices/scanner_450/synchronization.yaml")) &&
               scanner650->synchronizationConfigPath(sourceRoot).endsWith(
                   QStringLiteral(
-                      "/config/synchronization.yaml")) &&
+                      "/config/devices/scanner_650/synchronization.yaml")) &&
               scanner450->synchronizationConfigPath(sourceRoot) !=
                   scanner650->synchronizationConfigPath(sourceRoot),
           "synchronization settings must be profile-scoped");
@@ -141,6 +144,11 @@ int main() {
               scanner450->scanSessionRoot(sourceRoot) !=
                   scanner650->scanSessionRoot(sourceRoot),
           "scan session roots must be profile-scoped");
+    check(scanner450->adaptiveScanConfigPath(sourceRoot).isEmpty() &&
+              scanner650->adaptiveScanConfigPath(sourceRoot).endsWith(
+                  QStringLiteral(
+                      "/config/devices/scanner_650/adaptive_scan_650.yaml")),
+          "adaptive scan settings must be declared by the device profile");
 
     if (failures != 0) {
         std::cerr << "LineLaserDeviceProfile tests failed: "

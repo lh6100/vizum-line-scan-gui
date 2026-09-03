@@ -1,0 +1,22 @@
+uint8 IDLE=0
+uint8 CHECKING=1
+uint8 PLANNING=2
+uint8 REVIEW_REQUIRED=3
+uint8 APPROVED=4
+uint8 EXECUTING=5
+uint8 PAUSED=6
+uint8 COMPLETE=7
+uint8 ABORTED=8
+uint8 FAULT=9
+uint8 STALE=10
+
+std_msgs/Header header
+string session_id
+string task_id
+string workflow
+uint8 state
+float32 progress
+string detail
+bool motion_lease_active
+bool laser_active
+bool dependencies_valid

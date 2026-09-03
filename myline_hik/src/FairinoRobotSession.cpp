@@ -9,6 +9,8 @@
 FairinoRobotSession::FairinoRobotSession(QObject* parent)
     : QObject(parent) {
     qRegisterMetaType<hik_sync::RobotSample>("hik_sync::RobotSample");
+    qRegisterMetaType<hik_adaptive::RobotPathEvaluation>(
+        "hik_adaptive::RobotPathEvaluation");
 
     worker_ = new FairinoReadOnlyWorker;
     worker_->moveToThread(&workerThread_);
@@ -35,6 +37,15 @@ FairinoRobotSession::FairinoRobotSession(QObject* parent)
             Qt::QueuedConnection);
     connect(worker_, &FairinoReadOnlyWorker::motionFinished,
             this, &FairinoRobotSession::motionFinished,
+            Qt::QueuedConnection);
+    connect(worker_, &FairinoReadOnlyWorker::motionTimingMeasured,
+            this, &FairinoRobotSession::motionTimingMeasured,
+            Qt::QueuedConnection);
+    connect(worker_, &FairinoReadOnlyWorker::kinematicPathEvaluated,
+            this, &FairinoRobotSession::kinematicPathEvaluated,
+            Qt::QueuedConnection);
+    connect(worker_, &FairinoReadOnlyWorker::kinematicPathBatchFinished,
+            this, &FairinoRobotSession::kinematicPathBatchFinished,
             Qt::QueuedConnection);
     connect(worker_, &FairinoReadOnlyWorker::log,
             this, &FairinoRobotSession::log,
@@ -354,6 +365,41 @@ void FairinoRobotSession::moveLinearPhysical(
     }
 }
 
+void FairinoRobotSession::executeAdaptiveTrajectory(
+        int requestId,
+        std::vector<hik_adaptive::ScanSegment> segments,
+        int timeoutMs) {
+    const QString operation =
+        QStringLiteral("预提交 LINE/ARC 自适应轨迹");
+    int ownerAtQueue = 0;
+    quint64 epochAtQueue = 0;
+    if (!prepareRequest(requestId, operation, true,
+                        &ownerAtQueue, &epochAtQueue)) {
+        return;
+    }
+    FairinoReadOnlyWorker* const worker = worker_;
+    if (!QMetaObject::invokeMethod(
+            worker,
+            [this, worker, requestId, operation,
+             ownerAtQueue, epochAtQueue,
+             segments = std::move(segments), timeoutMs]() mutable {
+                const std::lock_guard<std::mutex> admissionLock(
+                    commandAdmissionMutex_);
+                if (!queuedRequestStillValid(
+                        ownerAtQueue, epochAtQueue)) {
+                    rejectStaleQueuedRequest(requestId, operation);
+                    return;
+                }
+                worker->executeAdaptiveTrajectory(
+                    requestId, std::move(segments), timeoutMs);
+            },
+            Qt::QueuedConnection)) {
+        emit error(requestId,
+                   QStringLiteral("%1 无法进入共享 FR5 队列。")
+                       .arg(operation));
+    }
+}
+
 void FairinoRobotSession::stopMotion(int requestId) {
     const QString operation = QStringLiteral("StopMotion");
     int ownerAtQueue = 0;
@@ -375,6 +421,41 @@ void FairinoRobotSession::stopMotion(int requestId) {
                     return;
                 }
                 worker->stopMotion(requestId);
+            },
+            Qt::QueuedConnection)) {
+        emit error(requestId,
+                   QStringLiteral("%1 无法进入共享 FR5 队列。")
+                       .arg(operation));
+    }
+}
+
+void FairinoRobotSession::evaluateKinematicPaths(
+        int requestId,
+        std::vector<hik_fr5::PathEvaluationRequest> requests,
+        hik_fr5::PathEvaluationOptions options) {
+    const QString operation =
+        QStringLiteral("候选路径 IK/奇异性评估");
+    int ownerAtQueue = 0;
+    quint64 epochAtQueue = 0;
+    if (!prepareRequest(requestId, operation, true,
+                        &ownerAtQueue, &epochAtQueue)) {
+        return;
+    }
+    FairinoReadOnlyWorker* const worker = worker_;
+    if (!QMetaObject::invokeMethod(
+            worker,
+            [this, worker, requestId, operation,
+             ownerAtQueue, epochAtQueue,
+             requests = std::move(requests), options]() mutable {
+                const std::lock_guard<std::mutex> admissionLock(
+                    commandAdmissionMutex_);
+                if (!queuedRequestStillValid(
+                        ownerAtQueue, epochAtQueue)) {
+                    rejectStaleQueuedRequest(requestId, operation);
+                    return;
+                }
+                worker->evaluateKinematicPaths(
+                    requestId, std::move(requests), options);
             },
             Qt::QueuedConnection)) {
         emit error(requestId,

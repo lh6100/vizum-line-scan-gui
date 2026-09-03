@@ -1037,6 +1037,10 @@ struct SynchronizationSession::Impl {
     mutable std::mutex stateMutex;
     mutable std::mutex statisticsMutex;
     mutable std::mutex callbackMutex;
+    mutable std::mutex measurementGateMutex;
+    bool measurementGateConfigured{false};
+    bool measurementGateEnabled{true};
+    std::vector<MeasurementSegmentGate> measurementGates;
     PipelineStatistics stats;
     std::function<void(const SynchronizedFrame&)> synchronizedCallback;
     int64_t firstCameraNs{0};
@@ -1089,6 +1093,59 @@ struct SynchronizationSession::Impl {
         std::lock_guard<std::mutex> lock(statisticsMutex);
         ++stats.writerQueueOverflows;
         return false;
+    }
+
+    bool applyMeasurementGate(SynchronizedFrame* output) const {
+        if (!output) return false;
+        bool configured = false;
+        bool enabled = true;
+        std::vector<MeasurementSegmentGate> gates;
+        {
+            const std::lock_guard<std::mutex> lock(
+                measurementGateMutex);
+            configured = measurementGateConfigured;
+            enabled = measurementGateEnabled;
+            gates = measurementGates;
+        }
+        output->measurementSegmentId = -1;
+        output->measurementActive = !configured;
+        if (!configured) return true;
+        if (!enabled || gates.empty()) return false;
+        double bestLateral =
+            std::numeric_limits<double>::infinity();
+        int bestSegmentId = -1;
+        for (const MeasurementSegmentGate& gate : gates) {
+            const Eigen::Vector3d direction =
+                gate.measurementEndMm - gate.measurementStartMm;
+            const double lengthSquared = direction.squaredNorm();
+            if (!std::isfinite(lengthSquared) ||
+                lengthSquared < 0.25) {
+                continue;
+            }
+            const double alpha =
+                (output->flangePositionMm -
+                 gate.measurementStartMm).dot(direction) /
+                lengthSquared;
+            const Eigen::Vector3d closest =
+                gate.measurementStartMm +
+                std::max(0.0, std::min(1.0, alpha)) *
+                    direction;
+            const double lateralDistance =
+                (output->flangePositionMm - closest).norm();
+            const bool active =
+                std::isfinite(alpha) &&
+                std::isfinite(lateralDistance) &&
+                alpha >= 0.0 &&
+                alpha <= 1.0 &&
+                lateralDistance <= gate.lateralToleranceMm;
+            if (active && lateralDistance < bestLateral) {
+                bestLateral = lateralDistance;
+                bestSegmentId = gate.segmentId;
+            }
+        }
+        output->measurementSegmentId = bestSegmentId;
+        output->measurementActive = bestSegmentId >= 0;
+        return output->measurementActive;
     }
 
     void synchronizationLoop() {
@@ -1171,7 +1228,13 @@ struct SynchronizationSession::Impl {
                         const bool sdkSequenceKnown =
                             output.robotSdkSequenceBefore > 0U &&
                             output.robotSdkSequenceAfter > 0U;
-                        if (sdkSequenceKnown &&
+                        const bool measurementActive =
+                            applyMeasurementGate(&output);
+                        if (!measurementActive) {
+                            output.quality =
+                                SyncQuality::
+                                    OUTSIDE_VALID_SCAN_SEGMENT;
+                        } else if (sdkSequenceKnown &&
                             output.robotSdkSequenceAfter !=
                                 output.robotSdkSequenceBefore + 1U) {
                             output.quality =
@@ -1380,6 +1443,8 @@ struct SynchronizationSession::Impl {
                         << value.flangeOrientation.x() << ',' << value.flangeOrientation.y() << ','
                         << value.flangeOrientation.z() << ',' << value.flangeOrientation.w() << ','
                         << value.actualScanSpeedMmS << ',' << syncQualityName(value.quality) << ','
+                        << value.measurementSegmentId << ','
+                        << (value.measurementActive ? 1 : 0) << ','
                         << value.imageFilename << ',' << value.filteredScanSpeedMmS << ','
                         << motionPhaseName(value.motionPhase) << ','
                         << value.robotSdkSequenceBefore << ','
@@ -1517,7 +1582,8 @@ bool SynchronizationSession::start(const SynchronizationConfig& config,
             "aligned_timestamp_ns,robot_sequence_before,robot_sequence_after,robot_time_before_ns,"
             "robot_time_after_ns,interpolation_alpha,robot_gap_ms,flange_x_mm,flange_y_mm,"
             "flange_z_mm,flange_qx,flange_qy,flange_qz,flange_qw,actual_scan_speed_mm_s,"
-            "sync_quality,image_filename,filtered_scan_speed_mm_s,motion_phase,"
+            "sync_quality,measurement_segment_id,measurement_active,"
+            "image_filename,filtered_scan_speed_mm_s,motion_phase,"
             "robot_sdk_sequence_before,robot_sdk_sequence_after\n";
     }
     created->startUtc = isoUtcNow();
@@ -1545,6 +1611,84 @@ bool SynchronizationSession::start(const SynchronizationConfig& config,
     }
     if (error) error->clear();
     return true;
+}
+
+bool SynchronizationSession::configureMeasurementSegment(
+        int segmentId,
+        const Eigen::Vector3d& measurementStartMm,
+        const Eigen::Vector3d& measurementEndMm,
+        double lateralToleranceMm,
+        std::string* error) {
+    MeasurementSegmentGate gate;
+    gate.segmentId = segmentId;
+    gate.measurementStartMm = measurementStartMm;
+    gate.measurementEndMm = measurementEndMm;
+    gate.lateralToleranceMm = lateralToleranceMm;
+    return configureMeasurementSegments({gate}, error);
+}
+
+bool SynchronizationSession::configureMeasurementSegments(
+        const std::vector<MeasurementSegmentGate>& gates,
+        std::string* error) {
+    if (gates.empty()) {
+        if (error) *error = "measurement gate list is empty";
+        return false;
+    }
+    for (const MeasurementSegmentGate& gate : gates) {
+        if (gate.segmentId < 0 ||
+            !gate.measurementStartMm.allFinite() ||
+            !gate.measurementEndMm.allFinite() ||
+            (gate.measurementEndMm -
+             gate.measurementStartMm).norm() < 0.5 ||
+            !std::isfinite(gate.lateralToleranceMm) ||
+            gate.lateralToleranceMm <= 0.0) {
+            if (error) *error =
+                "measurement segment gate is invalid";
+            return false;
+        }
+    }
+    const std::lock_guard<std::mutex> lifecycleLock(
+        lifecycleMutex_);
+    Impl* implementation = impl_.get();
+    if (!implementation ||
+        !implementation->accepting.load(
+            std::memory_order_acquire)) {
+        if (error) *error =
+            "synchronization session is not running";
+        return false;
+    }
+    {
+        const std::lock_guard<std::mutex> gateLock(
+            implementation->measurementGateMutex);
+        implementation->measurementGateConfigured = true;
+        implementation->measurementGateEnabled = true;
+        implementation->measurementGates = gates;
+    }
+    if (error) error->clear();
+    return true;
+}
+
+void SynchronizationSession::suspendMeasurementSegment() {
+    const std::lock_guard<std::mutex> lifecycleLock(
+        lifecycleMutex_);
+    Impl* implementation = impl_.get();
+    if (!implementation) return;
+    const std::lock_guard<std::mutex> gateLock(
+        implementation->measurementGateMutex);
+    implementation->measurementGateConfigured = true;
+    implementation->measurementGateEnabled = false;
+}
+
+void SynchronizationSession::clearMeasurementSegmentGate() {
+    const std::lock_guard<std::mutex> lifecycleLock(
+        lifecycleMutex_);
+    Impl* implementation = impl_.get();
+    if (!implementation) return;
+    const std::lock_guard<std::mutex> gateLock(
+        implementation->measurementGateMutex);
+    implementation->measurementGateConfigured = false;
+    implementation->measurementGateEnabled = true;
+    implementation->measurementGates.clear();
 }
 
 bool SynchronizationSession::pushCamera(CameraFrame frame) {

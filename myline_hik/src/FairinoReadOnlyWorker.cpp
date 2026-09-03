@@ -2,6 +2,9 @@
 
 #include <QTimer>
 
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+
 #ifdef HAVE_FAIRINO_SDK
 #include "robot.h"
 #endif
@@ -14,7 +17,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <mutex>
+#include <sstream>
 
 namespace {
 
@@ -23,6 +28,106 @@ constexpr qint64 kRealtimeFreshnessLimitNs = 500000000LL;
 constexpr int kRequiredStationaryStopSamples = 3;
 constexpr double kStoppedLinearSpeedMmS = 0.10;
 constexpr double kStoppedAngularSpeedDegS = 0.10;
+constexpr double kPi = 3.14159265358979323846;
+
+bool finitePose(const hik_scan::Pose6D& pose) {
+    return std::isfinite(pose.x) && std::isfinite(pose.y) &&
+           std::isfinite(pose.z) && std::isfinite(pose.rx) &&
+           std::isfinite(pose.ry) && std::isfinite(pose.rz);
+}
+
+double wrappedDeltaDeg(double from, double to) {
+    double delta = to - from;
+    while (delta > 180.0) delta -= 360.0;
+    while (delta < -180.0) delta += 360.0;
+    return delta;
+}
+
+double poseDistanceMm(const hik_scan::Pose6D& first,
+                      const hik_scan::Pose6D& second) {
+    const double dx = second.x - first.x;
+    const double dy = second.y - first.y;
+    const double dz = second.z - first.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+double poseRotationDeltaDeg(const hik_scan::Pose6D& first,
+                            const hik_scan::Pose6D& second) {
+    const double dx = wrappedDeltaDeg(first.rx, second.rx);
+    const double dy = wrappedDeltaDeg(first.ry, second.ry);
+    const double dz = wrappedDeltaDeg(first.rz, second.rz);
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+bool appendPoseSamples(
+        const hik_scan::Pose6D& first,
+        const hik_scan::Pose6D& second,
+        const hik_fr5::PathEvaluationOptions& options,
+        std::vector<hik_scan::Pose6D>* samples) {
+    if (!samples || !finitePose(first) || !finitePose(second)) {
+        return false;
+    }
+    const double translation = poseDistanceMm(first, second);
+    const double rotation = poseRotationDeltaDeg(first, second);
+    const std::size_t translationIntervals =
+        static_cast<std::size_t>(std::ceil(
+            translation / options.maximumCartesianSampleStepMm));
+    const std::size_t rotationIntervals =
+        static_cast<std::size_t>(std::ceil(
+            rotation / options.maximumAngularSampleStepDeg));
+    const std::size_t intervals =
+        std::max<std::size_t>(
+            1U, std::max(translationIntervals, rotationIntervals));
+    if (samples->size() + intervals >
+        options.maximumPathSamples) {
+        return false;
+    }
+    for (std::size_t index = 1U; index <= intervals; ++index) {
+        const double ratio =
+            static_cast<double>(index) /
+            static_cast<double>(intervals);
+        hik_scan::Pose6D pose = first;
+        pose.x += ratio * (second.x - first.x);
+        pose.y += ratio * (second.y - first.y);
+        pose.z += ratio * (second.z - first.z);
+        pose.rx += ratio * wrappedDeltaDeg(first.rx, second.rx);
+        pose.ry += ratio * wrappedDeltaDeg(first.ry, second.ry);
+        pose.rz += ratio * wrappedDeltaDeg(first.rz, second.rz);
+        samples->push_back(pose);
+    }
+    return true;
+}
+
+double estimateMoveTime(double lengthMm,
+                        double speedMmS,
+                        double accelerationMmS2) {
+    if (!std::isfinite(lengthMm) || !std::isfinite(speedMmS) ||
+        !std::isfinite(accelerationMmS2) || lengthMm < 0.0 ||
+        speedMmS <= 0.0 || accelerationMmS2 <= 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    if (lengthMm == 0.0) return 0.0;
+    const double accelerationDistance =
+        speedMmS * speedMmS / accelerationMmS2;
+    if (lengthMm <= accelerationDistance) {
+        return 2.0 * std::sqrt(lengthMm / accelerationMmS2);
+    }
+    return 2.0 * speedMmS / accelerationMmS2 +
+        (lengthMm - accelerationDistance) / speedMmS;
+}
+
+Eigen::Matrix3d fixedAxisRpy(double rxDeg,
+                             double ryDeg,
+                             double rzDeg) {
+    const double scale = kPi / 180.0;
+    return (Eigen::AngleAxisd(rzDeg * scale,
+                             Eigen::Vector3d::UnitZ()) *
+            Eigen::AngleAxisd(ryDeg * scale,
+                             Eigen::Vector3d::UnitY()) *
+            Eigen::AngleAxisd(rxDeg * scale,
+                             Eigen::Vector3d::UnitX()))
+        .toRotationMatrix();
+}
 
 }  // namespace
 
@@ -213,6 +318,11 @@ void FairinoReadOnlyWorker::finishMotion(
         const QString& description) {
     motionPollTimer_->stop();
     const int request = motionRequestId_;
+    const qint64 finishedMs =
+        hik_sync::getMonotonicRawNs() / 1000000LL;
+    const qint64 elapsedMs =
+        motionStartMs_ > 0 && finishedMs >= motionStartMs_
+        ? finishedMs - motionStartMs_ : -1;
     motionActive_ = false;
     motionStopUnconfirmed_ = !motionStoppedConfirmed;
     stopConfirmationPending_ = false;
@@ -223,6 +333,10 @@ void FairinoReadOnlyWorker::finishMotion(
     lastStopSampleReceiveNs_ = 0;
     stationaryStopSamples_ = 0;
     if (request >= 0) {
+        if (elapsedMs >= 0) {
+            emit motionTimingMeasured(
+                request, elapsedMs, targetReached);
+        }
         emit motionFinished(request, targetReached,
                             motionStoppedConfirmed, description);
     }
@@ -390,6 +504,383 @@ void FairinoReadOnlyWorker::readFlangePose(int requestId) {
 #endif
 }
 
+void FairinoReadOnlyWorker::evaluateKinematicPaths(
+        int requestId,
+        std::vector<hik_fr5::PathEvaluationRequest> requests,
+        hik_fr5::PathEvaluationOptions options) {
+#ifndef HAVE_FAIRINO_SDK
+    (void)requests;
+    (void)options;
+    emit kinematicPathBatchFinished(
+        requestId, false,
+        QStringLiteral("构建时未找到 Fairino SDK，路径评估不可用。"));
+    return;
+#else
+    const bool optionsValid =
+        std::isfinite(options.maximumCartesianSampleStepMm) &&
+        options.maximumCartesianSampleStepMm >= 1.0 &&
+        std::isfinite(options.maximumAngularSampleStepDeg) &&
+        options.maximumAngularSampleStepDeg >= 0.5 &&
+        std::isfinite(options.minimumJointLimitMarginDeg) &&
+        options.minimumJointLimitMarginDeg >= 0.0 &&
+        std::isfinite(options.minimumNormalizedSingularValue) &&
+        options.minimumNormalizedSingularValue > 0.0 &&
+        std::isfinite(options.jacobianCharacteristicLengthMm) &&
+        options.jacobianCharacteristicLengthMm > 0.0 &&
+        options.maximumJacobianSamples >= 2U &&
+        options.maximumJacobianSamples <= 128U &&
+        options.maximumPathSamples >= 4U &&
+        options.maximumPathSamples <= 4096U;
+    if (!optionsValid || requests.empty() ||
+        requests.size() > 256U) {
+        emit kinematicPathBatchFinished(
+            requestId, false,
+            QStringLiteral("FR5 路径评估参数无效或候选数超过 256。"));
+        return;
+    }
+    if (!connected_ || !robot_) {
+        emit kinematicPathBatchFinished(
+            requestId, false,
+            QStringLiteral("FR5 尚未连接，IK/奇异性为 UNKNOWN。"));
+        return;
+    }
+    if (motionActive_ || motionStopUnconfirmed_) {
+        emit kinematicPathBatchFinished(
+            requestId, false,
+            QStringLiteral("FR5 正在运动或机械停止未确认，拒绝路径评估。"));
+        return;
+    }
+
+    JointPos actualJoint;
+    float negativeLimit[6] = {};
+    float positiveLimit[6] = {};
+    errno_t setupResult =
+        robot_->GetActualJointPosDegree(0, &actualJoint);
+    if (setupResult == 0) {
+        setupResult = robot_->GetJointSoftLimitDeg(
+            0, negativeLimit, positiveLimit);
+    }
+    if (setupResult != 0) {
+        emit kinematicPathBatchFinished(
+            requestId, false,
+            QStringLiteral(
+                "FR5 当前关节/软限位读取失败，err=%1；"
+                "所有候选保持 UNKNOWN。")
+                .arg(setupResult));
+        return;
+    }
+
+    emit busyChanged(true);
+    std::size_t completedCount = 0U;
+    JointPos chainedReference = actualJoint;
+    hik_scan::Pose6D chainedEndPose;
+    bool chainedReferenceValid = false;
+    for (const hik_fr5::PathEvaluationRequest& request :
+         requests) {
+        hik_adaptive::RobotPathEvaluation evaluation;
+        evaluation.collision =
+            hik_adaptive::VerificationState::Unknown;
+        evaluation.detail =
+            "geometric collision model is unavailable";
+        const hik_adaptive::ScanSegment& segment =
+            request.segment;
+        evaluation.evaluatedPrimitive = segment.primitive;
+        const hik_scan::Pose6D motionStart =
+            finitePose(segment.motionStart)
+                ? segment.motionStart : segment.start;
+        const hik_scan::Pose6D motionEnd =
+            finitePose(segment.motionEnd)
+                ? segment.motionEnd : segment.end;
+        if (request.chainWithPrevious &&
+            (!chainedReferenceValid ||
+             poseDistanceMm(
+                 request.currentPose, chainedEndPose) > 1.0e-3 ||
+             poseRotationDeltaDeg(
+                 request.currentPose, chainedEndPose) > 1.0e-3)) {
+            evaluation.ik =
+                hik_adaptive::VerificationState::Failed;
+            evaluation.singularity =
+                hik_adaptive::VerificationState::Unknown;
+            evaluation.detail =
+                "cross-segment IK chain is unavailable or discontinuous; "
+                "collision remains UNKNOWN";
+            chainedReferenceValid = false;
+            emit kinematicPathEvaluated(
+                requestId, request.actionId, evaluation);
+            ++completedCount;
+            continue;
+        }
+        std::vector<hik_scan::Pose6D> poses;
+        poses.reserve(std::min<std::size_t>(
+            options.maximumPathSamples, 128U));
+        poses.push_back(request.currentPose);
+        std::vector<hik_scan::Pose6D> segmentPoses;
+        std::string segmentSampleError;
+        bool pathValid =
+            finitePose(request.currentPose) &&
+            finitePose(segment.start) &&
+            finitePose(segment.end) &&
+            finitePose(motionStart) &&
+            finitePose(motionEnd) &&
+            std::isfinite(segment.speedMmS) &&
+            segment.speedMmS > 0.0 &&
+            std::isfinite(segment.accelerationMmS2) &&
+            segment.accelerationMmS2 > 0.0 &&
+            appendPoseSamples(
+                request.currentPose, motionStart,
+                options, &poses);
+        const std::size_t remainingSamples =
+            poses.size() < options.maximumPathSamples
+            ? options.maximumPathSamples - poses.size() + 1U
+            : 0U;
+        pathValid = pathValid && remainingSamples >= 2U &&
+            hik_adaptive::sampleSegmentMotion(
+                segment,
+                options.maximumCartesianSampleStepMm,
+                options.maximumAngularSampleStepDeg,
+                remainingSamples, &segmentPoses,
+                &segmentSampleError);
+        if (pathValid) {
+            poses.insert(poses.end(),
+                         segmentPoses.begin() + 1,
+                         segmentPoses.end());
+        }
+        if (!pathValid) {
+            evaluation.ik =
+                hik_adaptive::VerificationState::Failed;
+            evaluation.singularity =
+                hik_adaptive::VerificationState::Unknown;
+            evaluation.detail =
+                "candidate path is invalid or exceeds sample limit: " +
+                segmentSampleError +
+                "; collision remains UNKNOWN";
+            chainedReferenceValid = false;
+            emit kinematicPathEvaluated(
+                requestId, request.actionId, evaluation);
+            ++completedCount;
+            continue;
+        }
+
+        JointPos reference = request.chainWithPrevious
+            ? chainedReference : actualJoint;
+        std::vector<JointPos> jointSolutions;
+        jointSolutions.reserve(poses.size());
+        evaluation.jointSamplesDeg.reserve(poses.size());
+        evaluation.minimumJointLimitMarginDeg =
+            std::numeric_limits<double>::infinity();
+        bool ikPassed = true;
+        bool jointMarginPassed = true;
+        errno_t ikError = 0;
+        for (std::size_t poseIndex = 0U;
+             poseIndex < poses.size(); ++poseIndex) {
+            const hik_scan::Pose6D& pose = poses[poseIndex];
+            DescPose target(
+                pose.x, pose.y, pose.z,
+                pose.rx, pose.ry, pose.rz);
+            JointPos solution;
+            ikError = robot_->GetInverseKinRef(
+                0, &target, &reference, &solution);
+            if (ikError != 0) {
+                ikPassed = false;
+                break;
+            }
+            std::array<double, 6> sample{};
+            for (int joint = 0; joint < 6; ++joint) {
+                const double value = solution.jPos[joint];
+                if (!std::isfinite(value)) {
+                    ikPassed = false;
+                    break;
+                }
+                sample[static_cast<std::size_t>(joint)] = value;
+                const double margin = std::min(
+                    value - negativeLimit[joint],
+                    positiveLimit[joint] - value);
+                evaluation.minimumJointLimitMarginDeg =
+                    std::min(
+                        evaluation.minimumJointLimitMarginDeg,
+                        margin);
+                if (!std::isfinite(margin) ||
+                    margin <
+                        options.minimumJointLimitMarginDeg) {
+                    jointMarginPassed = false;
+                }
+            }
+            if (!ikPassed) break;
+            if (!jointSolutions.empty()) {
+                for (int joint = 0; joint < 6; ++joint) {
+                    evaluation.jointTravelDeg += std::abs(
+                        solution.jPos[joint] -
+                        jointSolutions.back().jPos[joint]);
+                }
+            }
+            evaluation.jointSamplesDeg.push_back(sample);
+            jointSolutions.push_back(solution);
+            reference = solution;
+        }
+        if (!ikPassed || jointSolutions.size() != poses.size()) {
+            evaluation.ik =
+                hik_adaptive::VerificationState::Failed;
+            evaluation.singularity =
+                hik_adaptive::VerificationState::Unknown;
+            evaluation.detail =
+                QStringLiteral(
+                    "FR5 sampled path IK failed at %1/%2, err=%3; "
+                    "collision remains UNKNOWN")
+                    .arg(jointSolutions.size())
+                    .arg(poses.size())
+                    .arg(ikError)
+                    .toStdString();
+            chainedReferenceValid = false;
+            emit kinematicPathEvaluated(
+                requestId, request.actionId, evaluation);
+            ++completedCount;
+            continue;
+        }
+        chainedReference = jointSolutions.back();
+        chainedEndPose = motionEnd;
+        chainedReferenceValid = true;
+        evaluation.ik = jointMarginPassed
+            ? hik_adaptive::VerificationState::Passed
+            : hik_adaptive::VerificationState::Failed;
+
+        const std::size_t jacobianCount = std::min(
+            options.maximumJacobianSamples,
+            jointSolutions.size());
+        evaluation.minimumSingularValue =
+            std::numeric_limits<double>::infinity();
+        bool jacobianValid = true;
+        errno_t fkError = 0;
+        for (std::size_t sampleIndex = 0U;
+             sampleIndex < jacobianCount; ++sampleIndex) {
+            const std::size_t jointIndex =
+                jacobianCount == 1U ? 0U :
+                sampleIndex * (jointSolutions.size() - 1U) /
+                (jacobianCount - 1U);
+            JointPos baselineJoint = jointSolutions[jointIndex];
+            DescPose baselinePose;
+            fkError = robot_->GetForwardKin(
+                &baselineJoint, &baselinePose);
+            if (fkError != 0) {
+                jacobianValid = false;
+                break;
+            }
+            const Eigen::Vector3d baselineTranslation(
+                baselinePose.tran.x,
+                baselinePose.tran.y,
+                baselinePose.tran.z);
+            const Eigen::Matrix3d baselineRotation =
+                fixedAxisRpy(
+                    baselinePose.rpy.rx,
+                    baselinePose.rpy.ry,
+                    baselinePose.rpy.rz);
+            Eigen::Matrix<double, 6, 6> jacobian;
+            jacobian.setZero();
+            const double epsilonRad = 1.0e-4;
+            const double epsilonDeg =
+                epsilonRad * 180.0 / kPi;
+            for (int joint = 0; joint < 6; ++joint) {
+                JointPos perturbed = baselineJoint;
+                double signedEpsilonDeg = epsilonDeg;
+                if (perturbed.jPos[joint] + epsilonDeg >=
+                    positiveLimit[joint]) {
+                    signedEpsilonDeg = -epsilonDeg;
+                }
+                perturbed.jPos[joint] += signedEpsilonDeg;
+                DescPose perturbedPose;
+                fkError = robot_->GetForwardKin(
+                    &perturbed, &perturbedPose);
+                if (fkError != 0) {
+                    jacobianValid = false;
+                    break;
+                }
+                const double signedEpsilonRad =
+                    signedEpsilonDeg * kPi / 180.0;
+                const Eigen::Vector3d translation(
+                    perturbedPose.tran.x,
+                    perturbedPose.tran.y,
+                    perturbedPose.tran.z);
+                jacobian.block<3, 1>(0, joint) =
+                    (translation - baselineTranslation) /
+                    signedEpsilonRad /
+                    options.jacobianCharacteristicLengthMm;
+                const Eigen::Matrix3d rotation =
+                    fixedAxisRpy(
+                        perturbedPose.rpy.rx,
+                        perturbedPose.rpy.ry,
+                        perturbedPose.rpy.rz);
+                const Eigen::Matrix3d delta =
+                    baselineRotation.transpose() * rotation;
+                const Eigen::AngleAxisd angleAxis(delta);
+                jacobian.block<3, 1>(3, joint) =
+                    angleAxis.axis() * angleAxis.angle() /
+                    signedEpsilonRad;
+            }
+            if (!jacobianValid) break;
+            const Eigen::JacobiSVD<
+                Eigen::Matrix<double, 6, 6>> svd(
+                    jacobian,
+                    Eigen::ComputeFullU |
+                    Eigen::ComputeFullV);
+            const Eigen::Matrix<double, 6, 1> singular =
+                svd.singularValues();
+            const double minimum = singular.minCoeff();
+            if (!std::isfinite(minimum)) {
+                jacobianValid = false;
+                break;
+            }
+            evaluation.minimumSingularValue =
+                std::min(
+                    evaluation.minimumSingularValue,
+                    minimum);
+        }
+        if (!jacobianValid) {
+            evaluation.singularity =
+                hik_adaptive::VerificationState::Unknown;
+        } else {
+            evaluation.singularity =
+                evaluation.minimumSingularValue >=
+                    options.minimumNormalizedSingularValue
+                ? hik_adaptive::VerificationState::Passed
+                : hik_adaptive::VerificationState::Failed;
+        }
+
+        const double physicalLength =
+            poseDistanceMm(request.currentPose, motionStart) +
+            hik_adaptive::segmentMotionLengthMm(segment);
+        evaluation.estimatedExecutionTimeS =
+            estimateMoveTime(
+                physicalLength,
+                segment.speedMmS,
+                segment.accelerationMmS2) + 0.20;
+        std::ostringstream detail;
+        detail << "sampled_poses=" << poses.size()
+               << ", primitive="
+               << hik_adaptive::motionPrimitiveName(
+                      segment.primitive)
+               << ", jacobian_samples=" << jacobianCount
+               << ", min_joint_margin_deg="
+               << evaluation.minimumJointLimitMarginDeg
+               << ", min_normalized_sigma="
+               << evaluation.minimumSingularValue
+               << ", fk_error=" << fkError
+               << "; collision=UNKNOWN (no validated geometric "
+                  "workcell model)";
+        evaluation.detail = detail.str();
+        emit kinematicPathEvaluated(
+            requestId, request.actionId, evaluation);
+        ++completedCount;
+    }
+    emit busyChanged(false);
+    emit kinematicPathBatchFinished(
+        requestId, completedCount == requests.size(),
+        QStringLiteral(
+            "FR5 路径评估完成 %1/%2；IK/关节余量/数值Jacobian"
+            "来自控制器模型，几何碰撞仍为 UNKNOWN。")
+            .arg(completedCount)
+            .arg(requests.size()));
+#endif
+}
+
 void FairinoReadOnlyWorker::moveLinear(int requestId,
                                        double xMm,
                                        double yMm,
@@ -410,6 +901,212 @@ void FairinoReadOnlyWorker::moveLinearPhysical(
         double speedMmS, double accelerationMmS2, int timeoutMs) {
     moveLinearImpl(requestId, xMm, yMm, zMm, rxDeg, ryDeg, rzDeg,
                    speedMmS, accelerationMmS2, timeoutMs, true);
+}
+
+void FairinoReadOnlyWorker::executeAdaptiveTrajectory(
+        int requestId,
+        std::vector<hik_adaptive::ScanSegment> segments,
+        int timeoutMs) {
+#ifndef HAVE_FAIRINO_SDK
+    (void)segments;
+    (void)timeoutMs;
+    emit motionFinished(requestId, false, true,
+                        QStringLiteral("Fairino SDK 不可用。"));
+#else
+    if (!connected_ || !robot_) {
+        emit motionFinished(requestId, false, false,
+                            QStringLiteral("FR5 尚未连接。"));
+        return;
+    }
+    if (motionActive_ || motionStopUnconfirmed_) {
+        emit motionFinished(
+            requestId, false, false,
+            motionActive_
+                ? QStringLiteral("已有 FR5 运动正在执行。")
+                : QStringLiteral(
+                      "上一运动尚未确认机械停止；拒绝预提交轨迹。"));
+        return;
+    }
+    if (segments.size() < 3U || segments.size() > 199U ||
+        timeoutMs < 1000 || timeoutMs > 300000) {
+        emit motionFinished(
+            requestId, false, true,
+            QStringLiteral("预提交轨迹段数或超时参数无效。"));
+        return;
+    }
+    for (std::size_t index = 0U;
+         index < segments.size(); ++index) {
+        const hik_adaptive::ScanSegment& segment = segments[index];
+        const bool expectedMeasurement = (index % 2U) == 0U;
+        const bool primitiveValid = expectedMeasurement
+            ? segment.kind ==
+                  hik_adaptive::SegmentKind::Measurement &&
+              segment.primitive ==
+                  hik_adaptive::MotionPrimitive::Line
+            : segment.kind ==
+                  hik_adaptive::SegmentKind::Transition &&
+              segment.primitive ==
+                  hik_adaptive::MotionPrimitive::Arc &&
+              finitePose(segment.arcVia);
+        const bool blendValid =
+            index + 1U == segments.size()
+            ? segment.blendRadiusMm == 0.0
+            : std::isfinite(segment.blendRadiusMm) &&
+              segment.blendRadiusMm > 0.0 &&
+              segment.blendRadiusMm <= 1000.0;
+        if (!primitiveValid || !blendValid ||
+            !finitePose(segment.motionEnd) ||
+            !std::isfinite(segment.speedMmS) ||
+            segment.speedMmS < 10.0 ||
+            segment.speedMmS > 50.0 ||
+            !std::isfinite(segment.accelerationMmS2) ||
+            segment.accelerationMmS2 <= 0.0 ||
+            segment.accelerationMmS2 > 1000.0) {
+            emit motionFinished(
+                requestId, false, true,
+                QStringLiteral(
+                    "预提交轨迹第 %1 段不是已验证的融合 "
+                    "LINE/ARC，或速度/加速度/blendR 越界。")
+                    .arg(index));
+            return;
+        }
+    }
+
+    struct PreparedCommand {
+        hik_adaptive::ScanSegment segment;
+        JointPos viaJoint;
+        JointPos targetJoint;
+    };
+    JointPos reference;
+    errno_t result =
+        robot_->GetActualJointPosDegree(0, &reference);
+    std::vector<PreparedCommand> prepared;
+    prepared.reserve(segments.size());
+    for (const hik_adaptive::ScanSegment& segment : segments) {
+        if (result != 0) break;
+        PreparedCommand command;
+        command.segment = segment;
+        if (segment.primitive ==
+            hik_adaptive::MotionPrimitive::Arc) {
+            DescPose via(
+                segment.arcVia.x, segment.arcVia.y,
+                segment.arcVia.z, segment.arcVia.rx,
+                segment.arcVia.ry, segment.arcVia.rz);
+            result = robot_->GetInverseKinRef(
+                0, &via, &reference, &command.viaJoint);
+            if (result == 0) reference = command.viaJoint;
+        }
+        if (result == 0) {
+            const hik_scan::Pose6D& pose = segment.motionEnd;
+            DescPose target(
+                pose.x, pose.y, pose.z,
+                pose.rx, pose.ry, pose.rz);
+            result = robot_->GetInverseKinRef(
+                0, &target, &reference, &command.targetJoint);
+            if (result == 0) reference = command.targetJoint;
+        }
+        if (result == 0) prepared.push_back(command);
+    }
+    if (result != 0 || prepared.size() != segments.size()) {
+        emit motionFinished(
+            requestId, false, true,
+            QStringLiteral(
+                "预提交前端点/圆弧中间点链式逆解失败，err=%1；"
+                "未发送任何运动。")
+                .arg(result));
+        return;
+    }
+
+    ExaxisPos externalAxis(0.0, 0.0, 0.0, 0.0);
+    DescPose offset;
+    bool firstSubmitted = false;
+    for (std::size_t index = 0U;
+         index < prepared.size(); ++index) {
+        PreparedCommand& command = prepared[index];
+        const hik_adaptive::ScanSegment& segment =
+            command.segment;
+        const float blendRadius =
+            static_cast<float>(segment.blendRadiusMm);
+        const hik_scan::Pose6D& end = segment.motionEnd;
+        DescPose target(
+            end.x, end.y, end.z,
+            end.rx, end.ry, end.rz);
+        if (segment.primitive ==
+            hik_adaptive::MotionPrimitive::Arc) {
+            const hik_scan::Pose6D& middle = segment.arcVia;
+            DescPose via(
+                middle.x, middle.y, middle.z,
+                middle.rx, middle.ry, middle.rz);
+            result = robot_->MoveC(
+                &command.viaJoint, &via,
+                0, 0, 100.0F, 100.0F,
+                &externalAxis, 0, &offset,
+                &command.targetJoint, &target,
+                0, 0, 100.0F, 100.0F,
+                &externalAxis, 0, &offset,
+                static_cast<float>(segment.speedMmS),
+                blendRadius,
+                static_cast<float>(segment.accelerationMmS2), 1);
+        } else {
+            result = robot_->MoveL(
+                &command.targetJoint, &target,
+                0, 0, 100.0F, 100.0F,
+                static_cast<float>(segment.speedMmS),
+                blendRadius, 0, &externalAxis, 0, 0, &offset,
+                static_cast<float>(segment.accelerationMmS2), 1);
+        }
+        if (result != 0) break;
+        if (!firstSubmitted) {
+            firstSubmitted = true;
+            motionActive_ = true;
+            motionStopUnconfirmed_ = true;
+            stopConfirmationPending_ = false;
+            motionRequestId_ = requestId;
+            motionStartMs_ =
+                hik_sync::getMonotonicRawNs() / 1000000LL;
+            motionTimeoutMs_ = timeoutMs;
+            stopConfirmationStartMs_ = 0;
+            lastStopSampleReceiveNs_ = 0;
+            stationaryStopSamples_ = 0;
+            motionPollTimer_->start();
+            emit motionStarted(
+                requestId,
+                QStringLiteral(
+                    "FR5 融合轨迹开始预提交：%1 段，"
+                    "物理速度模式，LINE/MoveC，非末段 blendR>0。")
+                    .arg(segments.size()));
+        }
+    }
+    if (result != 0) {
+        if (!firstSubmitted) {
+            emit motionFinished(
+                requestId, false, true,
+                QStringLiteral(
+                    "首段轨迹提交失败，err=%1；未开始运动。")
+                    .arg(result));
+            return;
+        }
+        const errno_t stopResult = robot_->StopMotion();
+        if (stopResult == 0) {
+            beginStopConfirmation(QStringLiteral(
+                "轨迹预提交中途失败，err=%1；StopMotion 已提交")
+                .arg(result));
+        } else {
+            finishMotion(
+                false, false,
+                QStringLiteral(
+                    "轨迹预提交中途失败，err=%1；StopMotion "
+                    "失败，err=%2，请使用物理急停")
+                    .arg(result)
+                    .arg(stopResult));
+        }
+        return;
+    }
+    emit log(QStringLiteral(
+        "FR5 控制器已接受全部 %1 段 LINE/MoveC；"
+        "最终到位由20004状态与GetRobotMotionDone监控。")
+        .arg(segments.size()));
+#endif
 }
 
 void FairinoReadOnlyWorker::moveLinearImpl(
@@ -652,7 +1349,7 @@ void FairinoReadOnlyWorker::pollMotionDone() {
         return;
     }
     if (done != 0U) {
-        finishMotion(true, true, QStringLiteral("FR5 MoveL 已到位"));
+        finishMotion(true, true, QStringLiteral("FR5 运动已到位"));
         return;
     }
     if (nowMs - motionStartMs_ > motionTimeoutMs_) {
@@ -661,12 +1358,12 @@ void FairinoReadOnlyWorker::pollMotionDone() {
             finishMotion(
                 false, false,
                 QStringLiteral(
-                    "MoveL 等待超时；StopMotion 失败，err=%1；"
+                    "FR5 运动等待超时；StopMotion 失败，err=%1；"
                     "请使用物理急停")
                     .arg(stopResult));
         } else {
             beginStopConfirmation(QStringLiteral(
-                "MoveL 等待超时；StopMotion 已提交"));
+                "FR5 运动等待超时；StopMotion 已提交"));
         }
     }
 #endif

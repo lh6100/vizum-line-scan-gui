@@ -20,9 +20,10 @@ Qt GUI -> 持久 ssh -T -> forced-command gateway
 V1 的 Pin11 是 GPIO0_B7（offset 15），Pin7 是 GPIO0_C0（offset 16）；普通
 LubanCat-4 的同号物理引脚映射不同，不能混用。
 
-daemon 用一个 GPIO character-device handle 同时申请两路，任何一次写入都只允许
-`off`、`laser450`、`laser650` 三种状态。两路不会同时为 HIGH；从一个波长切换到
-另一个波长时严格按“当前通道 LOW → 回读两路 LOW → 目标通道 HIGH”执行。
+daemon 用一个 GPIO character-device handle 同时申请两路，任何一次写入只允许
+`off`、`laser450`、`laser650`、`both` 四种状态。`both` 会在同一次 GPIO ioctl
+中将两路置为 HIGH；在任意两个非关光状态之间切换时，严格按“当前状态 → 两路 LOW
+并回读 → 目标状态”执行。
 
 ## 失效行为
 
@@ -82,10 +83,11 @@ sudo ./uninstall.sh
 ```json
 {"v":1,"id":1,"op":"hello","client":"scan-gui"}
 {"v":1,"id":2,"op":"set","state":"laser450"}
-{"v":1,"id":3,"op":"heartbeat"}
-{"v":1,"id":4,"op":"off"}
-{"v":1,"id":5,"op":"status"}
-{"v":1,"id":6,"op":"goodbye"}
+{"v":1,"id":3,"op":"set","state":"both"}
+{"v":1,"id":4,"op":"heartbeat"}
+{"v":1,"id":5,"op":"off"}
+{"v":1,"id":6,"op":"status"}
+{"v":1,"id":7,"op":"goodbye"}
 ```
 
 回复始终带相同 `id`、`ok` 和完整状态。状态中的 `ttl450_high`、`ttl650_high` 是 GPIO

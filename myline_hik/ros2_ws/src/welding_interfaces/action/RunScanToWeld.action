@@ -1,0 +1,16 @@
+string session_id
+string calibration_package_id
+string acceptance_profile_path
+bool stop_before_arc
+bool dry_run
+---
+bool success
+string final_state
+string weld_plan_id
+string report_path
+string error
+---
+float32 progress
+string state
+string detail
+bool review_required

@@ -1,0 +1,19 @@
+uint8 COMMISSIONING_BOOTSTRAP=1
+uint8 ROUTINE_AUTOMATIC=2
+
+string session_id
+uint8 mode
+string board_config_path
+string seed_calibration_id
+bool dry_run
+---
+bool success
+string calibration_package_id
+string report_path
+string error
+---
+float32 progress
+string state
+string detail
+uint32 accepted_samples
+uint32 rejected_samples

@@ -337,10 +337,10 @@ double rotationDifferenceDeg(const cv::Matx33d& first,
 }  // namespace
 
 BoardSpec::BoardSpec()
-    : squaresX(5),
-      squaresY(7),
-      squareLengthMm(22.0),
-      markerLengthMm(16.0),
+    : squaresX(11),
+      squaresY(8),
+      squareLengthMm(24.0),
+      markerLengthMm(18.0),
       dictionaryId(cv::aruco::DICT_4X4_50) {}
 
 int BoardSpec::charucoCornerCount() const {
@@ -1155,6 +1155,9 @@ bool extractLaserStripe(const cv::Mat& differenceImage,
 namespace {
 
 std::vector<StripePoint> qualityStripePoints(
+    const std::vector<hik_stripe::Candidate>& candidates);
+
+std::vector<StripePoint> qualityStripePoints(
     const hik_stripe::Result& extraction);
 
 }  // namespace
@@ -1378,9 +1381,15 @@ StaticProfilePoint::StaticProfilePoint()
       boardPlaneDistanceMm(std::numeric_limits<double>::quiet_NaN()),
       insideBoard(false) {}
 
+StaticProfileAmbiguousBranch::StaticProfileAmbiguousBranch()
+    : intervalId(-1), branchId(-1), firstScanIndex(0),
+      lastScanIndex(-1) {}
+
 StaticProfileResult::StaticProfileResult()
-    : ok(false), legacyExtractionPassed(false),
-      qualityExtractionPassed(false), rejectedParallelRayCount(0),
+    : ok(false), formalPublicationPassed(false),
+      multipathAuditOnly(false), legacyExtractionPassed(false),
+      qualityAnalysisCompleted(false), qualityExtractionPassed(false),
+      rejectedParallelRayCount(0),
       rejectedBehindCameraCount(0),
       rejectedDepthCount(0), minimumDepthMm(0.0), maximumDepthMm(0.0),
       meanConfidence(0.0), lineQualityPassed(false),
@@ -1399,13 +1408,10 @@ struct StripeReconstructionCounters {
 };
 
 std::vector<StripePoint> qualityStripePoints(
-        const hik_stripe::Result& extraction) {
+        const std::vector<hik_stripe::Candidate>& candidates) {
     std::vector<StripePoint> points;
-    points.reserve(extraction.selected.size());
-    for (const hik_stripe::Candidate& input : extraction.selected) {
-        if (!input.accepted()) {
-            continue;
-        }
+    points.reserve(candidates.size());
+    for (const hik_stripe::Candidate& input : candidates) {
         StripePoint output;
         output.pixel = input.pixel;
         output.row = static_cast<int>(std::lround(input.pixel.y));
@@ -1429,6 +1435,14 @@ std::vector<StripePoint> qualityStripePoints(
         points.push_back(output);
     }
     return points;
+}
+
+std::vector<StripePoint> qualityStripePoints(
+        const hik_stripe::Result& extraction) {
+    // Result::selected is the extractor's publishable path.  Do not derive
+    // publication from Candidate::accepted(): multipath evidence has a
+    // deliberately soft pre-path state and is exported separately by branch.
+    return qualityStripePoints(extraction.selected);
 }
 
 bool reconstructStripePoints(
@@ -1597,6 +1611,93 @@ StripeShadowComparison compareStripeCenters(
         comparison.absoluteMaximumOffsetPx = metrics.maximum;
     }
     return comparison;
+}
+
+int stripeScanIndex(const StripePoint& point,
+                    hik_stripe::Orientation orientation) {
+    return orientation == hik_stripe::Orientation::Horizontal
+        ? static_cast<int>(std::lround(point.pixel.x))
+        : static_cast<int>(std::lround(point.pixel.y));
+}
+
+bool insideMultipathProtectionInterval(
+        int scanIndex,
+        const std::vector<hik_stripe::MultipathInterval>& intervals) {
+    return std::any_of(
+        intervals.begin(), intervals.end(),
+        [scanIndex](const hik_stripe::MultipathInterval& interval) {
+            return scanIndex >= interval.firstScanIndex &&
+                   scanIndex <= interval.lastScanIndex;
+        });
+}
+
+void splitLegacyStripeAtMultipathIntervals(
+        const std::vector<StripePoint>& input,
+        hik_stripe::Orientation orientation,
+        const std::vector<hik_stripe::MultipathInterval>& intervals,
+        std::vector<StripePoint>* publishable,
+        std::vector<StripePoint>* withheld) {
+    if (!publishable || !withheld) {
+        return;
+    }
+    publishable->clear();
+    withheld->clear();
+    publishable->reserve(input.size());
+    withheld->reserve(input.size());
+    for (const StripePoint& point : input) {
+        if (insideMultipathProtectionInterval(
+                stripeScanIndex(point, orientation), intervals)) {
+            withheld->push_back(point);
+        } else {
+            publishable->push_back(point);
+        }
+    }
+}
+
+void splitLegacyPointsAtMultipathIntervals(
+        const std::vector<StaticProfilePoint>& input,
+        hik_stripe::Orientation orientation,
+        const std::vector<hik_stripe::MultipathInterval>& intervals,
+        std::vector<StaticProfilePoint>* publishable,
+        std::vector<StaticProfilePoint>* withheld) {
+    if (!publishable || !withheld) {
+        return;
+    }
+    publishable->clear();
+    withheld->clear();
+    publishable->reserve(input.size());
+    withheld->reserve(input.size());
+    for (const StaticProfilePoint& point : input) {
+        if (insideMultipathProtectionInterval(
+                stripeScanIndex(point.stripe, orientation), intervals)) {
+            withheld->push_back(point);
+        } else {
+            publishable->push_back(point);
+        }
+    }
+}
+
+bool multipathAuditBranchesReady(
+        const StaticProfileResult& result) {
+    if (!result.qualityAnalysisCompleted ||
+        result.qualityAmbiguousBranches.empty()) {
+        return false;
+    }
+    std::map<int, std::set<int> > branchesByInterval;
+    for (const StaticProfileAmbiguousBranch& branch :
+         result.qualityAmbiguousBranches) {
+        if (branch.intervalId < 0 || branch.branchId < 0 ||
+            branch.stripe.empty() || branch.points.empty()) {
+            return false;
+        }
+        branchesByInterval[branch.intervalId].insert(
+            branch.branchId);
+    }
+    return std::all_of(
+        branchesByInterval.begin(), branchesByInterval.end(),
+        [](const std::pair<const int, std::set<int> >& interval) {
+            return interval.second.size() >= 2U;
+        });
 }
 
 }  // namespace
@@ -1791,17 +1892,49 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
     if (options.stripe.mode != StripeExtractionMode::Legacy) {
         result->centerlineAlgorithmVersion =
             hik_stripe::algorithmVersion();
-        result->qualityExtractionPassed =
+        result->qualityAnalysisCompleted =
             hik_stripe::extractCenterline(
                 result->differenceImage, onGray,
                 options.stripe.quality, &qualityExtraction,
                 options.stripeValidityMask);
+        result->qualityExtractionPassed =
+            result->qualityAnalysisCompleted;
         result->qualityDiagnostics =
             qualityExtraction.diagnostics;
         result->qualityExtractionError =
             qualityExtraction.error;
         result->qualityStripe =
             qualityStripePoints(qualityExtraction);
+        std::vector<hik_stripe::Candidate>
+            hardRejectedCandidates;
+        hardRejectedCandidates.reserve(
+            qualityExtraction.candidates.size());
+        for (const hik_stripe::Candidate& candidate :
+             qualityExtraction.candidates) {
+            if (candidate.rejectFlags !=
+                    hik_stripe::REJECT_NONE &&
+                !candidate.usableForPath()) {
+                hardRejectedCandidates.push_back(candidate);
+            }
+        }
+        result->qualityRejectedCandidateStripe =
+            qualityStripePoints(hardRejectedCandidates);
+        result->qualityAmbiguousBranches.clear();
+        for (const hik_stripe::MultipathInterval& interval :
+             qualityExtraction.multipathIntervals) {
+            for (const hik_stripe::MultipathBranch& branch :
+                 interval.branches) {
+                StaticProfileAmbiguousBranch output;
+                output.intervalId = interval.intervalId;
+                output.branchId = branch.branchId;
+                output.firstScanIndex = interval.firstScanIndex;
+                output.lastScanIndex = interval.lastScanIndex;
+                output.stripe =
+                    qualityStripePoints(branch.candidates);
+                result->qualityAmbiguousBranches.push_back(
+                    std::move(output));
+            }
+        }
         if (static_cast<int>(result->qualityStripe.size()) <
             options.stripe.minPointCount) {
             std::ostringstream message;
@@ -1823,10 +1956,13 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
                 result->legacyStripe, result->qualityStripe,
                 qualityExtraction.orientation);
         }
-        if (!result->qualityExtractionPassed &&
-            options.stripe.mode == StripeExtractionMode::Quality) {
+        // Shadow is now a safety gate rather than an observational-only
+        // fallback. If the quality analysis itself did not complete, it
+        // cannot prove that the legacy path is outside a multipath interval.
+        if (!result->qualityAnalysisCompleted &&
+            options.stripe.mode == StripeExtractionMode::Shadow) {
             result->error =
-                "quality stripe extraction failed: " +
+                "quality multipath analysis failed in shadow mode: " +
                 result->qualityExtractionError;
             return false;
         }
@@ -1847,17 +1983,58 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
             return false;
         }
     }
-    if (result->qualityExtractionPassed &&
+    if (result->qualityAnalysisCompleted &&
         !reconstructStripePoints(
             result->qualityStripe, intrinsics, laserPlane,
             options, &result->qualityPoints, &qualityCounters,
             &result->qualityExtractionError)) {
         result->qualityExtractionPassed = false;
-        if (options.stripe.mode == StripeExtractionMode::Quality) {
-            result->error =
-                "quality stripe reconstruction failed: " +
-                result->qualityExtractionError;
-            return false;
+    }
+    if (result->qualityAnalysisCompleted &&
+        !result->qualityRejectedCandidateStripe.empty()) {
+        StripeReconstructionCounters rejectedCandidateCounters;
+        std::string rejectedCandidateError;
+        if (!reconstructStripePoints(
+                result->qualityRejectedCandidateStripe,
+                intrinsics, laserPlane, options,
+                &result->qualityRejectedCandidatePoints,
+                &rejectedCandidateCounters,
+                &rejectedCandidateError)) {
+            result->qualityRejectedCandidatePoints.clear();
+            if (!result->qualityExtractionError.empty()) {
+                result->qualityExtractionError += "; ";
+            }
+            result->qualityExtractionError +=
+                "quality rejected-candidate audit reconstruction "
+                "failed: " + rejectedCandidateError;
+        }
+    }
+    if (result->qualityAnalysisCompleted) {
+        for (StaticProfileAmbiguousBranch& branch :
+             result->qualityAmbiguousBranches) {
+            StripeReconstructionCounters branchCounters;
+            std::string branchError;
+            if (!reconstructStripePoints(
+                    branch.stripe, intrinsics, laserPlane, options,
+                    &branch.points, &branchCounters, &branchError)) {
+                result->qualityExtractionPassed = false;
+                if (!result->qualityExtractionError.empty()) {
+                    result->qualityExtractionError += "; ";
+                }
+                result->qualityExtractionError +=
+                    "multipath branch reconstruction failed: " +
+                    branchError;
+                break;
+            }
+            if (branch.points.empty()) {
+                result->qualityExtractionPassed = false;
+                if (!result->qualityExtractionError.empty()) {
+                    result->qualityExtractionError += "; ";
+                }
+                result->qualityExtractionError +=
+                    "multipath branch has no valid 3-D points";
+                break;
+            }
         }
     }
     if (result->qualityExtractionPassed &&
@@ -1871,10 +2048,14 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
                 << " are required";
         result->qualityExtractionError = message.str();
         result->qualityExtractionPassed = false;
-        if (options.stripe.mode == StripeExtractionMode::Quality) {
-            result->error = result->qualityExtractionError;
-            return false;
-        }
+    }
+    if (!result->qualityExtractionPassed &&
+        options.stripe.mode == StripeExtractionMode::Quality &&
+        !multipathAuditBranchesReady(*result)) {
+        result->error =
+            "quality stripe extraction/reconstruction failed: " +
+            result->qualityExtractionError;
+        return false;
     }
 
     StripeReconstructionCounters selectedCounters;
@@ -1882,6 +2063,33 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
         result->stripe = result->qualityStripe;
         result->points = result->qualityPoints;
         selectedCounters = qualityCounters;
+    } else if (options.stripe.mode == StripeExtractionMode::Shadow) {
+        splitLegacyStripeAtMultipathIntervals(
+            result->legacyStripe, qualityExtraction.orientation,
+            qualityExtraction.multipathIntervals,
+            &result->stripe,
+            &result->ambiguityMaskedLegacyStripe);
+        std::vector<StaticProfilePoint> legacyPublishableDiagnostic;
+        splitLegacyPointsAtMultipathIntervals(
+            result->legacyPoints, qualityExtraction.orientation,
+            qualityExtraction.multipathIntervals,
+            &legacyPublishableDiagnostic,
+            &result->ambiguityMaskedLegacyPoints);
+        if (qualityExtraction.multipathIntervals.empty()) {
+            result->points = result->legacyPoints;
+            selectedCounters = legacyCounters;
+        } else {
+            std::string maskedLegacyError;
+            if (!reconstructStripePoints(
+                    result->stripe, intrinsics, laserPlane, options,
+                    &result->points, &selectedCounters,
+                    &maskedLegacyError)) {
+                result->error =
+                    "ambiguity-masked legacy reconstruction failed: " +
+                    maskedLegacyError;
+                return false;
+            }
+        }
     } else {
         result->stripe = result->legacyStripe;
         result->points = result->legacyPoints;
@@ -1893,15 +2101,49 @@ bool reconstructStaticProfile(const cv::Mat& laserOffImage,
         selectedCounters.behindCamera;
     result->rejectedDepthCount =
         selectedCounters.outsideDepth;
-    if (static_cast<int>(result->points.size()) < options.minReconstructedPoints) {
+    const bool qualityPolicyRejected =
+        options.stripe.mode == StripeExtractionMode::Quality &&
+        !result->qualityExtractionPassed;
+    if (qualityPolicyRejected ||
+        static_cast<int>(result->points.size()) <
+            options.minReconstructedPoints) {
         std::ostringstream message;
-        message << "only " << result->points.size()
-                << " valid reconstructed points; at least "
-                << options.minReconstructedPoints << " are required (depth range "
-                << options.minimumDepthMm << ".." << options.maximumDepthMm << " mm)";
+        if (qualityPolicyRejected) {
+            message
+                << "quality publishable path failed its configured "
+                   "2-D/3-D count gate";
+        } else {
+            message << "only " << result->points.size()
+                    << " valid reconstructed points; at least "
+                    << options.minReconstructedPoints
+                    << " are required (depth range "
+                    << options.minimumDepthMm << ".."
+                    << options.maximumDepthMm << " mm)";
+        }
+        if (multipathAuditBranchesReady(*result)) {
+            result->multipathAuditOnly = true;
+            result->formalPublicationPassed = false;
+            if (!result->qualityExtractionError.empty()) {
+                result->qualityExtractionError += "; ";
+            }
+            result->qualityExtractionError +=
+                "formal publication withheld, multipath audit retained: " +
+                message.str();
+            // Preserve legacyPoints/qualityPoints and the explicit branches
+            // for diagnostics. The policy-selected fragment is explicitly
+            // routed to rejected before publication is cleared.
+            result->publicationGateRejectedPoints =
+                result->points;
+            result->stripe.clear();
+            result->points.clear();
+            result->lineQualityPassed = false;
+            result->ok = true;
+            return true;
+        }
         result->error = message.str();
         return false;
     }
+    result->formalPublicationPassed = true;
     result->minimumDepthMm = selectedCounters.minimumDepth;
     result->maximumDepthMm = selectedCounters.maximumDepth;
     result->meanConfidence = selectedCounters.confidenceSum /
@@ -2470,10 +2712,13 @@ bool fitLaserPlane(const std::vector<LaserPlaneSample>& samples,
 }
 
 IntrinsicsYamlMetadata::IntrinsicsYamlMetadata()
-    : cameraName("hik_camera"), pixelFormat("Mono8") {}
+    : cameraName("hik_camera"), pixelFormat("Mono8"),
+      validCameraZMinMm(0.0), validCameraZMaxMm(0.0) {}
 
 LaserPlaneYamlMetadata::LaserPlaneYamlMetadata()
-    : validCameraZMinMm(0.0), validCameraZMaxMm(0.0) {}
+    : validCameraZMinMm(0.0), validCameraZMaxMm(0.0),
+      validationPoseCount(0), validationPointCount(0),
+      validationRmsMm(0.0), validationP95Mm(0.0) {}
 
 namespace {
 
@@ -2906,6 +3151,9 @@ bool saveIntrinsicsYaml(const std::string& path,
     output << "    accepted_views: " << calibration.acceptedViewCount << '\n';
     output << "    rejected_views: " << calibration.rejectedViewCount << '\n';
     output << "    reprojection_rms_px: " << calibration.calibrationRmsPx << '\n';
+    output << "  validity:\n";
+    output << "    camera_z_min_mm: " << metadata.validCameraZMinMm << '\n';
+    output << "    camera_z_max_mm: " << metadata.validCameraZMaxMm << '\n';
     output << "  generated_at: " << yamlQuote(metadata.generatedAt) << '\n';
     if (!output) {
         setError("failed while writing intrinsic YAML file: " + path, error);
@@ -3011,6 +3259,15 @@ bool loadIntrinsicsYaml(const std::string& path,
         optionalLookup(values, "metadata.board.printed_pattern_sha256",
                        &metadata->printedPatternSha256);
         optionalLookup(values, "metadata.generated_at", &metadata->generatedAt);
+        std::string value;
+        if (optionalLookup(
+                values, "metadata.validity.camera_z_min_mm", &value)) {
+            parseDouble(value, &metadata->validCameraZMinMm);
+        }
+        if (optionalLookup(
+                values, "metadata.validity.camera_z_max_mm", &value)) {
+            parseDouble(value, &metadata->validCameraZMaxMm);
+        }
     }
     *calibration = parsed;
     return true;
@@ -3064,6 +3321,12 @@ bool saveLaserPlaneYaml(const std::string& path,
     output << "  inlier_rms_mm: " << fit.inlierDistanceMm.rms << '\n';
     output << "  inlier_p95_mm: " << fit.inlierDistanceMm.p95 << '\n';
     output << "  inlier_max_mm: " << fit.inlierDistanceMm.maximum << "\n\n";
+    output << "validation:\n";
+    output << "  method: " << yamlQuote(metadata.validationMethod) << '\n';
+    output << "  holdout_pose_count: " << metadata.validationPoseCount << '\n';
+    output << "  holdout_point_count: " << metadata.validationPointCount << '\n';
+    output << "  holdout_rms_mm: " << metadata.validationRmsMm << '\n';
+    output << "  holdout_p95_mm: " << metadata.validationP95Mm << "\n\n";
     output << "validity:\n";
     output << "  camera_z_min_mm: " << metadata.validCameraZMinMm << '\n';
     output << "  camera_z_max_mm: " << metadata.validCameraZMaxMm << "\n\n";
@@ -3176,6 +3439,24 @@ bool loadLaserPlaneYaml(const std::string& path,
         }
         if (optionalLookup(values, "validity.camera_z_max_mm", &value)) {
             parseDouble(value, &metadata->validCameraZMaxMm);
+        }
+        optionalLookup(values, "validation.method",
+                       &metadata->validationMethod);
+        if (optionalLookup(
+                values, "validation.holdout_pose_count", &value)) {
+            parseInt(value, &metadata->validationPoseCount);
+        }
+        if (optionalLookup(
+                values, "validation.holdout_point_count", &value)) {
+            parseInt(value, &metadata->validationPointCount);
+        }
+        if (optionalLookup(
+                values, "validation.holdout_rms_mm", &value)) {
+            parseDouble(value, &metadata->validationRmsMm);
+        }
+        if (optionalLookup(
+                values, "validation.holdout_p95_mm", &value)) {
+            parseDouble(value, &metadata->validationP95Mm);
         }
     }
     parsed.ok = true;

@@ -10,8 +10,9 @@ Panels:
         - /Reported Flange Axes1
         - /Flange Coordinates1
         - /Weld-gun TCP Axes1
-        - /Vizum Left Camera Axes1
-        - /Calibrated TCP and Camera Points1
+        - /HIK 650 Camera Axes1
+        - /HIK 450 Camera Axes1
+        - /Weld-gun TCP and HIK Laser Planes1
         - /TF1
       Splitter Ratio: 0.5
     Tree Height: 560
@@ -96,16 +97,24 @@ Visualization Manager:
     - Class: rviz_default_plugins/Axes
       Enabled: true
       Length: 0.14
-      Name: Vizum Left Camera Axes
+      Name: HIK 650 Camera Axes
       Radius: 0.009
-      Reference Frame: vizum_left_camera_optical_frame
+      Reference Frame: hik_camera_optical_frame
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Enabled: true
+      Length: 0.14
+      Name: HIK 450 Camera Axes
+      Radius: 0.009
+      Reference Frame: hik_450_camera_optical_frame
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Calibrated TCP and Camera Points
+      Name: Weld-gun TCP and HIK Laser Planes
       Namespaces:
         calibrated_point_labels: true
         calibrated_points: true
+        hik_laser_planes: true
       Topic:
         Depth: 1
         Durability Policy: Transient Local

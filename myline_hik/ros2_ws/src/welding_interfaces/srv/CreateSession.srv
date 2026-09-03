@@ -1,0 +1,8 @@
+string task_type
+string requested_session_id
+string config_snapshot_yaml
+---
+bool success
+string session_id
+string session_directory
+string error

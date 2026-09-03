@@ -1,0 +1,62 @@
+%YAML:1.0
+---
+schema_version: 1
+profile_id: "scanner_650"
+
+global:
+  lane_offset_mm: [0.0, 10.0, 0.0]
+  lane_count: 5
+  transition_speed_mm_s: 20.0
+  lead_in_mm: 30.0
+  lead_out_mm: 30.0
+  enable_arc_transitions: 1
+  minimum_arc_radius_mm: 5.0
+  maximum_arc_radius_mm: 100.0
+  transition_blend_radius_mm: 2.0
+  maximum_arc_tangent_error_deg: 5.0
+  maximum_segment_count: 199
+  maximum_total_length_mm: 5000.0
+
+quality_map:
+  voxel_size_mm: 2.0
+  minimum_mean_confidence: 0.35
+  rejected_ratio_threshold: 0.30
+  minimum_accepted_observations: 1
+
+roi:
+  minimum_voxel_count: 1
+  padding_mm: 3.0
+  maximum_extent_mm: 250.0
+  maximum_candidate_rois: 8
+
+candidate_library:
+  yaw_offsets_deg: [-25.0, 0.0, 25.0]
+  pitch_offsets_deg: [-15.0, 0.0, 15.0]
+  working_distance_scales: [0.9, 1.0, 1.1]
+  speeds_mm_s: [10.0, 20.0, 30.0]
+  exposure_scales: [0.5, 1.0]
+  include_reverse_direction: 1
+  roi_padding_mm: 5.0
+  maximum_candidate_count: 4096
+
+search:
+  horizon: 3
+  beam_width: 12
+  shortlist_size: 12
+  maximum_candidates_per_roi: 3
+
+fr5:
+  maximum_cartesian_sample_step_mm: 10.0
+  maximum_angular_sample_step_deg: 5.0
+  minimum_joint_limit_margin_deg: 5.0
+  minimum_normalized_singular_value: 0.02
+  jacobian_characteristic_length_mm: 100.0
+  maximum_jacobian_samples: 16
+  maximum_path_samples: 512
+
+# v1 has no validated collision scene and cannot execute local NBS paths.
+# These values are deliberately fail-closed and are enforced by the parser.
+safety:
+  collision_model_validated: 0
+  local_adaptive_execution_enabled: 0
+  collision_state_when_unavailable: "UNKNOWN"
