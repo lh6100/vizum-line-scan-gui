@@ -24,14 +24,22 @@ Visualization Manager:
       Robot Description: robot_description
       Planning Request:
         Planning Group: fairino5_v6_group
+        Query Goal State: false
+        Query Start State: false
       Planned Path:
+        Color Enabled: true
         Loop Animation: false
+        Robot Alpha: 0.35
+        Robot Color: 210; 210; 220
+        Show Robot Collision: false
+        Show Robot Visual: true
+        Show Trail: false
         State Display Time: 0.05 s
         Trajectory Topic: display_planned_path
       Scene Geometry:
         Scene Alpha: 1
       Scene Robot:
-        Robot Alpha: 0.65
+        Robot Alpha: 1
       Value: true
     - Class: rviz_default_plugins/Axes
       Name: Scanner TCP
@@ -83,7 +91,20 @@ Visualization Manager:
       Decay Time: 0.25
       Value: true
     - Class: rviz_default_plugins/PointCloud2
-      Name: Accumulated scan cloud
+      Name: Live scan preview
+      Enabled: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scanner_650/scan_cloud_preview
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: RGB8
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Archived scan cloud
       Enabled: true
       Topic:
         Depth: 1
@@ -95,17 +116,6 @@ Visualization Manager:
       Size (Pixels): 2
       Color Transformer: RGB8
       Value: true
-    - Class: rviz_default_plugins/Image
-      Name: Scanner image
-      Enabled: false
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Best Effort
-        Value: /scanner_650/image_raw
-      Normalize Range: true
-      Value: false
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: true

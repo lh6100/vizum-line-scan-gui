@@ -22,6 +22,7 @@ RVIZ_CONFIG = WORKSPACE / "src/fr5_scanner_650/rviz/scanner_650_moveit.rviz"
 RECONSTRUCTION_SOURCE = (
     WORKSPACE / "src/fr5_scanner_650/src/line_laser_reconstruction_node.cpp"
 )
+CAMERA_SOURCE = WORKSPACE / "src/fr5_scanner_650/src/hik_single_camera_node.cpp"
 LAUNCH_FILE = WORKSPACE / "src/fr5_scanner_650/launch/scanner_650_moveit.launch.py"
 
 
@@ -121,6 +122,7 @@ def test_motion_compensation_fails_closed_on_unsynchronized_frames():
         reconstruction["maximum_image_age_s"]
         > reconstruction["tf_lookup_timeout_s"]
     )
+    assert 0.001 <= reconstruction["maximum_future_image_lead_s"] <= 0.05
 
 
 def test_gui_device_connection_services_are_explicit_and_separate_from_laser_output():
@@ -154,13 +156,29 @@ def test_reconstruction_matches_proven_scanner_650_continuous_profile():
     assert reconstruction["reconstruction_queue_capacity"] >= 32
     assert reconstruction["reconstruction_worker_threads"] >= 2
     assert reconstruction["clear_cloud_on_accumulation_start"] is True
+    assert reconstruction["auto_save_on_accumulation_stop"] is True
+    assert reconstruction["require_camera_ready_for_accumulation"] is True
+    assert (
+        reconstruction["camera_statistics_service"]
+        == "/scanner_650/get_camera_statistics"
+    )
     assert reconstruction["accumulation_drain_timeout_s"] > 0.0
     assert reconstruction["scan_publish_period_s"] >= 0.25
+    assert math.isclose(reconstruction["expected_camera_fps"], 60.0)
+    assert 1.1 <= reconstruction["maximum_frame_interval_factor"] < 2.0
+    assert reconstruction["preview_topic"] == "/scanner_650/scan_cloud_preview"
+    assert reconstruction["scan_topic"] == "/scanner_650/scan_cloud"
+    assert reconstruction["preview_voxel_size_m"] > reconstruction["voxel_size_m"]
+    assert (
+        reconstruction["maximum_preview_voxels"]
+        < reconstruction["maximum_voxels"]
+    )
+    assert 1 <= reconstruction["maximum_pending_save_jobs"] <= 4
 
 
 def test_rviz_and_saved_ply_share_base_height_rgb_contract():
     rviz = RVIZ_CONFIG.read_text()
-    accumulated_display = rviz.split("Name: Accumulated scan cloud", 1)[1].split(
+    accumulated_display = rviz.split("Name: Archived scan cloud", 1)[1].split(
         "- Class:", 1
     )[0]
     assert "Color Transformer: RGB8" in accumulated_display
@@ -174,6 +192,71 @@ def test_rviz_and_saved_ply_share_base_height_rgb_contract():
     rgb = source.index("property uchar red", xyz)
     scalars = source.index("property float confidence", rgb)
     assert xyz < rgb < scalars
+
+
+def test_live_preview_is_best_effort_and_full_cloud_is_archival_only():
+    displays = yaml.safe_load(RVIZ_CONFIG.read_text())["Visualization Manager"][
+        "Displays"
+    ]
+    preview = next(display for display in displays if display["Name"] == "Live scan preview")
+    archived = next(
+        display for display in displays if display["Name"] == "Archived scan cloud"
+    )
+
+    assert preview["Topic"]["Value"] == "/scanner_650/scan_cloud_preview"
+    assert preview["Topic"]["Reliability Policy"] == "Best Effort"
+    assert preview["Topic"]["Durability Policy"] == "Volatile"
+    assert archived["Topic"]["Value"] == "/scanner_650/scan_cloud"
+    assert archived["Topic"]["Reliability Policy"] == "Reliable"
+    assert archived["Topic"]["Durability Policy"] == "Transient Local"
+
+    source = RECONSTRUCTION_SOURCE.read_text()
+    assert "save_worker_ = std::thread" in source
+    assert "pending_accumulation_tasks_ == 0U" in source
+    assert "latest_session.txt" in source
+    assert "manifest.yaml" in source
+    assert "event=data_loss" in source
+
+
+def test_camera_loss_counters_are_snapshotted_at_scan_boundaries():
+    camera_source = CAMERA_SOURCE.read_text()
+    reconstruction_source = RECONSTRUCTION_SOURCE.read_text()
+
+    assert '"/scanner_650/get_camera_statistics"' in camera_source
+    for counter in (
+        "frame_id_gaps",
+        "sdk_rejected",
+        "image_pool_exhausted",
+        "publish_queue_dropped",
+        "timestamp_rejected",
+    ):
+        assert counter in camera_source
+        assert counter in reconstruction_source
+    assert "audit_camera_statistics" in reconstruction_source
+
+
+def test_rviz_does_not_create_a_scanner_image_display():
+    rviz = RVIZ_CONFIG.read_text()
+
+    assert "Name: Scanner image" not in rviz
+    assert "/scanner_650/image_raw" not in rviz
+
+
+def test_rviz_separates_live_scene_robot_from_transparent_planned_robot():
+    displays = yaml.safe_load(RVIZ_CONFIG.read_text())["Visualization Manager"][
+        "Displays"
+    ]
+    planning = next(display for display in displays if display["Name"] == "MotionPlanning")
+
+    assert not any(
+        display["Class"] == "rviz_default_plugins/RobotModel" for display in displays
+    )
+    assert planning["Planning Scene Topic"] == "monitored_planning_scene"
+    assert planning["Planning Request"]["Query Goal State"] is False
+    assert planning["Planning Request"]["Query Start State"] is False
+    assert planning["Scene Robot"]["Robot Alpha"] == 1
+    assert planning["Planned Path"]["Robot Alpha"] < 1
+    assert planning["Planned Path"]["Show Trail"] is False
 
 
 def test_rosbag_preserves_reliable_60_fps_image_stream():

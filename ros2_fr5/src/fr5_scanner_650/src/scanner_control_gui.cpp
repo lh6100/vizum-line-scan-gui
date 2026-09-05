@@ -101,7 +101,7 @@ public:
   using TopicCallback = std::function<void (const std::string &, const std::string &)>;
   using AvailabilityCallback = std::function<void (const Availability &)>;
   using JointCallback = std::function<void (const std::array<double, 6> &)>;
-  using CloudCallback = std::function<void (std::size_t)>;
+  using CloudCallback = std::function<void (std::size_t, std::size_t)>;
 
   ScannerControlBridge()
   : Node("scanner_650_control_gui")
@@ -157,8 +157,18 @@ public:
       "/scanner_650/scan_cloud", rclcpp::QoS(1).reliable().transient_local(),
       [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
         const std::size_t count = static_cast<std::size_t>(message->width) * message->height;
+        archived_cloud_points_.store(count);
         if (cloud_callback_) {
-          cloud_callback_(count);
+          cloud_callback_(preview_cloud_points_.load(), count);
+        }
+      });
+    preview_cloud_subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      "/scanner_650/scan_cloud_preview", rclcpp::QoS(1).best_effort().durability_volatile(),
+      [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+        const std::size_t count = static_cast<std::size_t>(message->width) * message->height;
+        preview_cloud_points_.store(count);
+        if (cloud_callback_) {
+          cloud_callback_(count, archived_cloud_points_.load());
         }
       });
 
@@ -172,7 +182,7 @@ public:
 
     subscribeStatus("/scanner_650/camera_status", "camera", true);
     subscribeStatus("/scanner_650/laser_status", "laser", true);
-    subscribeStatus("/scanner_650/reconstruction_status", "reconstruction", false);
+    subscribeStatus("/scanner_650/reconstruction_status", "reconstruction", true);
     subscribeStatus("/scanner_650/workspace_coarse_scan_status", "workspace", true);
   }
 
@@ -450,6 +460,7 @@ private:
   rclcpp::Client<SetBool>::SharedPtr rviz_mode_client_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_subscription_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr preview_cloud_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_subscription_;
   std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> status_subscriptions_;
   std::atomic<int64_t> last_joint_ns_{0};
@@ -457,6 +468,8 @@ private:
   std::atomic<bool> camera_connected_{false};
   std::atomic<bool> camera_streaming_{false};
   std::atomic<bool> laser_connected_{false};
+  std::atomic<std::size_t> preview_cloud_points_{0U};
+  std::atomic<std::size_t> archived_cloud_points_{0U};
 };
 
 class ScannerControlWindow final : public QMainWindow
@@ -853,7 +866,18 @@ private:
       accumulation_off, &QPushButton::clicked, this, [this]() {
         bridge_->setAccumulation(false);
       });
-    connect(clear_cloud, &QPushButton::clicked, this, [this]() {bridge_->clearCloud();});
+    connect(
+      clear_cloud, &QPushButton::clicked, this, [this]() {
+        if (QMessageBox::warning(
+          this, QStringLiteral("清空当前点云"),
+          QStringLiteral(
+            "这会丢弃尚未保存的当前点云；如果后台写盘失败，也会放弃内存中的重试数据。"
+            "已归档的历史 session 不受影响。是否继续？"),
+          QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
+        {
+          bridge_->clearCloud();
+        }
+      });
     connect(save_cloud, &QPushButton::clicked, this, [this]() {bridge_->saveCloud();});
     layout->addLayout(utility_grid);
 
@@ -892,7 +916,8 @@ private:
       joints_grid->addWidget(name, i / 3 * 2, i % 3);
       joints_grid->addWidget(joint_values_[static_cast<std::size_t>(i)], i / 3 * 2 + 1, i % 3);
     }
-    cloud_count_ = new QLabel(QStringLiteral("base_link 累计点云：0 点"));
+    cloud_count_ = new QLabel(
+      QStringLiteral("实时预览（2 mm）：0 点\n已归档完整点云（0.5 mm）：0 点"));
     cloud_count_->setObjectName(QStringLiteral("cloudCount"));
     layout->addWidget(joints_title);
     layout->addLayout(joints_grid);
@@ -963,15 +988,17 @@ private:
           }, Qt::QueuedConnection);
       });
     bridge_->setCloudCallback(
-      [self](std::size_t count) {
+      [self](std::size_t preview_count, std::size_t archived_count) {
         if (!self) {return;}
         QMetaObject::invokeMethod(
           self,
-          [self, count]() {
+          [self, preview_count, archived_count]() {
             if (self) {
               self->cloud_count_->setText(
-                QStringLiteral("base_link 累计点云：%L1 点").arg(
-                  static_cast<qulonglong>(count)));
+                QStringLiteral(
+                  "实时预览（2 mm）：%L1 点\n已归档完整点云（0.5 mm）：%L2 点")
+                .arg(static_cast<qulonglong>(preview_count))
+                .arg(static_cast<qulonglong>(archived_count)));
             }
           }, Qt::QueuedConnection);
       });
@@ -1138,8 +1165,8 @@ private:
       (value.laser_connected ? QStringLiteral("控制器已连接") :
       QStringLiteral("激光控制未连接")));
     setBadge(
-      cloud_badge_, value.reconstruction, value.reconstruction ? QStringLiteral(
-        "重建服务就绪") : QStringLiteral("服务未就绪"));
+      cloud_badge_, value.reconstruction && !reconstruction_fault_,
+      !value.reconstruction ? QStringLiteral("服务未就绪") : reconstruction_state_);
     updateDeviceButtons();
   }
 
@@ -1158,7 +1185,24 @@ private:
       prefix = QStringLiteral("相机");
     } else if (key == QStringLiteral("laser")) {
       prefix = QStringLiteral("激光");
-    } else if (key == QStringLiteral("reconstruction")) {prefix = QStringLiteral("重建");} else {
+    } else if (key == QStringLiteral("reconstruction")) {
+      prefix = QStringLiteral("重建");
+      if (message.contains(QStringLiteral("storage=FAILED")) ||
+        message.contains(QStringLiteral("valid=0")))
+      {
+        reconstruction_fault_ = true;
+        reconstruction_state_ = QStringLiteral("扫描无效 / 归档失败");
+      } else if (message.contains(QStringLiteral("storage=SAVING"))) {
+        reconstruction_fault_ = false;
+        reconstruction_state_ = QStringLiteral("后台归档中");
+      } else if (message.contains(QStringLiteral("storage=COMPLETE"))) {
+        reconstruction_fault_ = false;
+        reconstruction_state_ = QStringLiteral("完整点云已归档");
+      } else if (message.contains(QStringLiteral("accumulation enabled"))) {
+        reconstruction_fault_ = false;
+        reconstruction_state_ = QStringLiteral("独立扫描会话采集中");
+      }
+    } else {
       prefix = QStringLiteral("粗扫");
     }
     appendLog(QStringLiteral("ROS"), prefix + QStringLiteral("：") + message);
@@ -1223,6 +1267,8 @@ private:
   QLabel * cloud_badge_{nullptr};
   std::array<QLabel *, 6> joint_values_{};
   QLabel * cloud_count_{nullptr};
+  QString reconstruction_state_{QStringLiteral("重建服务就绪")};
+  bool reconstruction_fault_{false};
   QPlainTextEdit * log_{nullptr};
   QProgressBar * operation_progress_{nullptr};
   QPushButton * safe_stop_button_{nullptr};
