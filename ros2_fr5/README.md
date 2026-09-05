@@ -351,9 +351,10 @@ CONFIRM_FR5_HARDWARE=YES ./run_scanner_650_moveit_hardware.sh \
   allow_execution:=true scan_distance_m:=0.05
 ```
 
-执行服务的顺序是：确认 650 nm TTL 高且 450 nm 低 → 开始点云累积 → 执行
-Pilz LIN → 停止累积并等待重建队列排空 → 确认两路 TTL 均低。每次开始累积会自动清空
-上一轮体素，避免多个扫描被静默混合；任一步未获确认都不会开始机械臂运动。
+执行服务的顺序是：确认 650 nm TTL 高且 450 nm 低 → 确认 HIK 连续取流与设备时钟映射
+稳定 → 创建独立扫描 session 并开始点云累积 → 执行 Pilz LIN → 封口并等待重建队列排空
+→ 把完整体素表移交后台归档 → 确认两路 TTL 均低。新 session 不复用上一轮的内存点云；
+保存失败的数据仍保留在内存并阻止开始下一轮，避免覆盖或静默混合。
 
 ### 点云与服务
 
@@ -361,16 +362,18 @@ Pilz LIN → 停止累积并等待重建队列排空 → 确认两路 TTL 均低
 | --- | --- |
 | `/scanner_650/image_raw` | 标定分辨率的 Mono8 图像 |
 | `/scanner_650/set_camera_connected` | `SetBool`：连接并启动 HIK 连续取流，或停止取流后断开相机 |
+| `/scanner_650/get_camera_statistics` | `Trigger`：读取相机连接、时钟映射及全部累计丢帧计数 |
 | `/scanner_650/set_laser_connected` | `SetBool`：连接激光控制器，或确认两路 TTL 关闭后断开并释放租约 |
 | `/scanner_650/set_laser` | `SetBool`：在控制通道就绪时确认打开 650 nm，或确认关闭两路激光 |
 | `/scanner_650/profile_cloud` | 每帧轮廓，相机 optical frame，单位 m |
-| `/scanner_650/scan_cloud` | 按逐帧 TF 变换到 `base_link` 后的 0.5 mm 体素点云，含按基坐标 Z 生成的 RGB |
+| `/scanner_650/scan_cloud_preview` | 2 mm 粗体素实时预览，best-effort；拥塞时允许跳过预览更新，不影响归档数据 |
+| `/scanner_650/scan_cloud` | session 成功写盘后才发布的 0.5 mm 完整点云，reliable + transient-local |
 | `/scanner_650/plan_linear_scan` | 只规划一次扫描 TCP 的 Pilz LIN |
 | `/scanner_650/execute_last_plan` | 显式执行最后一次成功规划 |
 | `/scanner_650/stop_motion` | 请求 MoveIt 停止、停止累积并关光 |
 | `/scanner_650/set_rviz_scan_mode` | 切换 RViz Execute 的关光定位/整轨迹扫描模式 |
 | `/scanner_650/clear_cloud` | 清空累积点云 |
-| `/scanner_650/save_cloud` | 保存与 legacy 扫描器兼容、带 RGB 的 binary little-endian PLY |
+| `/scanner_650/save_cloud` | 后台保存/重试当前 session；自动保存已排队时返回其状态 |
 
 手动保存：
 
@@ -378,25 +381,51 @@ Pilz LIN → 停止累积并等待重建队列排空 → 确认两路 TTL 均低
 ros2 service call /scanner_650/save_cloud std_srvs/srv/Trigger '{}'
 ```
 
-保存前点已经按逐帧 TF 累积到配置的 `output_frame`，当前配置为 `base_link`。实时
+默认在停止累积后自动保存，无需再手动调用；上述服务主要用于关闭自动保存后的手动归档，
+或写盘失败后的重试。保存前点已经按逐帧 TF 累积到配置的 `output_frame`，当前配置为
+`base_link`。实时
 `PointCloud2.rgb` 与 PLY 的 `red/green/blue` 共用同一组 Turbo 颜色：较低的世界 Z 为
 紫/蓝色，较高的世界 Z 为橙/红色；RViz 直接读取 RGB，不再另外使用 `AxisColor` 重算。
 默认用 Z 的 `1%..99%` 分位数作为色阶，避免少量离群点压缩主体颜色。服务响应会同时返回
-本次实际色阶范围，以及入队帧、成功重建帧、轮廓拒绝、队列丢帧、TF 接受/拒绝和体素数；
-这些统计也写入 PLY 的 `comment` 头。累计尚未停止或队列尚未排空时拒绝保存，避免生成
-不完整文件。PLY 与 `myline_hik` 连续扫描器一样使用 `binary_little_endian`，XYZ 按毫米
+入队帧、成功重建帧、轮廓拒绝、队列丢帧、队列高水位、TF 接受/拒绝和体素数；这些统计、
+扫描有效性、失效原因及首尾相机状态同时写入 PLY 头和 `manifest.yaml`。累计尚未停止或
+队列尚未排空时拒绝保存，避免生成不完整文件。PLY 与 `myline_hik` 连续扫描器一样使用
+`binary_little_endian`，XYZ 按毫米
 写入，并将 RGB 紧跟在 XYZ 后面，避免 CloudCompare 等软件优先显示 intensity/confidence
 标量场而看起来像“高度颜色错误”。需要调整时可设置 `height_color_lower_percentile` 和
 `height_color_upper_percentile`，但颜色只影响显示，不会改变 XYZ、强度或置信度。
 
-图像订阅回调只负责把帧放入 64 深度的有界队列，默认由两个工作线程重建，以避免重建
-阻塞 60 FPS 相机流。不断增大的 `/scanner_650/scan_cloud` 最快每 0.5 秒发布一次，最终
-停止累计时再强制发布完整点云，避免 DDS/RViz 刷新反过来挤占重建吞吐。
+图像订阅回调只负责把帧放入 64 深度的有界队列，默认由两个工作线程重建。每个工作线程
+先在私有连续缓冲中完成坐标变换，再批量合并到 session 的 0.5 mm 完整体素表，避免重复的
+逐帧哈希表分配。
+RViz 每 0.5 秒只接收独立的 2 mm 粗预览；预览快照占锁时允许跳过该帧的预览合并，但完整
+体素仍全部合并。停止时先禁止新帧进入当前 epoch，再等待 `pending=0`，以 O(1) move 将体素
+表交给专用保存线程。点云转换、着色和 4 MiB 分块写盘均不占用 ROS 回调或重建线程。
+
+每次结果写入：
+
+```text
+${VIZUM_DATA_DIR}/scans/scanner_650/
+├── latest_session.txt
+└── scan_YYYYMMDD_HHMMSS_mmm/
+    ├── scan_voxel.ply
+    └── manifest.yaml
+```
+
+写入期间目录名带 `.partial`，PLY 和 manifest 都先写临时文件；全部完成后才将目录重命名为
+最终 session，旧扫描不会被覆盖。`manifest.yaml` 的 `valid: false` 表示检测到相机帧号跳变、
+SDK/图像池/DDS 前置队列丢帧、相邻图像时间戳超过 30 ms（60 FPS 端到端缺帧检查）、
+重建队列溢出、轮廓拒绝、TF 拒绝、计数不守恒或体素上限。
+系统保证这些情况不会被静默当作完整扫描；硬件、操作系统或进程崩溃仍无法由软件承诺零丢失。
 
 相机侧也沿用 legacy 连续扫描器的非阻塞回调结构：MVS SDK 回调只把已复制的共享图像
 缓冲放进 16 深度的有界 ROS 发布队列，ROS 消息复制和 DDS 发布由独立线程完成，不再在
 SDK 回调里同步发布 1.55 MB 图像。`/scanner_650/camera_status` 每 120 个发布帧报告一次
-设备实测 FPS、接收/发布帧数和发布队列丢帧数。相机到重建节点的图像链路使用有界
+设备实测 FPS、接收/发布帧数、相机帧号缺口、SDK 拒绝、图像池耗尽、发布队列高水位和
+发布队列丢帧数；任一数据损失还会即时发布 `event=data_loss`，使当前 session 标为无效。
+重建节点还会在 session 开始和封口时同步读取一次这些计数并检查增量，因此最后一帧丢失也
+不依赖异步状态消息恰好及时到达。
+相机到重建节点的图像链路使用有界
 reliable QoS，避免原来深度 5 best-effort 在 60 FPS 大图像流下静默漏帧；RViz 仍可用
 best-effort 订阅读取 reliable 发布端。
 
@@ -577,7 +606,9 @@ exit
 ```text
 myline_hik/data/rosbags/scanner_650/<时间>_pm45_exp1825/
 ├── bag/
-├── artifacts/ros2_scan_cloud.ply       # 本次录制期间调用 save_cloud 时复制
+├── artifacts/scan_YYYYMMDD_HHMMSS_mmm/
+│   ├── scan_voxel.ply                  # 本次录制期间完成的扫描 session
+│   └── manifest.yaml
 └── metadata/
     ├── rosbag_info.txt
     ├── *_params_start.yaml
@@ -586,9 +617,9 @@ myline_hik/data/rosbags/scanner_650/<时间>_pm45_exp1825/
     └── config_sha256.txt
 ```
 
-`/scanner_650/scan_cloud` 是不断增大的累计点云，重复写进 rosbag 会产生非常大的数据量；
-默认不记录它，而是记录可重新提线的原图、逐帧 `profile_cloud` 并复制最终 PLY。确实需要
-累计点云话题时使用：
+`/scanner_650/scan_cloud_preview` 是反复刷新的实时粗预览，默认不写入 rosbag；
+`/scanner_650/scan_cloud` 每个 session 只在归档成功后发布一次。默认记录可重新提线的原图、
+逐帧 `profile_cloud` 并复制最终 session 目录。确实需要同时记录归档完整点云话题时使用：
 
 ```bash
 SCANNER_650_RECORD_SCAN_CLOUD=1 ./record_scanner_650_scan.sh pm45_full
@@ -731,3 +762,10 @@ ros2 service call /scanner_650/plan_workspace_local_rescan \
 | `/scanner_650/clear_workspace_coarse_checkpoint` | 显式清除续扫检查点 |
 | `/scanner_650/workspace_coarse_scan_markers` | RViz 全部候选带、拒绝带和摘要 |
 | `/scanner_650/workspace_coarse_scan_status` | 规划、执行、错误和检查点状态 |
+
+
+
+cd /home/zhulong/lh/vizum-line-scan-gui/ros2_fr5
+
+CONFIRM_FR5_HARDWARE=YES \
+./run_scanner_650_moveit_hardware.sh allow_execution:=true

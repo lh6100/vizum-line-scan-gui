@@ -15,8 +15,9 @@
    `1200 us / 1825 us / 2500 us` 必须分别重启相机、分别扫描和录包。
 2. ROS 2 Humble 的 rosbag2 不记录本项目的 service request/response。必须同时保存操作者
    终端日志，才能知道何时调用了规划、批准、执行、停止和保存点云服务。
-3. 默认不录制不断增大的 `/scanner_650/scan_cloud`。它会反复写入整个累计点云，数据量很大。
-   原始图像、逐帧 `/scanner_650/profile_cloud` 和最终 PLY 足以满足通常的离线分析。
+3. 默认不录制反复刷新的 `/scanner_650/scan_cloud_preview`；`/scanner_650/scan_cloud` 仅在
+   独立 session 归档成功后发布完整点云。原始图像、逐帧 `/scanner_650/profile_cloud`、
+   `manifest.yaml` 和最终 PLY 足以满足通常的离线分析。
 4. `1440 × 1080 × 60 FPS` Mono8 原图约为 `93 MB/s`，即约 `5.6 GB/min`。必须使用经过
    测试的高速本地磁盘，并在正式扫描前做一次短录制掉帧检查。
 5. rosbag 只负责记录，不会提高机械臂安全性。实扫仍须确认碰撞场景、扫描头、线缆、工件、
@@ -41,7 +42,7 @@
 | MoveIt | 规划场景、规划显示、碰撞对象、运动计划请求等话题 |
 | 诊断 | `/parameter_events`、`/rosout` |
 | 会话快照 | 节点参数、标定 YAML、URDF、SHA-256、Git 状态、节点/话题/服务列表 |
-| 扫描产物 | 调用 `/scanner_650/save_cloud` 后生成的 `ros2_scan_cloud.ply` |
+| 扫描产物 | 停止累积后后台生成的 `scan_<timestamp>/scan_voxel.ply` 与 `manifest.yaml` |
 
 脚本要求至少有 `20 GiB` 可用空间，默认每 `4 GiB` 分割一个 SQLite3 文件，并使用专门的
 相机 QoS 配置。输出根目录默认为：
@@ -252,11 +253,12 @@ ros2 service call /scanner_650/approve_workspace_coarse_scan \
 ros2 service call /scanner_650/execute_workspace_coarse_scan \
   std_srvs/srv/Trigger '{}'
 ```
-QCoreApplication
+
 不要在执行服务尚未返回时停止 rosbag。正常流程是三条扫描完成、激光关闭、写入
 `return_status: "in_progress"`、返回示教起点，然后写入 `completed`。
 
-执行返回后保存累计点云，并检查检查点：
+停止累积时已经自动把独立 session 送入后台归档。执行返回后可再次调用保存服务查询
+“已排队/已保存”状态，并检查检查点：
 
 ```bash
 ros2 service call /scanner_650/save_cloud \
@@ -281,9 +283,10 @@ exit
 - 返程已经完成，或返程失败原因已被完整记录；
 - 点云累积已关闭；
 - 激光已确认关闭；
-- `save_cloud` 已调用。
+- 重建状态已经报告 `storage=COMPLETE`（手动 `save_cloud` 查询为已保存）。
 
-脚本会在 rosbag 停止后保存结束参数、bag 信息，并把本次新生成的 PLY 复制到会话目录。
+脚本会在 rosbag 停止后保存结束参数、bag 信息，并把本次新生成的扫描 session（PLY 与
+manifest）复制到会话目录。
 
 ## 8. 检查本次录制是否完整
 
@@ -307,7 +310,8 @@ find "${SESSION_DIR}" -maxdepth 3 -type f | sort
    达到 `95%`；明显更低表示录包磁盘或 CPU 跟不上。
 3. `image_raw / bag duration` 应接近 `60 FPS`。录制前后相机持续工作，因此可以直接估算。
 4. `metadata/operator_terminal.log` 中包含规划、批准、执行和保存点云的完整响应。
-5. `artifacts/ros2_scan_cloud.ply` 存在且大小不是 0。
+5. `artifacts/scan_<timestamp>/scan_voxel.ply` 存在且大小不是 0，并检查同目录
+   `manifest.yaml` 的 `valid: true`、`queue_dropped: 0` 和 `tf_rejected: 0`。
 6. `metadata/*_params_start.yaml` 和 `*_params_end.yaml` 存在。
 
 可选地为 bag 数据库生成校验值：
@@ -392,8 +396,10 @@ ros2 run fr5_scanner_650 line_laser_reconstruction_node --ros-args \
   --params-file src/fr5_scanner_650/config/scanner_650.yaml \
   -p use_sim_time:=true \
   -p voxel_size_m:=0.0005 \
-  -p output_ply:="${SESSION_DIR}/artifacts/reprocessed_voxel0p5mm.ply" \
+  -p require_camera_ready_for_accumulation:=false \
+  -p output_ply:="${SESSION_DIR}/artifacts/offline_reconstruction/scan_voxel.ply" \
   -p profile_topic:=/offline/scanner_650/profile_cloud \
+  -p preview_topic:=/offline/scanner_650/scan_cloud_preview \
   -p scan_topic:=/offline/scanner_650/scan_cloud \
   -p marker_topic:=/offline/scanner_650/markers
 ```
@@ -414,10 +420,12 @@ ros2 service call /scanner_650/set_accumulation std_srvs/srv/SetBool '{data: tru
 ros2 bag play "${SESSION_DIR}/bag" \
   --clock 60 \
   --rate 0.25 \
+  --qos-profile-overrides-path \
+    /path/to/vizum-line-scan-gui/ros2_fr5/src/fr5_scanner_650/config/scanner_650_rosbag_qos.yaml \
   --topics /scanner_650/image_raw /scanner_650/camera_info /tf /tf_static
 ```
 
-播放结束后关闭累积并保存：
+播放结束后关闭累积；它会自动后台保存。第二个调用只用于查询/重试：
 
 ```bash
 ros2 service call /scanner_650/set_accumulation \

@@ -136,7 +136,7 @@ echo "Session: ${session_dir}"
 echo "Free disk: ${available_gib} GiB"
 echo "Recording raw images and scanner/robot state. Press Ctrl-C only after the scan has stopped and the laser is OFF."
 if [[ "${SCANNER_650_RECORD_SCAN_CLOUD:-0}" != "1" ]]; then
-  echo "The repeatedly accumulated /scanner_650/scan_cloud topic is excluded to control bag size; raw images and per-frame profiles are recorded."
+  echo "The archived full /scanner_650/scan_cloud topic is excluded; raw images and per-frame profiles are recorded."
 fi
 
 set +e
@@ -150,10 +150,27 @@ ros2 topic list -t | sort >"${metadata_dir}/topics_end.txt" || true
 df -h "${output_root}" >"${metadata_dir}/disk_end.txt"
 ros2 bag info "${bag_dir}" >"${metadata_dir}/rosbag_info.txt" 2>"${metadata_dir}/rosbag_info.err" || true
 
-saved_cloud="${data_root}/scans/scanner_650/ros2_scan_cloud.ply"
-if [[ -f "${saved_cloud}" && "${saved_cloud}" -nt "${metadata_dir}/recording_started.marker" ]]; then
-  mkdir -p "${session_dir}/artifacts"
-  cp "${saved_cloud}" "${session_dir}/artifacts/"
+scan_archive_root="${data_root}/scans/scanner_650"
+latest_scan_pointer="${scan_archive_root}/latest_session.txt"
+if [[ -f "${latest_scan_pointer}" ]]; then
+  IFS= read -r saved_scan_session <"${latest_scan_pointer}" || true
+  if [[ -n "${saved_scan_session:-}" ]]; then
+    resolved_scan_session="$(readlink -f "${saved_scan_session}" 2>/dev/null || true)"
+    resolved_scan_root="$(readlink -f "${scan_archive_root}" 2>/dev/null || true)"
+    saved_cloud="${resolved_scan_session}/scan_voxel.ply"
+    case "${resolved_scan_session}" in
+      "${resolved_scan_root}"/scan_*)
+        if [[ -f "${saved_cloud}" && "${saved_cloud}" -nt "${metadata_dir}/recording_started.marker" ]]; then
+          mkdir -p "${session_dir}/artifacts"
+          cp -a "${resolved_scan_session}" "${session_dir}/artifacts/"
+          printf 'scanner_session=%s\n' "${resolved_scan_session}" >>"${metadata_dir}/recording_settings.txt"
+        fi
+        ;;
+      *)
+        echo "Ignoring invalid scanner latest-session pointer: ${saved_scan_session}" >&2
+        ;;
+    esac
+  fi
 fi
 
 if [[ ${record_status} -ne 0 && ${record_status} -ne 130 ]]; then
