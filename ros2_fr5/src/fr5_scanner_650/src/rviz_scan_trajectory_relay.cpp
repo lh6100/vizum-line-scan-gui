@@ -147,7 +147,8 @@ private:
     auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
     request->data = enabled;
     auto future = client->async_send_request(request);
-    if (future.wait_for(4s) != std::future_status::ready) {
+    // Scanner accumulation stop may legitimately use its 5 s drain window.
+    if (future.wait_for(7s) != std::future_status::ready) {
       if (error) {*error = label + " service timed out";}
       return false;
     }

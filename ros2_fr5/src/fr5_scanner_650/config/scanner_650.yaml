@@ -34,7 +34,12 @@ hik_single_camera:
 line_laser_reconstruction:
   ros__parameters:
     image_topic: "/scanner_650/image_raw"
+    camera_statistics_service: "/scanner_650/get_camera_statistics"
     profile_topic: "/scanner_650/profile_cloud"
+    # Lightweight best-effort cloud used only for live RViz/GUI feedback.
+    preview_topic: "/scanner_650/scan_cloud_preview"
+    # Reliable transient-local full cloud is published only after a sealed
+    # session has been archived successfully.
     scan_topic: "/scanner_650/scan_cloud"
     marker_topic: "/scanner_650/markers"
     camera_frame: "hik_camera_optical_frame"
@@ -52,9 +57,21 @@ line_laser_reconstruction:
     centerline_mode: "legacy"
     voxel_size_m: 0.0005
     maximum_voxels: 2000000
+    # Decouple visualization bandwidth from the lossless reconstruction map.
+    # The preview may be capped without affecting the archived 0.5 mm cloud.
+    preview_voxel_size_m: 0.002
+    maximum_preview_voxels: 200000
+    # Bound memory if storage is slower than scanning. At most two sealed full
+    # voxel maps may wait/write while a new scan is allowed to start.
+    maximum_pending_save_jobs: 2
     publish_every_n_profiles: 6
-    # Publishing an ever-growing cloud at camera rate overloads DDS/RViz.
+    # Only the coarse preview is refreshed periodically; the full cloud never
+    # competes with the 60 FPS image/reconstruction path during acquisition.
     scan_publish_period_s: 0.5
+    # Detect gaps across the complete camera->DDS->reconstruction path. A
+    # normal 60 FPS interval is 16.67 ms; >30 ms is treated as missing data.
+    expected_camera_fps: 60.0
+    maximum_frame_interval_factor: 1.8
     # Reconstruction must not run inside the DDS image callback: a bounded
     # two-worker queue preserves the 60 FPS camera stream, as in myline_hik.
     reconstruction_queue_capacity: 64
@@ -64,14 +81,25 @@ line_laser_reconstruction:
     # before reporting that accumulation has stopped.
     clear_cloud_on_accumulation_start: true
     accumulation_drain_timeout_s: 5.0
+    # Stop seals the session and transfers its voxel table to a dedicated
+    # writer thread. Saving therefore does not block ROS callbacks or the next
+    # camera frames. A failed write is retained in memory and blocks a new scan.
+    auto_save_on_accumulation_stop: true
+    # Do not create a scan until streaming and stable device-clock mapping have
+    # both been observed from the HIK node.
+    require_camera_ready_for_accumulation: true
     # The image header is the mapped exposure midpoint. An exact-time TF query
     # then interpolates the 125 Hz controller joint-state transforms; it never
     # falls back to the latest pose when an enclosing time bracket is absent.
     tf_lookup_timeout_s: 0.10
     maximum_image_age_s: 1.0
+    # Small scheduling allowance for rosbag /clock and executor ordering. The
+    # live HIK mapper itself already rejects exposure times >1 ms in the future.
+    maximum_future_image_lead_s: 0.02
     accumulate_on_start: false
-    # Injected by the launch file; this basename is safe for direct node runs.
-    output_ply: "ros2_scan_cloud.ply"
+    # Compatibility path: its parent is the session archive root. Each scan is
+    # written atomically to <root>/scan_<timestamp>/{scan_voxel.ply,manifest.yaml}.
+    output_ply: "scan_voxel.ply"
     # The live PointCloud2 rgb field and saved PLY use the same base_link-Z
     # Turbo values.  PLY follows the proven legacy scanner layout: binary
     # little-endian, XYZ in millimetres, then RGB/confidence/response.

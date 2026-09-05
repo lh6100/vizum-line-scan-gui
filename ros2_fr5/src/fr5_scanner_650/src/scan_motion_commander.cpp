@@ -259,7 +259,9 @@ private:
     auto request = std::make_shared<std_srvs::srv::SetBool::Request>();
     request->data = enabled;
     auto future = client->async_send_request(request);
-    if (future.wait_for(std::chrono::seconds(4)) != std::future_status::ready) {
+    // Reconstruction may spend up to 5 s draining its bounded queue while
+    // sealing a scan. Keep the caller timeout longer than that contract.
+    if (future.wait_for(std::chrono::seconds(7)) != std::future_status::ready) {
       if (error) {*error = label + " service timed out";}
       return false;
     }

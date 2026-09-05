@@ -387,8 +387,11 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "output_ply",
-                default_value=str(scan_data_dir / "ros2_scan_cloud.ply"),
-                description="Saved accumulated point cloud",
+                default_value=str(scan_data_dir / "scan_voxel.ply"),
+                description=(
+                    "Compatibility PLY path; its parent is the per-session scan "
+                    "archive root"
+                ),
             ),
             DeclareLaunchArgument(
                 "checkpoint_path",
