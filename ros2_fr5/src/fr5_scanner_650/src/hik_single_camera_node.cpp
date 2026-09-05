@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -167,6 +168,12 @@ public:
         camera_frames_received_.store(0U);
         camera_frames_published_.store(0U);
         camera_publish_queue_drops_.store(0U);
+        camera_frame_id_gaps_.store(0U);
+        camera_out_of_order_frames_.store(0U);
+        camera_sdk_rejected_frames_.store(0U);
+        camera_image_pool_exhaustions_.store(0U);
+        camera_publish_queue_high_water_.store(0U);
+        last_camera_frame_id_.store(0U);
         first_device_timestamp_ns_.store(0);
         last_device_timestamp_ns_.store(0);
         {
@@ -178,7 +185,8 @@ public:
         std_msgs::msg::String status;
         status.data = "connected=1; streaming=1; exposure_us=" + std::to_string(exposure) +
           "; fps=" + std::to_string(fps) + "; device_tick_hz=" +
-          std::to_string(frequency) + "; " + description.toStdString();
+          std::to_string(frequency) + "; camera_time=WARMING_UP; " +
+          description.toStdString();
         status_publisher_->publish(status);
         RCLCPP_INFO(get_logger(), "%s", status.data.c_str());
       });
@@ -192,6 +200,7 @@ public:
         }
         stream_start_requested_.store(false);
         connection_condition_.notify_all();
+        publish_connection_status(true, false, detail.toStdString());
       });
     QObject::connect(
       worker_.get(), &HikCameraWorker::continuousFrameReady,
@@ -199,9 +208,22 @@ public:
     QObject::connect(
       worker_.get(), &HikCameraWorker::continuousFrameRejected,
       [this](quint64 frame, const QString & reason) {
+        ++camera_sdk_rejected_frames_;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000, "camera rejected frame %llu: %s",
           static_cast<unsigned long long>(frame), reason.toUtf8().constData());
+        publish_data_loss_event(
+          "sdk_rejected_frame", static_cast<std::uint64_t>(frame), reason.toStdString());
+      });
+    QObject::connect(
+      worker_.get(), &HikCameraWorker::imagePoolExhausted,
+      [this]() {
+        ++camera_image_pool_exhaustions_;
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "camera image pool exhausted (capacity=%d, total=%llu)", pool_capacity_,
+          static_cast<unsigned long long>(camera_image_pool_exhaustions_.load()));
+        publish_data_loss_event("image_pool_exhausted", 0U, "no reusable image buffer");
       });
     QObject::connect(
       worker_.get(), &HikCameraWorker::error,
@@ -223,6 +245,11 @@ public:
       connection_service_name,
       std::bind(
         &HikSingleCameraNode::set_camera_connected, this,
+        std::placeholders::_1, std::placeholders::_2));
+    statistics_service_ = create_service<std_srvs::srv::Trigger>(
+      "/scanner_650/get_camera_statistics",
+      std::bind(
+        &HikSingleCameraNode::get_camera_statistics, this,
         std::placeholders::_1, std::placeholders::_2));
     publisher_thread_ = std::thread([this]() {publisher_worker();});
     publish_connection_status(false, false, "camera node ready; camera disconnected");
@@ -260,6 +287,44 @@ private:
     status_publisher_->publish(status);
   }
 
+  std::string data_flow_statistics() const
+  {
+    std::ostringstream text;
+    text << "received=" << camera_frames_received_.load()
+         << "; published=" << camera_frames_published_.load()
+         << "; frame_id_gaps=" << camera_frame_id_gaps_.load()
+         << "; out_of_order=" << camera_out_of_order_frames_.load()
+         << "; sdk_rejected=" << camera_sdk_rejected_frames_.load()
+         << "; image_pool_exhausted=" << camera_image_pool_exhaustions_.load()
+         << "; publish_queue_dropped=" << camera_publish_queue_drops_.load()
+         << "; publish_queue_high_water=" << camera_publish_queue_high_water_.load()
+         << "; timestamp_warmup_withheld=" << mapping_warmup_drops_.load()
+         << "; timestamp_rejected=" << camera_timestamp_rejections_.load()
+         << "; non_monotonic_timestamp=" << non_monotonic_stamp_drops_.load();
+    return text.str();
+  }
+
+  void publish_data_loss_event(
+    const std::string & reason, std::uint64_t frame_id, const std::string & detail)
+  {
+    bool connected = false;
+    bool streaming = false;
+    {
+      std::lock_guard<std::mutex> lock(connection_mutex_);
+      connected = camera_connected_;
+      streaming = camera_streaming_;
+    }
+    std_msgs::msg::String status;
+    status.data = "connected=" + std::to_string(connected) +
+      "; streaming=" + std::to_string(streaming) +
+      "; event=data_loss; reason=" + reason +
+      "; frame_id=" + std::to_string(frame_id) + "; " + data_flow_statistics();
+    if (!detail.empty()) {
+      status.data += "; detail=" + detail;
+    }
+    status_publisher_->publish(status);
+  }
+
   void reset_camera_timing()
   {
     {
@@ -271,19 +336,34 @@ private:
       static_cast<std::size_t>(camera_clock_mapping_window_),
       camera_mapping_max_residual_us_ * 1000.0);
     mapping_was_stable_ = false;
-    mapping_warmup_drops_ = 0;
-    non_monotonic_stamp_drops_ = 0;
+    mapping_warmup_drops_.store(0U);
+    camera_timestamp_rejections_.store(0U);
+    non_monotonic_stamp_drops_.store(0U);
     last_image_stamp_ns_ = 0;
   }
 
   void enqueue_frame(hik_sync::CameraFrame frame)
   {
     ++camera_frames_received_;
+    const std::uint64_t previous_frame_id = last_camera_frame_id_.exchange(frame.frameId);
+    if (previous_frame_id != 0U && frame.frameId > previous_frame_id + 1U) {
+      camera_frame_id_gaps_.fetch_add(frame.frameId - previous_frame_id - 1U);
+      publish_data_loss_event(
+        "camera_frame_id_gap", frame.frameId,
+        "previous_frame_id=" + std::to_string(previous_frame_id));
+    } else if (previous_frame_id != 0U && frame.frameId <= previous_frame_id) {
+      ++camera_out_of_order_frames_;
+      publish_data_loss_event(
+        "camera_frame_out_of_order", frame.frameId,
+        "previous_frame_id=" + std::to_string(previous_frame_id));
+    }
     if (frame.timestampValid && frame.cameraTimestampNs > 0) {
       std::int64_t expected = 0;
       first_device_timestamp_ns_.compare_exchange_strong(expected, frame.cameraTimestampNs);
       last_device_timestamp_ns_.store(frame.cameraTimestampNs);
     }
+    bool queue_dropped = false;
+    std::size_t queue_size = 0U;
     {
       std::lock_guard<std::mutex> lock(publish_queue_mutex_);
       if (publisher_stopping_) {
@@ -294,13 +374,24 @@ private:
         // publishing, then retain the newest exposure and its robot pose time.
         publish_queue_.pop_front();
         ++camera_publish_queue_drops_;
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "ROS image publish queue full; dropped oldest frame "
-          "(capacity=%d, drops=%llu)", publish_queue_capacity_,
-          static_cast<unsigned long long>(camera_publish_queue_drops_.load()));
+        queue_dropped = true;
       }
       publish_queue_.push_back(std::move(frame));
+      queue_size = publish_queue_.size();
+    }
+    std::uint64_t previous_high_water = camera_publish_queue_high_water_.load();
+    while (queue_size > previous_high_water &&
+      !camera_publish_queue_high_water_.compare_exchange_weak(
+        previous_high_water, static_cast<std::uint64_t>(queue_size)))
+    {
+    }
+    if (queue_dropped) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "ROS image publish queue full; dropped oldest frame "
+        "(capacity=%d, drops=%llu)", publish_queue_capacity_,
+        static_cast<unsigned long long>(camera_publish_queue_drops_.load()));
+      publish_data_loss_event("ros_publish_queue_overflow", 0U, "oldest frame discarded");
     }
     publish_queue_condition_.notify_one();
   }
@@ -335,6 +426,34 @@ private:
            static_cast<double>(last_ns - first_ns);
   }
 
+  void get_camera_statistics(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+    bool connected = false;
+    bool streaming = false;
+    {
+      std::lock_guard<std::mutex> lock(connection_mutex_);
+      connected = camera_connected_;
+      streaming = camera_streaming_;
+    }
+    bool mapping_stable = false;
+    {
+      std::lock_guard<std::mutex> lock(timing_mutex_);
+      mapping_stable = mapping_was_stable_;
+    }
+    std::ostringstream message;
+    message << "connected=" << connected
+            << "; streaming=" << streaming
+            << "; camera_time=" <<
+      (mapping_stable ? "DEVICE_TIMESTAMP_MAPPING" : "WARMING_UP")
+            << "; device_fps=" << std::fixed << std::setprecision(3)
+            << received_device_fps()
+            << "; " << data_flow_statistics();
+    response->success = true;
+    response->message = message.str();
+  }
+
   void set_camera_connected(
     const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
     std::shared_ptr<std_srvs::srv::SetBool::Response> response)
@@ -356,6 +475,7 @@ private:
       const bool connected_without_stream = camera_connected_;
       lock.unlock();
       if (connected_without_stream) {
+        reset_camera_timing();
         stream_start_requested_.store(true);
         QMetaObject::invokeMethod(
           worker_.get(),
@@ -407,6 +527,10 @@ private:
     const rclcpp::Time ros_now = now();
     const int64_t raw_now_ns = hik_sync::getMonotonicRawNs();
     if (raw_now_ns <= 0) {
+      ++camera_timestamp_rejections_;
+      publish_data_loss_event(
+        "monotonic_raw_unavailable", frame.frameId,
+        "cannot map camera exposure into ROS time");
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 2000, "CLOCK_MONOTONIC_RAW is unavailable");
       return std::nullopt;
@@ -421,7 +545,8 @@ private:
 
     const hik_sync::ClockFitReport report = camera_clock_mapper_
       ? camera_clock_mapper_->report() : hik_sync::ClockFitReport{};
-    if (mapped != mapping_was_stable_) {
+    const bool mapping_was_previously_stable = mapping_was_stable_;
+    if (mapped != mapping_was_previously_stable) {
       mapping_was_stable_ = mapped;
       std_msgs::msg::String status;
       std::ostringstream text;
@@ -436,6 +561,10 @@ private:
         RCLCPP_INFO(get_logger(), "%s", status.data.c_str());
       } else {
         RCLCPP_WARN(get_logger(), "%s", status.data.c_str());
+        ++camera_timestamp_rejections_;
+        publish_data_loss_event(
+          "device_timestamp_mapping_lost", frame.frameId,
+          "clock-fit residual exceeded the configured limit");
       }
     }
 
@@ -460,6 +589,10 @@ private:
     const hik_sync::ExposureTiming timing = hik_sync::computeExposureTiming(
       reference_raw_ns, exposure, camera_fixed_time_offset_us_, reference);
     if (!timing.valid) {
+      ++camera_timestamp_rejections_;
+      publish_data_loss_event(
+        "invalid_exposure_timing", frame.frameId,
+        "cannot compute exposure midpoint");
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000, "camera exposure timing is invalid");
       return std::nullopt;
@@ -471,6 +604,10 @@ private:
     const int64_t aligned_ros_ns = ros_now.nanoseconds() +
       timing.alignedTimestampNs - raw_now_ns;
     if (aligned_ros_ns <= 0 || aligned_ros_ns > ros_now.nanoseconds() + 1000000LL) {
+      ++camera_timestamp_rejections_;
+      publish_data_loss_event(
+        "invalid_mapped_exposure_time", frame.frameId,
+        "mapped midpoint is invalid or more than 1 ms in the future");
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "mapped exposure midpoint is invalid or more than 1 ms in the future");
@@ -478,6 +615,10 @@ private:
     }
     if (last_image_stamp_ns_ > 0 && aligned_ros_ns <= last_image_stamp_ns_) {
       ++non_monotonic_stamp_drops_;
+      ++camera_timestamp_rejections_;
+      publish_data_loss_event(
+        "non_monotonic_mapped_timestamp", frame.frameId,
+        "mapped exposure time did not increase");
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "non-monotonic mapped camera timestamp rejected (dropped=%llu)",
@@ -523,6 +664,8 @@ private:
     const std::size_t byte_count =
       static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height);
     if (frame.image->bytes.size() < byte_count) {
+      ++camera_sdk_rejected_frames_;
+      publish_data_loss_event("short_frame_buffer", frame.frameId, "image byte count is short");
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "camera frame buffer is short");
       return;
     }
@@ -554,9 +697,7 @@ private:
       text << "connected=1; streaming=1; camera_time=DEVICE_TIMESTAMP_MAPPING"
            << "; target_fps=" << std::fixed << std::setprecision(3) << fps_
            << "; device_fps=" << received_device_fps()
-           << "; received=" << camera_frames_received_.load()
-           << "; published=" << published
-           << "; publish_queue_dropped=" << camera_publish_queue_drops_.load();
+           << "; " << data_flow_statistics();
       status.data = text.str();
       status_publisher_->publish(status);
     }
@@ -581,12 +722,19 @@ private:
   bool mapping_was_stable_{false};
   hik_sync::CameraTimestampReference camera_timestamp_reference_{
     hik_sync::CameraTimestampReference::ExposureStart};
-  std::uint64_t mapping_warmup_drops_{0};
-  std::uint64_t non_monotonic_stamp_drops_{0};
+  std::atomic<std::uint64_t> mapping_warmup_drops_{0U};
+  std::atomic<std::uint64_t> camera_timestamp_rejections_{0U};
+  std::atomic<std::uint64_t> non_monotonic_stamp_drops_{0U};
   int64_t last_image_stamp_ns_{0};
   std::atomic<std::uint64_t> camera_frames_received_{0U};
   std::atomic<std::uint64_t> camera_frames_published_{0U};
   std::atomic<std::uint64_t> camera_publish_queue_drops_{0U};
+  std::atomic<std::uint64_t> camera_frame_id_gaps_{0U};
+  std::atomic<std::uint64_t> camera_out_of_order_frames_{0U};
+  std::atomic<std::uint64_t> camera_sdk_rejected_frames_{0U};
+  std::atomic<std::uint64_t> camera_image_pool_exhaustions_{0U};
+  std::atomic<std::uint64_t> camera_publish_queue_high_water_{0U};
+  std::atomic<std::uint64_t> last_camera_frame_id_{0U};
   std::atomic<std::int64_t> first_device_timestamp_ns_{0};
   std::atomic<std::int64_t> last_device_timestamp_ns_{0};
   std::atomic<bool> identity_valid_{false};
@@ -612,6 +760,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr info_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_publisher_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr connection_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr statistics_service_;
 };
 
 }  // namespace
